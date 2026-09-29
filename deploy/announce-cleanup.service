@@ -1,0 +1,11 @@
+[Unit]
+Description=叫号播报: 每日清理日志与过期存证
+Documentation=file:/home/debian/anntest/README.md
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/home/debian/anntest/announce-cleanup.sh
+# 清理是后台杂活, 别跟播报/OCR 抢 CPU 和磁盘带宽
+Nice=19
+IOSchedulingClass=idle

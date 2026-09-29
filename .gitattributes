@@ -1,0 +1,23 @@
+# 统一换行符策略: 入库一律 LF。
+# 理由: 本项目的 .sh / .service / .timer / .py 全部部署到 Linux,
+# 若被 Windows 编辑器写入 CRLF, bash 会报 "\r: command not found",
+# systemd 也可能解析失败。core.autocrlf=input 只覆盖提交方向, 这里再兜一层。
+* text=auto eol=lf
+
+# 明确按 LF 处理的脚本与配置
+*.sh        text eol=lf
+*.service   text eol=lf
+*.timer     text eol=lf
+*.py        text eol=lf
+*.rs        text eol=lf
+*.toml      text eol=lf
+*.json      text eol=lf
+*.md        text eol=lf
+*.bat       text eol=crlf
+
+# 二进制
+*.jpg  binary
+*.jpeg binary
+*.png  binary
+*.onnx binary
+*.exe  binary

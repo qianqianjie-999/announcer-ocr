@@ -1,0 +1,10 @@
+[Unit]
+Description=叫号播报: 每日 03:30 清理日志与过期存证
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target
