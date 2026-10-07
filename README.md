@@ -95,4 +95,5 @@ anntest-src/
 | [06-config.md](docs/06-config.md) | 配置参考：全部字段、默认值、调优建议 |
 | [07-troubleshooting.md](docs/07-troubleshooting.md) | 实战排障：踩坑记录与现场处置 |
 | [08-webui.md](docs/08-webui.md) | Web 配置调试台：ROI 拖框、OCR/TTS 自测、API 与安全设计 |
+| [09-rtsp-field-checklist.md](docs/09-rtsp-field-checklist.md) | 现场 RTSP 摄像头接入操作清单（打印携带用） |
 ```
