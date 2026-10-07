@@ -1,0 +1,75 @@
+# 06 · 配置参考（cfg.rs）
+
+全字段均有默认值，最小配置只需 `camera_source`。schema 与 Python 版完全一致。
+
+## 顶层
+
+| 字段 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `camera_source` | 数字/字符串 | `"/dev/video0"` | `0`/`"/dev/videoN"`/`"rtsp://..."`/`"simulate"` |
+| `roi` | [x,y,w,h] | null(全画幅) | **必配**。只在此区域做检测+识别，背景杂物严重污染识别 |
+| `fps` | f64 | 3.0 | 主循环频率 |
+| `capture_width/height` | u32 | 1920/1080 | 请求 ffmpeg 输出分辨率 |
+| `lock_port` | u16 | 51888 | 单实例锁（回环 TCP 占用，重复启动立即退出） |
+| `log_file` | str | `announce_log.csv` | 播报日志路径 |
+| `save_trigger_frames` | bool | true | 触发帧存证 `_live/`（生产稳定后可关，省 SD 写） |
+| `diag_heartbeat` | bool | true | 心跳诊断日志 |
+| `diag_every_sec` | f64 | 5.0 | 心跳间隔 |
+
+## detect（变化检测与确认）
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `diff_threshold` | 25.0 | 帧差单像素灰度阈（0-255） |
+| `changed_ratio` | 0.0015 | 超阈占比≥此值 → 判定变化。误触发多→调大；换屏不触发→调小 |
+| `stable_frames` | 2 | 候选复现确认轮数 |
+| `confirm_ttl_sec` | 4.0 | 确认窗口，下限自动抬到 3×OCR 耗时 |
+| `active_sec` | 3.0 | 变化后活跃期长度 |
+| `min_interval_sec` | 0.5 | 两次 OCR 最小间隔 |
+| `fallback_ocr_sec` | 3.0 | 常规兜底 OCR 间隔 |
+| `static_fb_sec` | 10.0 | 静帧兜底间隔（静止时放宽省 CPU） |
+| `static_confirm_ticks` | 2 | 静帧快速确认轮数，0=退回两轮投票 |
+
+## ocr（识别）
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `bin` | `"tesseract"` | 可执行文件路径 |
+| `lang` | `"chi_sim"` | 语言包（本地无包时 `TESSDATA_PREFIX` 指向自备 tessdata） |
+| `psm` | 11 | 稀疏文本模式，适配卡片布局 |
+| `dpi` | 150 | |
+| `pattern` | 双正则 | 单条字符串或数组；号码+窗口提取的核心，改前先跑 `cargo test` |
+
+默认 pattern：
+
+```json
+["([A-Z]{1,2}\\d{3,6})",
+ "([A-Z]{1,2}\\d{3,6})[到至]([A-Z]{0,2}\\d{1,3})[号窗]"]
+```
+
+## tts（语音）
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `enabled` | true | false 则只打 `[播报]` 日志不出声（自测用） |
+| `engine` | `"auto"` | `"auto"/"espeak"/"piper"` |
+| `template` | `请{number}到{window}号窗口办理` | `{number}/{window}` 占位 |
+| `spell_number` | false | true 时号码逐字中文读：GA200→"G A 二 零 零" |
+| `repeat` | 2 | 播报遍数 |
+| `rate` | 135 | espeak 语速（对 piper 无效） |
+| `piper_length_scale` | 1.0 | piper 语速缩放，越大越慢，稍慢 1.2 |
+| `gap_sec` | 0.35 | 遍间隔 |
+| `aplay_device` | null | 多声卡时指定，如 `"plughw:1,0"` |
+| `piper_bin/model` | null | piper 可执行与 onnx 模型路径 |
+| `piper_lib_dir` | null | onnxruntime 库目录（LD_LIBRARY_PATH 注入） |
+| `piper_url` | null | 常驻合成服务地址，命中则 2~3s 出声，挂了自动回退 CLI |
+
+## 调优速查
+
+| 现象 | 动作 |
+|---|---|
+| 换屏不触发 | `changed_ratio` ↓（0.0015→0.001）；确认 roi 是否盖住屏幕 |
+| 空场景反复 OCR | `changed_ratio` ↑；检查自动曝光（亮度对齐已兜底大部分） |
+| 播报延迟高 | 确认 `static_confirm_ticks`≥2；OCR 慢查 `OMP_THREAD_LIMIT=1` 与 ROI 大小 |
+| 同号重复播报 | 检查是否形近误读产生新键（C01/C001 类），先补测试用例再改 ocr.rs |
+| 号读成英语 | piper 场景 `spell_number: true`；espeak 场景必须开 |

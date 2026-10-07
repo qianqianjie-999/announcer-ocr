@@ -1,0 +1,6 @@
+# Rust 构建产物
+/target
+
+# 本地测试产物（触发帧存证、自测截图、模拟图）
+/_cam_test/
+/_rs_selftest/
