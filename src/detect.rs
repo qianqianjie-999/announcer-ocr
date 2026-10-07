@@ -11,10 +11,15 @@ pub struct Prepared {
 }
 
 /// 从整帧裁 ROI 并做检测前处理。
+/// ROI 完全出界时返回 0×0 空图(调用方须跳帧): RTSP 重连/降流会临时改变帧尺寸,
+/// USB 恒定分辨率从未暴露此路径, 网络源若不防御将数组越界 panic 杀死服务(实测)。
 pub fn prepare(frame: &Frame, roi: (usize, usize, usize, usize)) -> Prepared {
     let (rx, ry, rw, rh) = roi;
     let rw = rw.min(frame.w.saturating_sub(rx));
     let rh = rh.min(frame.h.saturating_sub(ry));
+    if rw == 0 || rh == 0 {
+        return Prepared { gray: GrayImage::new(0, 0) };
+    }
     let tw = rw.min(480);
     let th = std::cmp::max(1, rh * tw / rw.max(1));
 
@@ -170,6 +175,19 @@ mod tests {
         let b = gray(&[160u8; 64], 8, 8);
         let r = change_ratio(&a, &b, 0.05).unwrap();
         assert_eq!(r, 0.0);
+    }
+
+    #[test]
+    fn prepare_roi_out_of_frame_returns_empty_no_panic() {
+        // RTSP 重连/降流后帧变小、ROI 出界: 必须返回空图而非越界 panic(2026-10-07 实测炸过)
+        let mut f = Frame { w: 640, h: 360, rgb: vec![128u8; 640 * 360 * 3] };
+        assert_eq!(prepare(&f, (482, 396, 1108, 560)).gray.width(), 0); // 完全出界
+        assert_eq!(prepare(&f, (0, 0, 1920, 1080)).gray.width(), 480); // ROI 超大帧→夹到帧内
+        assert_eq!(prepare(&f, (600, 340, 700, 400)).gray.width(), 40); // 半出界→裁剪存活
+        assert_eq!(prepare(&f, (640, 360, 700, 400)).gray.width(), 0); // 边界贴齐=出界
+        // 尺寸恢复正常后必须能正常出图(服务自愈验证)
+        f.w = 960; f.h = 720; f.rgb = vec![128u8; 960 * 720 * 3];
+        assert!(prepare(&f, (482, 396, 1108, 560)).gray.width() > 0);
     }
 
     #[test]

@@ -53,6 +53,18 @@ ffmpeg stdout ──满帧率读取──▶ 后台线程 ──只保留最新�
 `Source::Simulate` 每次调用都重新读文件并解码——测试台脚本可以**原子替换**
 `sim_frame.jpg` 来模拟换屏，无需真实摄像头即可跑完整链路（自测/回归用）。
 
+## RTSP 源要点（2026-10-07 端到端实测）
+
+`camera_source: "rtsp://user:pass@ip:554/stream1"` 即生效，实测链路
+`mediamtx(H.264) → ffmpeg TCP 拉流 → 帧差/OCR 全通`：
+
+- **强制 TCP 传输**（`-rtsp_transport tcp`）：UDP 花屏帧会污染 OCR
+- 低延迟三件套：`nobuffer + low_delay + max_delay 300ms`
+- **RTSP 帧尺寸可能变**（重连/降流），ROI 出界防御已加入——`prepare()`
+  返回空图、主循环跳帧并告警一次；此前该路径会数组越界 panic（USB 恒定
+  分辨率从未暴露）
+- 现场建议用**子码流**（640×360 即够叫号屏识别），省带宽且解码更轻
+
 ## 相关配置
 
 | 字段 | 默认 | 说明 |

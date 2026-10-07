@@ -65,6 +65,7 @@ fn run() -> Result<(), String> {
     let fb_sec = det.fallback_ocr_sec;
 
     let mut prev_gray: Option<GrayImage> = None;
+    let mut roi_warned = false;
     let mut announced: HashSet<(String, String)> = HashSet::new();
     // 非阻塞确认状态机: {候选: (累计轮数, 最后出现时刻, 首次出现时刻)}
     // 关键: 不在确认期间 sleep 阻塞主循环, 否则屏幕连续跳号会被"盲区"吞掉
@@ -140,7 +141,16 @@ fn run() -> Result<(), String> {
         //   谁先看到 req 谁写 —— 主循环抢到时配置台就会读到半张图。
         capture::serve_preview(&frame, "主循环");
 
-        let mut prepared = detect::prepare(&frame, roi);
+        let prepared = detect::prepare(&frame, roi);
+        // ROI 落在帧外(源尺寸变化/配置不匹配): 跳帧防 panic, 只告警一次不刷屏
+        if prepared.gray.width() == 0 {
+            if !roi_warned {
+                roi_warned = true;
+                eprintln!("[警告] ROI {roi:?} 超出帧 {}x{}, 跳帧等待恢复", frame.w, frame.h);
+            }
+            continue;
+        }
+        let mut prepared = prepared;
         detect::blur5(&mut prepared.gray);
 
         let mut changed = true;

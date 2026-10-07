@@ -91,3 +91,20 @@ piper：目标机 python 重建 venv（**3.11 的 venv 在 3.12 不可用**）�
 ### 号码格式核对
 现场实测：号码 `GA204`/`GA200`（2字母+3位数字）、窗口 `C06`/`C08`。
 config 现有 pattern `\d{3,4}` 口径已覆盖，无需改动；若换现场先确认位数。
+
+## RTSP 摄像头接入（2026-10-07 端到端实测）
+
+最终部署用 RTSP 网络摄像头，切换只改一处配置：
+`"camera_source": "rtsp://user:pass@摄像头IP:554/stream1"`（或 Web 台编辑，
+自带双重校验）。实测 `mediamtx → ffmpeg TCP → 帧差/OCR` 全链路通过。
+
+### 接入核对单
+- **RTSP 地址**：摄像头后台确认（常见 `rtsp://user:pass@IP:554/stream1`），
+  debian 与摄像头同网段可达：`ffprobe -rtsp_transport tcp -i <url>` 能列出流即通
+- **用子码流**：640×360 足够叫号屏 OCR，带宽/解码减负；
+  `capture_width/height` 改成与子码流一致（如 640×360）
+- **ROI 重新标定**：分辨率变了旧 ROI 可能出界——出界时程序跳帧并告警
+  `[警告] ROI ... 超出帧`（只告警一次，不再 panic），改好 ROI 即恢复
+- **强制 TCP**：代码已固定 `-rtsp_transport tcp`，UDP 花屏帧不进 OCR；
+  摄像头端如限制传输协议请放开 TCP interleaved
+- **断流自愈同样适用**：网络抖动断流 → 3s 自动重拉（与 USB 同一机制）
