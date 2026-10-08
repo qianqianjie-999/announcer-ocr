@@ -1,9 +1,0 @@
-[Unit]
-# 每天 18:00 停播报服务(非工作时间开始)
-Description=Daily 18:00 stop announce services
-[Timer]
-OnCalendar=*-*-* 18:00:00
-Persistent=true
-Unit=announce-worktime-stop.service
-[Install]
-WantedBy=timers.target

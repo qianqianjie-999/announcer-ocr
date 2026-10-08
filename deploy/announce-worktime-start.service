@@ -1,6 +1,0 @@
-[Unit]
-# 工作时间(每日08:00)拉起播报服务 —— 由 announce-worktime-start.timer 触发
-Description=Start announce-rs and announce-web (work hours)
-[Service]
-Type=oneshot
-ExecStart=/usr/bin/systemctl start announce-piper.service announce-rs.service announce-web.service
