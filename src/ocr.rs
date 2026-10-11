@@ -103,8 +103,16 @@ impl Ocr {
                 e
             )
         })?;
-        let mut so = child.stdout.take().unwrap();
-        let mut se = child.stderr.take().unwrap();
+        // spawn 时固定了 Stdio::piped(), 正常不会为 None; 真出现就收尸返回错误,
+        // 绝不用 unwrap —— panic = "abort" 下 unwrap 等于整个进程猝死。
+        let (mut so, mut se) = match (child.stdout.take(), child.stderr.take()) {
+            (Some(a), Some(b)) => (a, b),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("tesseract 管道不可用(不可能发生)".to_string());
+            }
+        };
         let (tx1, rx1) = mpsc::channel();
         let (tx2, rx2) = mpsc::channel();
         std::thread::spawn(move || {

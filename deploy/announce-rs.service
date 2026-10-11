@@ -24,6 +24,18 @@ RestartSec=5
 StandardOutput=journal
 StandardError=journal
 
+# ★停机语义显式化(二轮加固): 这两条**不改** systemd 的默认行为, 只是把"本服务
+#   正确性所依赖的默认值"写进单元文件 —— 默认值会随 systemd 版本/发行版变化,
+#   而本服务的正常停机依赖它们。
+#   KillMode=control-group(默认): 停机时向整个 cgroup 发 SIGTERM, 连带 ffmpeg /
+#     tesseract 子进程一起收。若被改成 process(只杀主进程), 子进程会变成占住
+#     /dev/video0 的孤儿 —— 正是 docs/07-troubleshooting.md 里那条常见故障。
+#   TimeoutStopSec=15(默认 90s): 程序收到 SIGTERM 后自行收尾, 实测 0.5s 退出;
+#     15s = 播报队列排空有界 10s + 收尾余量。超过即为真卡死, 让 systemd 发
+#     SIGKILL 硬杀, 比干等 90s 好(下次启动还有 5s 重试兜底)。
+KillMode=control-group
+TimeoutStopSec=15
+
 Nice=5
 CPUWeight=50
 # ★150% 会把这个 cgroup(主程序+ffmpeg+tesseract) 掐死: 实测 98.6% 的调度周期被限流,

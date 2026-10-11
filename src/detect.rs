@@ -156,8 +156,13 @@ pub fn enhance_for_ocr(img: &image::RgbImage) -> image::RgbImage {
     for v in g.iter_mut() {
         *v = if *v > thr { 0 } else { 255 };
     }
-    let gray = image::GrayImage::from_raw(w, h, g).expect("enhance: gray buffer");
-    image::DynamicImage::ImageLuma8(gray).to_rgb8()
+    // from_raw 仅在缓冲区长度与 w*h 不符时返回 None —— 本函数里 g 恰为 w*h 个像素,
+    // 不可能发生。真发生就退回原图(不增强): 上层对"增强图读不出"本就有回退语义,
+    // 崩掉整个进程才是不可接受的。
+    match image::GrayImage::from_raw(w, h, g) {
+        Some(gray) => image::DynamicImage::ImageLuma8(gray).to_rgb8(),
+        None => img.clone(),
+    }
 }
 
 #[cfg(test)]

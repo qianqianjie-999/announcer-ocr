@@ -19,8 +19,16 @@ pub trait Engine: Send {
 fn run_timeout(cmd: &mut Command, timeout: Duration) -> Result<Output, String> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().map_err(|e| e.to_string())?;
-    let mut so = child.stdout.take().unwrap();
-    let mut se = child.stderr.take().unwrap();
+    // spawn 前已设 Stdio::piped(), 正常不会为 None; 兜底路径必须顺手收尸,
+    // 否则半途返回 Err 会把子进程留成孤儿(Child 析构不 kill)。
+    let (mut so, mut se) = match (child.stdout.take(), child.stderr.take()) {
+        (Some(a), Some(b)) => (a, b),
+        _ => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("子进程管道不可用".to_string());
+        }
+    };
     // 读线程防管道写满后子进程被阻塞
     let (tx1, rx1) = mpsc::channel();
     let (tx2, rx2) = mpsc::channel();

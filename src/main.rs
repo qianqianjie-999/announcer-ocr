@@ -15,20 +15,15 @@ mod logger;
 mod ocr;
 mod signal;
 mod tts;
+mod util;
 
 use cfg::{Config, SourceKind};
 use dedupe::{AgedMap, Expiry};
 use image::GrayImage;
 use std::collections::{HashMap, HashSet};
 use std::net::TcpListener;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-fn now_secs() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs_f64()
-}
+use std::time::Duration;
+use util::now_secs;
 
 /// 绑定本机回环端口作为单实例锁。端口被占 -> 已有实例在跑。
 /// 与 Python 版一致: 不设 SO_REUSEADDR(std 默认就不设), 进程死操作系统自动释放。
@@ -65,7 +60,7 @@ fn run() -> Result<(), String> {
     let roi = (roi_v[0] as usize, roi_v[1] as usize, roi_v[2] as usize, roi_v[3] as usize);
 
     let ocr = ocr::Ocr::new(&cfg.ocr)?;
-    let ann = announcer::Announcer::new(&cfg);
+    let ann = announcer::Announcer::new(&cfg)?;
     let mut src = capture::open(&cfg.source(), &cfg)?;
 
     let det = cfg.detect.clone();

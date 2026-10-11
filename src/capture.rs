@@ -1,6 +1,7 @@
 // capture.rs — 帧来源: simulate(读 sim_frame.jpg) / ffmpeg 管道(USB v4l2 与 RTSP 统一)
 // 为什么走 ffmpeg 子进程: 不引任何 C 绑定(纯 Rust 依赖才能静态交叉编译),
 // 且 ffmpeg 自带 v4l2/RTSP 解码与低延迟参数, 与 Python 版 OPENCV_FFMPEG_CAPTURE_OPTIONS 同源。
+use crate::util;
 use std::io::{BufReader, Read};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -80,7 +81,7 @@ impl PipeGrabber {
                     // 取子进程: 槽里有就用(首次), 没有就重新 spawn
                     let mut child = loop {
                         {
-                            let mut g = child_slot.lock().unwrap();
+                            let mut g = util::lock(&child_slot);
                             if let Some(c) = g.take() {
                                 break c;
                             }
@@ -106,9 +107,20 @@ impl PipeGrabber {
                             }
                         }
                     };
-                    let stdout = child.stdout.take().expect("ffmpeg stdout");
+                    let stdout = match child.stdout.take() {
+                        Some(s) => s,
+                        // spawn 时固定了 Stdio::piped(), 不会为 None。真出现就收尸后
+                        // 走"重拉"路径(与外层管道断开同构), 而不是 unwrap 崩进程。
+                        None => {
+                            println!("[抓帧] ffmpeg stdout 不可用, 3s 后重新拉起");
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            thread::sleep(Duration::from_secs(3));
+                            continue;
+                        }
+                    };
                     // child 本体放回槽(供 Drop kill); stdout 已取走, 读帧不持锁
-                    *child_slot.lock().unwrap() = Some(child);
+                    *util::lock(&child_slot) = Some(child);
                     let mut r = BufReader::with_capacity(1 << 20, stdout);
                     let frame_size = w * h * 3;
                     let mut bgr = vec![0u8; frame_size];
@@ -124,7 +136,7 @@ impl PipeGrabber {
                                 let mut rgb = bgr.clone();
                                 to_rgb(&mut rgb);
                                 let f = Arc::new(Frame { w, h, rgb });
-                                *latest.lock().unwrap() = Some(f.clone());
+                                *util::lock(&latest) = Some(f.clone());
                                 n_frames += 1;
                                 // 日志降噪: 原 60 帧一条会一天刷 4 万行(约7MB), 挤掉
                                 // 有用日志还耗 SD 写寿命。改为每 10 分钟一条。
@@ -150,7 +162,7 @@ impl PipeGrabber {
                     }
                     // 收尸: kill + wait, 不留 defunct 僵尸(实测僵尸会一直挂在 ps 里)
                     {
-                        let mut g = child_slot.lock().unwrap();
+                        let mut g = util::lock(&child_slot);
                         if let Some(mut c) = g.take() {
                             let _ = c.kill();
                             let _ = c.wait();
@@ -167,7 +179,7 @@ impl PipeGrabber {
     }
 
     pub fn latest(&self) -> Option<Arc<Frame>> {
-        self.latest.lock().unwrap().clone()
+        util::lock(&self.latest).clone()
     }
 }
 
@@ -183,7 +195,7 @@ fn spawn_ffmpeg(args: &[String]) -> std::io::Result<Child> {
 impl PipeGrabber {
     /// kill + wait 掉当前槽里的子进程(不管有没有)。幂等, 可反复调用。
     fn reap_child(&self) {
-        if let Some(mut c) = self.child.lock().unwrap().take() {
+        if let Some(mut c) = util::lock(&self.child).take() {
             let _ = c.kill();
             let _ = c.wait();
         }
