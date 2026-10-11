@@ -32,6 +32,7 @@ version = "1.0.0"
 dependencies = [
  "chrono",
  "image",
+ "libc",
  "regex",
  "serde",
  "serde_json",

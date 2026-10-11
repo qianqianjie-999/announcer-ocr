@@ -65,6 +65,22 @@ cargo test --release
 
 > ROI 强烈建议按现场标定收紧到叫号屏区域：背景杂物会严重污染识别（实测教训）。
 
+## 停机、重启与长稳维护
+
+2026-10-11 起，这三件事由程序自己负责，不再依赖部署层的定时器兜底：
+
+| 场景 | 行为 |
+|---|---|
+| `systemctl restart` / `Ctrl+C` / `kill <pid>` | 收到 SIGTERM/SIGINT → 播完队列 → 收掉 ffmpeg 子进程 → 退出码 0（**不留孤儿进程**） |
+| 号码跨天复用 | 去重表每天本地零点自动清理（`announced_ttl_sec: 0`）；也可配滚动 TTL |
+| 日志写满 | 超过 `log_max_mb`（默认 8MB）自动归档到 `logs_archive/`，只留最近 `log_keep`（默认 6）个 |
+
+> **升级提示**：`announced` 的语义从"永不重复"变为"当天不重复"。若现场确实需要
+> "一个号码一整天只播一次、跨天也不重播"，把 `announced_ttl_sec` 设为负数即可回到旧行为。
+
+journal 里的维护留痕（用于确认治理在工作）：`[退出] 收到停止信号…`、`[退出] 已优雅停机`、
+`[维护] 去重表清理: …`、`[日志] 已达阈值, 轮转 -> …`、`[启动] 清理 _live/ 上次遗留的临时文件 N 个`。
+
 ## 目录结构
 
 ```
@@ -74,9 +90,11 @@ anntest-src/
 │   ├── capture.rs     # 帧采集：ffmpeg 管道 / 模拟模式，断流自愈
 │   ├── detect.rs      # 变化检测：灰度缩放 + 亮度对齐帧差 + OCR 增强预处理
 │   ├── ocr.rs         # tesseract 子进程调用 + 噪声清洗 + 正则解析
-│   ├── announcer.rs   # 播报器：去重 TTL + 语音队列
+│   ├── announcer.rs   # 播报器：语音队列 + 优雅退出前排空
 │   ├── tts.rs         # 语音合成：espeak / piper 双引擎
-│   ├── logger.rs      # CSV 播报日志
+│   ├── logger.rs      # CSV 播报日志 + 按大小轮转归档
+│   ├── dedupe.rs      # 去重表的时间治理（每日零点 / TTL / 硬上限）
+│   ├── signal.rs      # SIGTERM/SIGINT 优雅退出（置停止标志）
 │   ├── cfg.rs         # 配置结构（serde 反序列化，全字段有默认值）
 │   └── （配套）config_web.py  # Web 配置调试台（Python 标准库，端口 8080）
 ├── docs/              # 按功能分块的详细文档（见下）
@@ -96,4 +114,5 @@ anntest-src/
 | [07-troubleshooting.md](docs/07-troubleshooting.md) | 实战排障：踩坑记录与现场处置 |
 | [08-webui.md](docs/08-webui.md) | Web 配置调试台：ROI 拖框、OCR/TTS 自测、API 与安全设计 |
 | [09-rtsp-field-checklist.md](docs/09-rtsp-field-checklist.md) | 现场 RTSP 摄像头接入操作清单（打印携带用） |
+| [10-quality-review.md](docs/10-quality-review.md) | 生产级稳定性评审：量化指标、问题分级、优化实施记录与实测证据 |
 ```

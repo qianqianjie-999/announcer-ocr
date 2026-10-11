@@ -25,6 +25,9 @@ fn trepeat() -> u32 { 2 }
 fn trate() -> i32 { 135 }
 fn ttemplate() -> String { "请{number}到{window}号窗口办理".into() }
 fn tgap() -> f64 { 0.35 }
+fn logmb() -> f64 { 8.0 }
+fn logkeep() -> u32 { 6 }
+fn logarch() -> String { "logs_archive".into() }
 
 #[derive(Deserialize, Clone, Default)]
 pub struct Detect {
@@ -94,6 +97,20 @@ pub struct Config {
     #[serde(default = "d5")] pub diag_every_sec: f64,
     #[serde(default = "def_true")] pub save_trigger_frames: bool,
     #[serde(default = "logf")] pub log_file: String,
+    /// 已播报去重表(`announced`)的过期策略, 单位秒。
+    /// **0(默认)= 每日本地零点清零** —— 与"叫号号码按天复用"的业务语义一致;
+    /// 正数 = 滚动 TTL, 距最后一次播报超过 N 秒即允许重播;
+    /// 负数 = 永不清理(旧行为, 仅供回归对照; 仍有 4096 条硬上限兜底)。
+    /// 为什么要有这个开关: 旧实现只增不删, 号码跨天复用时会被永久判为"已播报"而
+    /// 静默哑掉; 现场没暴露只是因为 worktime 定时器每天 18:00 重启顺带清了一次。
+    #[serde(default)] pub announced_ttl_sec: f64,
+    /// 播报日志按大小轮转的阈值(MB)。0 = 关闭, 完全交给 deploy/announce-cleanup.sh。
+    /// 默认 8MB 与清理脚本的阈值一致; 归档命名也一致, 两边可共存不冲突。
+    #[serde(default = "logmb")] pub log_max_mb: f64,
+    /// 日志归档保留个数(不含当前文件), 与清理脚本的 ARCHIVE_KEEP 保持一致。
+    #[serde(default = "logkeep")] pub log_keep: u32,
+    /// 日志归档目录。只在 log_max_mb > 0 时使用。
+    #[serde(default = "logarch")] pub log_archive_dir: String,
     #[serde(default = "cw")] pub capture_width: u32,
     #[serde(default = "chh")] pub capture_height: u32,
     #[serde(default)] pub detect: Detect,

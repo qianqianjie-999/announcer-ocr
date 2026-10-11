@@ -10,6 +10,9 @@ serde_json = "1"
 image = { version = "0.24", default-features = false, features = ["jpeg", "png"] }
 regex = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# 只为 signal.rs 注册 SIGTERM/SIGINT 处理器。libc 本来就被 std 链接,
+# 加它不引入任何 C 库依赖, 不影响静态交叉编译。版本跟随 Cargo.lock 里的传递依赖。
+libc = "0.2"
 
 [profile.release]
 opt-level = 2

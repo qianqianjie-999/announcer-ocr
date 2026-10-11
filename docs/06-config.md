@@ -12,6 +12,10 @@
 | `capture_width/height` | u32 | 1920/1080 | 请求 ffmpeg 输出分辨率 |
 | `lock_port` | u16 | 51888 | 单实例锁（回环 TCP 占用，重复启动立即退出） |
 | `log_file` | str | `announce_log.csv` | 播报日志路径 |
+| `announced_ttl_sec` | f64 | 0 | 已播报去重表的过期策略（秒）：**0 = 每日本地零点清零**（默认，与"号码按天复用"业务语义一致）；`>0` = 滚动 TTL；`<0` = 永不清理（旧行为，仍有 4096 条硬上限兜底） |
+| `log_max_mb` | f64 | 8.0 | 播报日志按大小轮转阈值（MB）。`0` = 关闭轮转（把治理完全交给 `deploy/announce-cleanup.sh`） |
+| `log_keep` | u32 | 6 | 日志归档保留个数（不含当前文件），与清理脚本的 `ARCHIVE_KEEP` 对齐 |
+| `log_archive_dir` | str | `logs_archive` | 日志归档目录，仅在 `log_max_mb > 0` 时使用 |
 | `save_trigger_frames` | bool | true | 触发帧存证 `_live/`（生产稳定后可关，省 SD 写） |
 | `diag_heartbeat` | bool | true | 心跳诊断日志 |
 | `diag_every_sec` | f64 | 5.0 | 心跳间隔 |

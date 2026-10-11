@@ -9,12 +9,15 @@
 mod announcer;
 mod capture;
 mod cfg;
+mod dedupe;
 mod detect;
 mod logger;
 mod ocr;
+mod signal;
 mod tts;
 
 use cfg::{Config, SourceKind};
+use dedupe::{AgedMap, Expiry};
 use image::GrayImage;
 use std::collections::{HashMap, HashSet};
 use std::net::TcpListener;
@@ -46,6 +49,14 @@ fn run() -> Result<(), String> {
     // 锁端口可配置: 便于不打扰生产实例的前提下另起模拟实例自测
     let _lock = acquire_lock(cfg.lock_port)?;
 
+    // ★优雅退出第一件事: 先把信号处理装好, 再干别的。
+    //   顺序不能反 —— 装之前收到的 SIGTERM 会直接终止进程, 那样 run() 作用域内的
+    //   PipeGrabber 不会被析构, ffmpeg 子进程就留成占住 /dev/video0 的孤儿了。
+    signal::install();
+    // 上次若是被 kill -9 / 掉电打断的, _live/ 会留下半截 .tmp 和没人消费的 req。
+    // 只清这两类"确定是垃圾"的, **不动 trig_*.jpg** —— 那是上一轮的现场证据。
+    cleanup_live_dir();
+
     let roi_v = cfg
         .roi
         .clone()
@@ -66,7 +77,11 @@ fn run() -> Result<(), String> {
 
     let mut prev_gray: Option<GrayImage> = None;
     let mut roi_warned = false;
-    let mut announced: HashSet<(String, String)> = HashSet::new();
+    // 已播报去重表 —— 带时间维度, 会被下面的"维护节拍"定期清理(见 dedupe.rs)。
+    // 旧实现只 insert 不删除, 号码跨天复用时会被永久判为"已播报"而静默哑掉。
+    // 4096 条硬上限兜底: 即使 announced_ttl_sec 被配成"永不清理"也不会吃内存。
+    let mut announced: AgedMap<(String, String), ()> =
+        AgedMap::new(Expiry::from_ttl_sec(cfg.announced_ttl_sec), 4096);
     // 非阻塞确认状态机: {候选: (累计轮数, 最后出现时刻, 首次出现时刻)}
     // 关键: 不在确认期间 sleep 阻塞主循环, 否则屏幕连续跳号会被"盲区"吞掉
     let mut confirm: HashMap<(String, String), (u32, f64, f64)> = HashMap::new();
@@ -89,8 +104,10 @@ fn run() -> Result<(), String> {
     let mut static_streak: u32 = 0;               // 连续"无变化"的轮数
     let mut static_since = 0.0f64;                // 当前静帧段起点(最后一条 changed 帧)
     let mut last_read_ok = false;                 // 上一轮 OCR 是否读出了内容
-    // 候选首次识别时的原文(静帧快速确认路径没有当轮 raw, 落日志用)
-    let mut cand_raw: HashMap<(String, String), String> = HashMap::new();
+    // 候选首次识别时的原文(静帧快速确认路径没有当轮 raw, 落日志用)。
+    // 同样是"只增不删"的表, 一并纳入时间治理 —— 按号牌累积, 连跑几个月会被撑大。
+    let mut cand_raw: AgedMap<(String, String), String> =
+        AgedMap::new(Expiry::from_ttl_sec(cfg.announced_ttl_sec), 8192);
     // 诊断窗口内的 OCR 统计(次数/总耗时/最长), 拼进 [监测] 行便于远程排障
     let mut diag_ocr_n: u32 = 0;
     let mut diag_ocr_total = 0.0f64;
@@ -110,6 +127,13 @@ fn run() -> Result<(), String> {
     let mut last_save = 0.0f64;
     let mut n_saved: u32 = 0;
 
+    // —— 维护节拍 ————————————————————————————————————————————
+    // 60s 一次, 做两件"旧实现漏掉"的事: 清理只增不删的表、日志写满就归档。
+    // 与"识别/播报"主逻辑无关, 单独拎出来只占几个变量。
+    let mut last_maint = now_secs();
+    let maint_every = 60.0f64;
+    let log_max_bytes = (cfg.log_max_mb.max(0.0) * 1024.0 * 1024.0) as u64;
+
     let src_desc = match cfg.source() {
         SourceKind::Simulate => "simulate".to_string(),
         SourceKind::Net(u) => u,
@@ -121,6 +145,12 @@ fn run() -> Result<(), String> {
     );
 
     loop {
+        // ★优雅退出检查点: 收到 SIGTERM/SIGINT 就在这里 break, 而不是被信号打死。
+        //   正常返回 -> run() 作用域内的 ann / src 依次析构 -> PipeGrabber 收 ffmpeg。
+        if signal::stopped() {
+            println!("[退出] 收到停止信号(SIGTERM/SIGINT), 开始收尾…");
+            break;
+        }
         let loop_start = now_secs();
         let frame = match src.read() {
             Some(f) => f,
@@ -227,7 +257,7 @@ fn run() -> Result<(), String> {
                 // c: &(号码, 窗口), v: (累计轮数, 最后出现时刻, 首次出现时刻)
                 // last_seen >= static_since: 候选必须 sighting 于"当前静帧段"内,
                 // 旧静帧段残留的假影候选永远进不了快速确认(走原投票路径)。
-                if !announced.contains(c) && v.1 >= static_since {
+                if !announced.contains_key(c) && v.1 >= static_since {
                     hit.push(c.clone());
                 }
             }
@@ -239,7 +269,7 @@ fn run() -> Result<(), String> {
                         Some(&(_, _, f)) => f,
                         None => t_ann,
                     };
-                    announced.insert(cand.clone());
+                    announced.insert(cand.clone(), (), t_ann);
                     let raw = cand_raw.get(&cand).cloned().unwrap_or_default();
                     logger::log(&cfg.log_file, &cand.0, &cand.1, &raw, "OK");
                     ann.speak(&cand.0, &cand.1); // 入FIFO队列, 播报线程按顺序播
@@ -341,8 +371,8 @@ fn run() -> Result<(), String> {
                     // 相当于把 1.8s 的合成耗时从关键路径上整体藏掉。
                     last_read_ok = !cands.is_empty();
                     for cand in &cands {
-                        cand_raw.insert(cand.clone(), raw.clone());
-                        if !announced.contains(cand) && prefetched.insert(cand.clone()) {
+                        cand_raw.insert(cand.clone(), raw.clone(), now);
+                        if !announced.contains_key(cand) && prefetched.insert(cand.clone()) {
                             if prefetched.len() > 64 {
                                 prefetched.clear();
                             }
@@ -351,7 +381,7 @@ fn run() -> Result<(), String> {
                     }
                     // 只对"尚未播报"的候选续观察期。若对已播报的号码也续期,
                     // 屏幕一直显示号码时观察期会被无限续期 -> OCR 变相常开白烧 CPU。
-                    if cands.difference(&announced).next().is_some() {
+                    if cands.iter().any(|c| !announced.contains_key(c)) {
                         active_until = now + active_sec;
                     }
                     // 清理超时未再出现的候选(闪变残留), 不立即清零 -> 短暂被替换的号码仍保留计数
@@ -365,8 +395,8 @@ fn run() -> Result<(), String> {
                             None => (1, now), // 首次出现时刻 = 真正的"屏幕变化"起点
                         };
                         confirm.insert(cand.clone(), (cnt, now, first));
-                        if cnt >= need_stable && !announced.contains(&cand) {
-                            announced.insert(cand.clone());
+                        if cnt >= need_stable && !announced.contains_key(&cand) {
+                            announced.insert(cand.clone(), (), now);
                             logger::log(&cfg.log_file, &cand.0, &cand.1, &raw, "OK");
                             ann.speak(&cand.0, &cand.1); // 入FIFO队列, 播报线程按顺序播
                             println!(
@@ -398,8 +428,74 @@ fn run() -> Result<(), String> {
             }
         }
 
+        // —— 维护节拍 ——————————————————————————————————————————
+        // ① 清掉过期的"已播报"记录(旧实现从不清理 -> 跨天后同一号码永久哑掉);
+        // ② 日志写满阈值就归档(旧实现只管写, 写满 SD 卡只能等部署层第二天来收)。
+        // 清理/轮转都打日志: 旧实现的"静默软故障"正是因为它悄悄什么都不做 ——
+        // 让隐式维护显形, 现场看一眼 journal 就知道治理在不在工作。
+        if now - last_maint >= maint_every {
+            last_maint = now;
+            let n_ann = announced.prune(now);
+            let n_raw = cand_raw.prune(now);
+            if n_ann > 0 || n_raw > 0 {
+                println!(
+                    "[维护] 去重表清理: 已播报 {} 条 / 候选原文 {} 条; 现存 {}/{}",
+                    n_ann,
+                    n_raw,
+                    announced.count(),
+                    cand_raw.count()
+                );
+            }
+            // 归档目录配了空串 -> 回落到与 deploy/announce-cleanup.sh 一致的默认目录,
+            // 免得"配错一个空值"让日志治理悄悄失效。
+            let dir = if cfg.log_archive_dir.trim().is_empty() {
+                logger::DEFAULT_ARCHIVE_DIR
+            } else {
+                cfg.log_archive_dir.trim()
+            };
+            if let Some(p) =
+                logger::rotate_if_needed(&cfg.log_file, dir, log_max_bytes, cfg.log_keep)
+            {
+                println!("[日志] 已达阈值, 轮转 -> {}", p);
+            }
+        }
+
         let rest = interval - (now_secs() - loop_start);
         std::thread::sleep(Duration::from_secs_f64(rest.max(0.05)));
+    }
+
+    // —— 优雅退出收尾 ————————————————————————————————————————
+    // 先把"已确认待播"的叫号播完(有界 10s), 再让 PipeGrabber 析构收 ffmpeg。
+    // 顺序有讲究: 先播完再拆流, 否则重启瞬间正在排队的号会被掐掉。
+    if !ann.drain(Duration::from_secs(10)) {
+        println!("[退出] 播报队列仍有积压, 超时退出(未播完的号码已记入 CSV 日志)");
+    }
+    println!("[退出] 已优雅停机");
+    Ok(())
+}
+
+/// 清理 `_live/` 里"确定是上一轮残留"的临时文件: 预览原子写留下的半截 `.tmp`、
+/// 以及没人消费的预览请求 `req`。
+///
+/// **故意不动 `trig_*.jpg`**: 那是触发时刻的存证帧, 是现场排障最想看的东西 ——
+/// 启动就删等于把上一轮出问题时的证据抹掉。它们的保留期由部署层
+/// `deploy/announce-cleanup.sh` 按 7 天统一管理。
+fn cleanup_live_dir() {
+    let rd = match std::fs::read_dir("_live") {
+        Ok(r) => r,
+        Err(_) => return, // 目录还不存在, 没什么可清
+    };
+    let mut n = 0u32;
+    for e in rd.flatten() {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        let junk = name == "latest.jpg.tmp" || name == "req";
+        if junk && std::fs::remove_file(e.path()).is_ok() {
+            n += 1;
+        }
+    }
+    if n > 0 {
+        println!("[启动] 清理 _live/ 上次遗留的临时文件 {} 个", n);
     }
 }
 
@@ -408,4 +504,6 @@ fn main() {
         eprintln!("[退出] {}", e);
         std::process::exit(1);
     }
+    // 正常路径(run 返回 Ok)只可能是收到停止信号后 break —— 退出码 0 表示
+    // "优雅停机", systemd 看到 Result=success 就不会记为失败。
 }

@@ -10,6 +10,15 @@ use std::sync::{Arc, Condvar, Mutex};
 
 type Item = (String, String);
 
+/// 取锁且"不中毒"。
+/// 为什么不用 `lock().unwrap()`: 本程序 release profile 是 `panic = "abort"`,
+/// panic 直接终止进程, 锁根本不可能进入 poisoned 状态 —— 用 `into_inner` 兜底
+/// 只是把"锁坏不了"这个事实写进代码, 同时避免生产路径上多出一堆 unwrap
+/// (评审 P2-1: mutex 的 lock().unwrap() 应换掉)。
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 struct Inner {
     q: Mutex<VecDeque<Item>>,
     cv: Condvar,
@@ -17,6 +26,8 @@ struct Inner {
 
 pub struct Announcer {
     inner: Arc<Inner>,
+    /// 是否正在出声(已出队但还没播完)。优雅退出时用它判断"能不能走了"。
+    busy: Arc<Mutex<bool>>,
     tts_cfg: crate::cfg::Tts,
     enabled: bool,
     repeat: u32,
@@ -33,6 +44,7 @@ impl Announcer {
         let t = cfg.tts.clone();
         let a = Arc::new(Announcer {
             inner: Arc::new(Inner { q: Mutex::new(VecDeque::new()), cv: Condvar::new() }),
+            busy: Arc::new(Mutex::new(false)),
             enabled: t.enabled,
             repeat: t.repeat,
             template: t.template.clone(),
@@ -57,12 +69,15 @@ impl Announcer {
         }
         loop {
             let (number, window) = {
-                let mut q = self.inner.q.lock().unwrap();
+                let mut q = lock(&self.inner.q);
                 loop {
                     if let Some(item) = q.pop_front() {
                         break item;
                     }
-                    q = self.inner.cv.wait(q).unwrap();
+                    q = self.inner
+                        .cv
+                        .wait(q)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                 }
             };
             let (n, w) = if self.spell {
@@ -75,6 +90,7 @@ impl Announcer {
                 .replace("{number}", &n)
                 .replace("{window}", &w);
             println!("[播报] {}", text);
+            *lock(&self.busy) = true; // 出队即标记"在出声"
             match &speak_fn {
                 Some(e) => {
                     if let Err(err) = e.speak(&text, self.repeat) {
@@ -91,16 +107,38 @@ impl Announcer {
                     }
                 }
             }
+            *lock(&self.busy) = false;
+        }
+    }
+
+    /// 队列是否空闲(没有待播的, 也没有正在出声的)。
+    pub fn is_idle(&self) -> bool {
+        lock(&self.inner.q).is_empty() && !*lock(&self.busy)
+    }
+
+    /// 优雅退出: 等播报队列排空(有界), 别在重启/停机时把已确认的叫号掐掉。
+    /// 返回 true = 已排空; false = 超时仍有积压(打印告警由调用方负责)。
+    /// 不负责停止播报线程 —— 进程退出时它自然结束。
+    pub fn drain(&self, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if self.is_idle() {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
     }
 
     /// 入FIFO队列: 播报中来的新号自动排队, 顺序不乱。
     pub fn speak(&self, number: &str, window: &str) {
-        let depth = self.inner.q.lock().unwrap().len();
+        let depth = lock(&self.inner.q).len();
         if depth >= 3 {
             println!("[警告] 播报队列积压 {} 条, 叫号过于密集, 声音将顺延", depth);
         }
-        let mut q = self.inner.q.lock().unwrap();
+        let mut q = lock(&self.inner.q);
         q.push_back((number.to_string(), window.to_string()));
         self.inner.cv.notify_one();
     }
@@ -135,5 +173,37 @@ impl Announcer {
                 let _ = crate::tts::http_post_wav(&url, &text);
             })
             .ok();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// enabled=false: 不建 TTS 引擎(否则会去探测 espeak/piper, 依赖靶机环境),
+    /// 只验证队列与"队列忙闲"语义 —— 这正是优雅退出依赖的那部分。
+    fn silent() -> Config {
+        let mut c = Config::default();
+        c.tts.enabled = false;
+        c.tts.template = "T{number}-{window}".to_string();
+        c
+    }
+
+    #[test]
+    fn fresh_announcer_is_idle() {
+        let a = Announcer::new(&silent());
+        assert!(a.is_idle(), "刚起来没有待播项");
+        assert!(a.drain(Duration::from_millis(100)), "空队列应立即排空");
+    }
+
+    #[test]
+    fn drain_waits_until_queue_is_consumed() {
+        let a = Announcer::new(&silent());
+        for i in 0..5u32 {
+            a.speak(&format!("GA20{i}"), "C03");
+        }
+        assert!(a.drain(Duration::from_secs(5)), "排队项应被播报线程消费完");
+        assert!(a.is_idle(), "排空后应为空闲");
     }
 }

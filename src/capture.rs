@@ -40,6 +40,9 @@ pub struct PipeGrabber {
     latest: Arc<Mutex<Option<Arc<Frame>>>>,
     stop: Arc<std::sync::atomic::AtomicBool>,
     child: Arc<Mutex<Option<Child>>>,
+    /// 抓帧线程句柄。Drop 需要**等它收完尸**再返回 —— 见 Drop 里的注释:
+    /// 只把 stop 置位就返回, 主进程可能先退出, 那条线程手上的 ffmpeg 就变孤儿了。
+    handle: Option<thread::JoinHandle<()>>,
 }
 
 impl PipeGrabber {
@@ -64,7 +67,7 @@ impl PipeGrabber {
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let child_slot: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(Some(first)));
 
-        {
+        let handle = {
             let latest = latest.clone();
             let stop = stop.clone();
             let child_slot = child_slot.clone();
@@ -86,7 +89,14 @@ impl PipeGrabber {
                             return;
                         }
                         match spawn_ffmpeg(&args) {
-                            Ok(c) => {
+                            Ok(mut c) => {
+                                // ★刚 spawn 完就收到停止请求: 当场收尸, 别留孤儿。
+                                //   Drop 的等待窗口此时可能已经走完, 这是最后一个漏点。
+                                if stop.load(Relaxed) {
+                                    let _ = c.kill();
+                                    let _ = c.wait();
+                                    return;
+                                }
                                 println!("[抓帧] ffmpeg 已重新拉起");
                                 break c;
                             }
@@ -151,9 +161,9 @@ impl PipeGrabber {
                     }
                     thread::sleep(Duration::from_secs(3));
                 }
-            });
-        }
-        Ok(PipeGrabber { latest, stop, child: child_slot })
+            })
+        };
+        Ok(PipeGrabber { latest, stop, child: child_slot, handle: Some(handle) })
     }
 
     pub fn latest(&self) -> Option<Arc<Frame>> {
@@ -170,13 +180,42 @@ fn spawn_ffmpeg(args: &[String]) -> std::io::Result<Child> {
         .spawn()
 }
 
-impl Drop for PipeGrabber {
-    fn drop(&mut self) {
-        use std::sync::atomic::Ordering::Relaxed;
-        self.stop.store(true, Relaxed);
+impl PipeGrabber {
+    /// kill + wait 掉当前槽里的子进程(不管有没有)。幂等, 可反复调用。
+    fn reap_child(&self) {
         if let Some(mut c) = self.child.lock().unwrap().take() {
             let _ = c.kill();
             let _ = c.wait();
+        }
+    }
+}
+
+impl Drop for PipeGrabber {
+    /// 收尸三段式(2026-10-11 补优雅退出时重写):
+    ///   ① 置停止标志 —— 抓帧线程与主循环都会看到;
+    ///   ② kill 槽里的子进程 —— 打断它阻塞中的 read_exact;
+    ///   ③ **等抓帧线程自己收完尾**(有界 2s)。
+    ///
+    /// 为什么必须有 ③: 子进程在"被线程从槽里取走、还没放回槽"的那几行代码之间时,
+    /// Drop 的 ② 会扑空 —— 而那条线程自己是会 kill+wait 的。不等它, 主进程一退出,
+    /// 线程手上的 ffmpeg 就成了占住 /dev/video0 的孤儿 —— 这正是
+    /// docs/07-troubleshooting.md 里"取帧失败先查孤儿 ffmpeg"那条的成因。
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.stop.store(true, Relaxed);
+        self.reap_child();
+        if let Some(h) = self.handle.take() {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while !h.is_finished() && std::time::Instant::now() < deadline {
+                self.reap_child(); // 线程可能刚把子进程放回槽里, 补刀
+                thread::sleep(Duration::from_millis(20));
+            }
+            if h.is_finished() {
+                let _ = h.join();
+            } else {
+                self.reap_child();
+                println!("[抓帧] 收尾超时(2s), 已强制收尸, 抓帧线程随进程退出");
+            }
         }
     }
 }
@@ -361,3 +400,75 @@ pub fn open(kind: &crate::cfg::SourceKind, cfg: &crate::cfg::Config) -> Result<S
 /// 树莓派/J1850 这类弱机没有硬解码器时 ffmpeg 自动回落软解, 不加也没错;
 /// 但显式关掉 vdpau/vaapi 探测可省 0.5s 启动时间。
 fn extend_hwaccel(_args: &mut Vec<String>) {}
+
+#[cfg(test)]
+mod tests {
+    use super::{crop_rgb, downscale, Frame};
+
+    /// 构造 w×h 的帧, 每个像素填 (x, y, 常量) —— 便于断言"裁对了位置"。
+    fn frame(w: usize, h: usize) -> Frame {
+        let mut rgb = Vec::with_capacity(w * h * 3);
+        for y in 0..h {
+            for x in 0..w {
+                rgb.push(x as u8);
+                rgb.push(y as u8);
+                rgb.push(7);
+            }
+        }
+        Frame { w, h, rgb }
+    }
+
+    #[test]
+    fn crop_takes_exact_window() {
+        let f = frame(8, 6);
+        let c = crop_rgb(&f, (2, 1, 3, 2));
+        assert_eq!((c.width(), c.height()), (3, 2));
+        // 左上角应取自原图 (2,1)
+        assert_eq!(c.get_pixel(0, 0).0, [2, 1, 7]);
+        // 右下角 = (2+2, 1+1) = (4,2)
+        assert_eq!(c.get_pixel(2, 1).0, [4, 2, 7]);
+    }
+
+    /// ROI 出界必须钳制成小图, 绝不能越界 panic(与 detect::prepare 的防御同源)。
+    #[test]
+    fn crop_clamps_out_of_frame_roi() {
+        let f = frame(4, 4);
+        let c = crop_rgb(&f, (3, 3, 100, 100));
+        assert_eq!((c.width(), c.height()), (1, 1));
+        assert_eq!(c.get_pixel(0, 0).0, [3, 3, 7]);
+
+        // 完全出界 -> 0×0 空图(上层据此跳帧)
+        let empty = crop_rgb(&f, (99, 99, 10, 10));
+        assert_eq!((empty.width(), empty.height()), (0, 0));
+    }
+
+    #[test]
+    fn downscale_by_two_averages_blocks() {
+        // 用 40×40: 缩 2 倍后 20×20, 不低于 downscale 的 16px 下限
+        let f = frame(40, 40);
+        let d = downscale(&f, 2).expect("40x40 缩 2 倍应成功");
+        assert_eq!((d.width(), d.height()), (20, 20));
+        // 左上 2×2 块: x∈{0,1}, y∈{0,1} -> 平均 x=0.5->0, y=0.5->0
+        assert_eq!(d.get_pixel(0, 0).0, [0, 0, 7]);
+        // 右上块 x∈{2,3} -> 平均 2.5 -> 2; y∈{0,1} -> 0
+        assert_eq!(d.get_pixel(1, 0).0, [2, 0, 7]);
+    }
+
+    #[test]
+    fn downscale_div_one_copies_frame() {
+        let f = frame(3, 2);
+        let d = downscale(&f, 1).expect("div<=1 应退化为原尺寸复制");
+        assert_eq!((d.width(), d.height()), (3, 2));
+        assert_eq!(d.as_raw(), &f.rgb);
+    }
+
+    #[test]
+    fn downscale_rejects_bad_input() {
+        // 缩完小于 16px 的边 -> None(预览要能看清, 不做碎图)
+        let small = frame(20, 20);
+        assert!(downscale(&small, 2).is_none());
+        // 缓冲区长度不足 -> None(尺寸不匹配时防越界读)
+        let broken = Frame { w: 40, h: 40, rgb: vec![0u8; 10] };
+        assert!(downscale(&broken, 2).is_none());
+    }
+}
