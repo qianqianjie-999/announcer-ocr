@@ -312,7 +312,7 @@ fn run() -> Result<(), String> {
                         92,
                     );
                     enc.encode_image(&image::DynamicImage::ImageRgb8(crop.clone()))
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+                        .map_err(std::io::Error::other)
                 });
                 match res {
                     Ok(()) => println!("[存证] OCR所见画面 -> {}", p),
@@ -333,7 +333,7 @@ fn run() -> Result<(), String> {
                         //   模式不同(实测同一图一个读对窗口、一个读对号码), 各试一次先中先用。
                         let up = detect::enhance_for_ocr(&crop);
                         for psm in [ocr.default_psm(), 6u32] {
-                            if cands.len() > 0 {
+                            if !cands.is_empty() {
                                 break;
                             }
                             if let Ok(raw2) = ocr.recognize_psm(&up, psm) {

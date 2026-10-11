@@ -318,7 +318,7 @@ pub fn serve_preview(frame: &Frame, who: &str) {
                 80,
             );
             enc.encode_image(&image::DynamicImage::ImageRgb8(img))
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+                .map_err(std::io::Error::other)
         }).and_then(|_| std::fs::rename(tmp, dst)),
         None => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,

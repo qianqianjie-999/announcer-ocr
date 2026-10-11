@@ -1,0 +1,9 @@
+[Unit]
+# 每天 08:00 启动播报服务(工作时间开始)
+Description=Daily 08:00 start announce services
+[Timer]
+OnCalendar=*-*-* 08:00:00
+Persistent=true
+Unit=announce-worktime-start.service
+[Install]
+WantedBy=timers.target

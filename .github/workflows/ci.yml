@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: build / test / clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup component add clippy
+
+      - name: 缓存 cargo 依赖
+        uses: Swatinem/rust-cache@v2
+
+      # 单测均为纯逻辑用例（去重表时间语义 / 号码解析 / ROI 边界 / 日志轮转），
+      # 不依赖 tesseract、ffmpeg 或摄像头设备，因此 CI 无需安装外部二进制。
+      - name: 构建
+        run: cargo build --release --locked
+
+      - name: 单元测试
+        run: cargo test --release --locked
+
+      - name: Clippy（告警即失败）
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      # 本项目采用手工对齐排版，尚未适配 rustfmt，故此项仅提示、不阻塞合并。
+      # 想改为强制，把下面两行删掉即可（届时需先跑一次 cargo fmt --all）。
+      - name: rustfmt 检查（非阻塞）
+        continue-on-error: true
+        run: cargo fmt --all --check

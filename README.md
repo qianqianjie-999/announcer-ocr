@@ -98,6 +98,7 @@ anntest-src/
 │   ├── cfg.rs         # 配置结构（serde 反序列化，全字段有默认值）
 │   └── （配套）config_web.py  # Web 配置调试台（Python 标准库，端口 8080）
 ├── docs/              # 按功能分块的详细文档（见下）
+├── deploy/            # 靶机部署资产：systemd 单元 + 安装/清理脚本（见「部署」节）
 └── config.json        # 运行配置
 ```
 
@@ -115,4 +116,28 @@ anntest-src/
 | [08-webui.md](docs/08-webui.md) | Web 配置调试台：ROI 拖框、OCR/TTS 自测、API 与安全设计 |
 | [09-rtsp-field-checklist.md](docs/09-rtsp-field-checklist.md) | 现场 RTSP 摄像头接入操作清单（打印携带用） |
 | [10-quality-review.md](docs/10-quality-review.md) | 生产级稳定性评审：量化指标、问题分级、优化实施记录与实测证据 |
-```
+
+## 部署（deploy/）
+
+靶机（Debian，部署根 `/home/debian/anntest`）的**运维即代码**，与主程序同仓库、同版本管理。
+⚠️ 这些文件描述的是**靶机布局**，不参与本地编译。
+
+Rust 版当前在用：
+
+| 文件 | 作用 |
+|---|---|
+| `announce-rs.service` | 主服务：`Restart=always`、`RestartSec=5`、`CPUQuota=300%`、`MemoryMax=300M` |
+| `announce-web.service` | Web 配置调试台（8080，**仅供内网调试**，故未加鉴权） |
+| `announce-piper.service` | 常驻 piper TTS 服务（避免每句重载模型） |
+| `announce-worktime-{start,stop}.{service,timer}` | 工作时段自动启停：每日 08:00 起、18:00 停 |
+| `announce-cleanup.{service,timer}` + `announce-cleanup.sh` | 每日 03:30 清理：CSV 轮转、存证按天保留、journald 限额 |
+| `tts_server.py`、`install_piper_zh.sh` | piper 服务端与中文模型安装 |
+| `install_cleanup.sh`、`inst_ocr.sh` | 清理与 OCR 环境安装脚本 |
+| `announce-net-apply.sh` | 改 IP（**应用后 90 秒内需确认，否则自动回滚**） |
+| `check_host.py`、`config.example.py` | 环境自检 / 配置模板 |
+
+历史遗留（Python 版，Rust 版不用）：`announce.service`、`announce-user.service`、`install.sh`。
+详细步骤见各 `install_*.sh` 脚本内注释。
+
+> ⚠️ `deploy/config_web.py` 是 2026-09 的历史快照，与仓库根目录的 `config_web.py` 已不一致。
+> **配置台一律以根目录的 `config_web.py` 为准。**

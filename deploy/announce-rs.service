@@ -1,0 +1,37 @@
+[Unit]
+# ============================================================================
+# Rust 版(announce-rs) systemd 系统级服务 — Debian 靶机 192.168.8.100
+# 装到: /etc/systemd/system/announce-rs.service   (需 root, 用 run_313.py 的 su 通道)
+# 启用: systemctl daemon-reload && systemctl enable --now announce-rs
+#
+# 与 Python 版(announce.service)二选一, 不要同时跑:
+#   两者都绑 127.0.0.1 单实例锁端口/抢同一摄像头。
+# 播报链: espeak-ng 合成 wav -> aplay 直连 ALSA(靶机无 pipewire, 直连即可)。
+# 若日后装了 pipewire/pulse, 参照 announce-sys.service 补 XDG_RUNTIME_DIR/PULSE_SERVER。
+# ============================================================================
+Description=叫号屏 OCR 语音播报(Rust 版)
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=debian
+Group=debian
+WorkingDirectory=/home/debian/anntest
+ExecStart=/home/debian/anntest/announce-rs
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+Nice=5
+CPUWeight=50
+# ★150% 会把这个 cgroup(主程序+ffmpeg+tesseract) 掐死: 实测 98.6% 的调度周期被限流,
+#   同一张图 tesseract 单独跑 1.5s、在服务里烧 15s CPU(配额边缘反复排队等待)。
+#   本机只跑本系统, 放宽到 300% 仍留 1 核给配置台/TTS/系统。
+CPUQuota=300%
+# Rust 版主进程常态 <30MB(tesseract 子进程瞬时另计), 上限给 300M 足够
+MemoryMax=300M
+
+[Install]
+WantedBy=multi-user.target

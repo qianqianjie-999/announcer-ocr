@@ -165,7 +165,7 @@ impl Ocr {
 
     /// 数字段归一化: OCR 常把 0 读成 O、1 读成 I/l（与 Python 版 norm_digits 一致）
     fn norm_digits(s: &str) -> String {
-        s.replace('O', "0").replace('I', "1").replace('l', "1")
+        s.replace('O', "0").replace(['I', 'l'], "1")
     }
 
     /// 解析原始文本为 (号码, 窗口) 集合。多条正则取并集; 前缀字母保留、其余归一化。
@@ -347,8 +347,8 @@ mod tests {
     #[test]
     fn parse_two_cards_on_one_screen() {
         let r = parse("请GA999到C01号窗口办理 请GA200到C08号窗口办理");
-        assert!(r.contains(&(format!("GA999"), format!("C01"))));
-        assert!(r.contains(&(format!("GA200"), format!("C08"))));
+        assert!(r.contains(&("GA999".to_string(), "C01".to_string())));
+        assert!(r.contains(&("GA200".to_string(), "C08".to_string())));
     }
 
     #[test]

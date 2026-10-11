@@ -130,12 +130,12 @@ pub fn enhance_for_ocr(img: &image::RgbImage) -> image::RgbImage {
     }
     let total = n as u64;
     let mut sum_all = 0f64;
-    for i in 0..256usize {
-        sum_all += i as f64 * hist[i] as f64;
+    for (i, &h) in hist.iter().enumerate() {
+        sum_all += i as f64 * h as f64;
     }
     let (mut sum_b, mut wb, mut best, mut thr) = (0f64, 0u64, 0f64, 127u8);
-    for t in 0..256usize {
-        wb += hist[t];
+    for (t, &h) in hist.iter().enumerate() {
+        wb += h;
         if wb == 0 {
             continue;
         }
@@ -143,7 +143,7 @@ pub fn enhance_for_ocr(img: &image::RgbImage) -> image::RgbImage {
         if wf == 0 {
             break;
         }
-        sum_b += t as f64 * hist[t] as f64;
+        sum_b += t as f64 * h as f64;
         let mb = sum_b / wb as f64;
         let mf = (sum_all - sum_b) / wf as f64;
         let between = wb as f64 * wf as f64 * (mb - mf) * (mb - mf);
