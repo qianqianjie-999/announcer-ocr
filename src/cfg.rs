@@ -25,6 +25,7 @@ fn trepeat() -> u32 { 2 }
 fn trate() -> i32 { 135 }
 fn ttemplate() -> String { "请{number}到{window}号窗口办理".into() }
 fn tgap() -> f64 { 0.35 }
+fn dhealth() -> f64 { 60.0 }
 fn logmb() -> f64 { 8.0 }
 fn logkeep() -> u32 { 6 }
 fn logarch() -> String { "logs_archive".into() }
@@ -96,6 +97,12 @@ pub struct Config {
     #[serde(default = "def_true")] pub diag_heartbeat: bool,
     #[serde(default = "d5")] pub diag_every_sec: f64,
     #[serde(default = "def_true")] pub save_trigger_frames: bool,
+    /// 「健康心跳」阈值(分钟): 距上次成功播报超过这么久就打印一条 `[健康]` 告警,
+    /// 用于发现"进程活着、链路已死"的静默软故障 —— 典型是摄像头黑屏/失焦后帧差与
+    /// OCR 双双归零, 程序照常空转一整天却一声不响(评审 P2-7)。
+    /// 60 = 默认(1 小时); **0 = 关闭**。若现场本就有长时间无人叫号的时段(午休/夜班),
+    /// 告警会如实报"很久没播报" —— 那属预期而非故障, 按作息调大或设为 0 即可。
+    #[serde(default = "dhealth")] pub health_alert_min: f64,
     #[serde(default = "logf")] pub log_file: String,
     /// 已播报去重表(`announced`)的过期策略, 单位秒。
     /// **0(默认)= 每日本地零点清零** —— 与"叫号号码按天复用"的业务语义一致;

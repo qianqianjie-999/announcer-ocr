@@ -1,10 +1,13 @@
-// util.rs — 两个跨模块复用的小工具: "不中毒"的取锁、带兜底的墙钟。
+// util.rs — 跨模块复用的小工具: "不中毒"的取锁、带兜底的墙钟、带超时的子进程执行。
 //
 // 为什么单独成模块: capture / announcer / main 都要取锁, 各自写一份 `lock().unwrap()`
 // 等于把"生产路径 unwrap"这个隐患复制到每个文件(评审 P2-1)。集中一处, 语义统一,
-// 将来要改也只改一个地方。
-use std::sync::{Mutex, MutexGuard};
-use std::time::{SystemTime, UNIX_EPOCH};
+// 将来要改也只改一个地方。run_timeout 同理 —— 播放(aplay)与启动自检(版本探测)都要
+// "跑一个可能挂死的外部命令并强制超时", 各写一份等于把线程排空 + try_wait 复制两遍。
+use std::io::Read;
+use std::process::{Command, Output, Stdio};
+use std::sync::{mpsc, Mutex, MutexGuard};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// 取锁且"不中毒"。
 ///
@@ -27,6 +30,58 @@ pub fn now_secs() -> f64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0)
+}
+
+/// 带超时的子进程执行(收集 stdout/stderr)。
+///
+/// 超时意义: 外部命令(aplay / espeak / ffmpeg / tesseract)一旦挂死会卡死调用方,
+/// 必须能强制跳过并**收尸**(kill + wait), 否则会留下 defunct 僵尸。
+/// 本函数从 tts.rs 上提到这里, 供 aplay 播放与启动自检(版本探测)共用一份实现。
+pub fn run_timeout(cmd: &mut Command, timeout: Duration) -> Result<Output, String> {
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+    // spawn 前已设 Stdio::piped(), 正常不会为 None; 兜底路径必须顺手收尸,
+    // 否则半途返回 Err 会把子进程留成孤儿(Child 析构不 kill)。
+    let (mut so, mut se) = match (child.stdout.take(), child.stderr.take()) {
+        (Some(a), Some(b)) => (a, b),
+        _ => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("子进程管道不可用".to_string());
+        }
+    };
+    // 读线程防管道写满后子进程被阻塞
+    let (tx1, rx1) = mpsc::channel();
+    let (tx2, rx2) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut v = Vec::new();
+        let _ = so.read_to_end(&mut v);
+        let _ = tx1.send(v);
+    });
+    std::thread::spawn(move || {
+        let mut v = Vec::new();
+        let _ = se.read_to_end(&mut v);
+        let _ = tx2.send(v);
+    });
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let stdout = rx1.recv().unwrap_or_default();
+                let stderr = rx2.recv().unwrap_or_default();
+                return Ok(Output { status, stdout, stderr });
+            }
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("命令超时({}s)已终止", timeout.as_secs()));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -64,5 +119,29 @@ mod tests {
         let t = now_secs();
         assert!(t > 1_600_000_000.0, "应晚于 2020 年: {t}");
         assert!(t < 4_100_000_000.0, "应早于 2100 年: {t}");
+    }
+
+    /// 挂死的子进程必须被超时杀掉并返回 Err(而不是把调用方一起卡死)。
+    #[test]
+    fn run_timeout_kills_hung_command() {
+        let t0 = Instant::now();
+        let mut c = Command::new("sleep");
+        c.arg("30");
+        let r = run_timeout(&mut c, Duration::from_millis(200));
+        assert!(r.is_err(), "超时必须返回 Err");
+        assert!(t0.elapsed() < Duration::from_secs(5), "不该等命令自然结束(30s)");
+    }
+
+    /// 正常命令: 收集到 stdout, 且 exit code 可读。
+    #[test]
+    fn run_timeout_collects_output() {
+        let mut c = Command::new("sh");
+        c.args(["-c", "echo check-util-ok"]);
+        let out = run_timeout(&mut c, Duration::from_secs(5)).expect("sh 应可用");
+        assert!(out.status.success(), "exit code 应为 0");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("check-util-ok"),
+            "应收集到 stdout"
+        );
     }
 }

@@ -3,64 +3,15 @@
 // 为什么不直接让 espeak 自己出声: espeak 直连会与 pipewire/pulse 抢声卡,
 // 先落 wav 再 aplay 可用 ALSA 设备回退列表解决占用问题(与 Python 版一致)。
 use crate::cfg::Tts;
+use crate::util::run_timeout; // 带超时的子进程执行(已上提到 util, 供启动自检复用)
 use std::io::{Read, Write};
-use std::process::{Command, Output, Stdio};
-use std::sync::mpsc;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 pub trait Engine: Send {
     fn name(&self) -> &'static str;
     /// 一次调用完整播放 times 遍。
     fn speak(&self, text: &str, times: u32) -> Result<(), String>;
-}
-
-/// 带超时的子进程执行(收集 stdout/stderr)。
-/// 超时意义: aplay/espeak 一旦挂死会卡死唯一的播报线程, 必须能强制跳过。
-fn run_timeout(cmd: &mut Command, timeout: Duration) -> Result<Output, String> {
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = cmd.spawn().map_err(|e| e.to_string())?;
-    // spawn 前已设 Stdio::piped(), 正常不会为 None; 兜底路径必须顺手收尸,
-    // 否则半途返回 Err 会把子进程留成孤儿(Child 析构不 kill)。
-    let (mut so, mut se) = match (child.stdout.take(), child.stderr.take()) {
-        (Some(a), Some(b)) => (a, b),
-        _ => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err("子进程管道不可用".to_string());
-        }
-    };
-    // 读线程防管道写满后子进程被阻塞
-    let (tx1, rx1) = mpsc::channel();
-    let (tx2, rx2) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut v = Vec::new();
-        let _ = so.read_to_end(&mut v);
-        let _ = tx1.send(v);
-    });
-    std::thread::spawn(move || {
-        let mut v = Vec::new();
-        let _ = se.read_to_end(&mut v);
-        let _ = tx2.send(v);
-    });
-    let start = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let stdout = rx1.recv().unwrap_or_default();
-                let stderr = rx2.recv().unwrap_or_default();
-                return Ok(Output { status, stdout, stderr });
-            }
-            Ok(None) => {
-                if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(format!("命令超时({}s)已终止", timeout.as_secs()));
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(e) => return Err(e.to_string()),
-        }
-    }
 }
 
 /// 简易 which: 遍历 PATH 找可执行文件。

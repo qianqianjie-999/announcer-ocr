@@ -367,6 +367,48 @@ fn preview_log_due() -> bool {
     }
 }
 
+/// 首帧就绪的等待上限。
+///
+/// 为什么不再固定 `sleep(1200ms)`(评审 P2-6): 固定睡眠在"ffmpeg 冷启动快"时白等,
+/// 在"RTSP 慢 / 相机刚上电"时又远远不够 —— 首帧没到就进主循环, 头几轮全是
+/// "取帧失败"刷屏, 还看不出到底是没就绪还是真断了。改成轮询: 通常几百毫秒即返回,
+/// 真正慢的源也给足时间(有上限, 不会无限等), 且"就绪/超时"都会留痕。
+const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// 轮询 `ready()` 直到为真或超过 `timeout`, 返回是否在超时前就绪。
+/// 抽成接受闭包的纯函数是为了可单测 —— 真实首帧依赖 ffmpeg/相机, 而"轮询到时/超时"
+/// 这条控制流不该依赖环境。
+fn poll_until(timeout: Duration, mut ready: impl FnMut() -> bool) -> bool {
+    let t0 = std::time::Instant::now();
+    loop {
+        if ready() {
+            return true;
+        }
+        if t0.elapsed() >= timeout {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// 等 PipeGrabber 排出第一帧。
+fn wait_first_frame(g: &PipeGrabber, timeout: Duration) -> bool {
+    poll_until(timeout, || g.latest().is_some())
+}
+
+/// 首帧就绪/超时的统一留痕。超时不报错、不退出 —— 主循环自己会重试, 与旧行为一致。
+fn report_ready(what: &str, ok: bool) {
+    if ok {
+        println!("[启动] {} 首帧就绪", what);
+    } else {
+        println!(
+            "[启动] 警告: {} 等待首帧超时({}s), 先进主循环继续重试",
+            what,
+            FIRST_FRAME_TIMEOUT.as_secs()
+        );
+    }
+}
+
 /// 按 source 构造取帧通道。低延迟参数与 Python 版逐条对齐。
 pub fn open(kind: &crate::cfg::SourceKind, cfg: &crate::cfg::Config) -> Result<Source, String> {
     let w = cfg.capture_width as usize;
@@ -374,20 +416,26 @@ pub fn open(kind: &crate::cfg::SourceKind, cfg: &crate::cfg::Config) -> Result<S
     match kind {
         crate::cfg::SourceKind::Simulate => Ok(Source::Simulate { path: "sim_frame.jpg".into() }),
         crate::cfg::SourceKind::Net(url) => {
-            let mut args = vec![
-                "-loglevel".into(), "error".into(),
-                "-rtsp_transport".into(), "tcp".into(),
+            let mut args = vec!["-loglevel".into(), "error".into()];
+            // ★只对 rtsp 源加 rtsp 传输参数: 对 http(s) 源, ffmpeg 会直接报
+            //   "Option rtsp_transport not found" 并拒绝打开输入(实测), 结果是永远取不到
+            //   帧。cfg.rs 把 http(s) 也归到 Net, 所以必须按 URL 前缀区分, 不能无条件加。
+            if url.starts_with("rtsp://") {
+                args.push("-rtsp_transport".into());
+                args.push("tcp".into());
+            }
+            args.extend([
                 "-i".into(), url.clone(),
                 "-fflags".into(), "nobuffer".into(),
                 "-flags".into(), "low_delay".into(),
                 "-max_delay".into(), "300000".into(),
                 "-an".into(),
                 "-vf".into(), format!("scale={}:{}", w, h),
-            ];
+            ]);
             extend_hwaccel(&mut args);
             let g = PipeGrabber::start(args, w, h)
                 .map_err(|e| format!("ffmpeg 启动失败(需安装 ffmpeg): {}", e))?;
-            thread::sleep(Duration::from_millis(1200)); // 等首帧
+            report_ready("网络流", wait_first_frame(&g, FIRST_FRAME_TIMEOUT));
             Ok(Source::Pipe(g))
         }
         crate::cfg::SourceKind::Device(dev) => {
@@ -403,7 +451,7 @@ pub fn open(kind: &crate::cfg::SourceKind, cfg: &crate::cfg::Config) -> Result<S
             extend_hwaccel(&mut args);
             let g = PipeGrabber::start(args, w, h)
                 .map_err(|e| format!("ffmpeg 启动失败(设备 {}): {}", dev, e))?;
-            thread::sleep(Duration::from_millis(1200));
+            report_ready(&format!("设备 {}", dev), wait_first_frame(&g, FIRST_FRAME_TIMEOUT));
             Ok(Source::Pipe(g))
         }
     }
@@ -415,7 +463,8 @@ fn extend_hwaccel(_args: &mut Vec<String>) {}
 
 #[cfg(test)]
 mod tests {
-    use super::{crop_rgb, downscale, Frame};
+    use super::{crop_rgb, downscale, poll_until, Frame};
+    use std::time::Duration;
 
     /// 构造 w×h 的帧, 每个像素填 (x, y, 常量) —— 便于断言"裁对了位置"。
     fn frame(w: usize, h: usize) -> Frame {
@@ -482,5 +531,26 @@ mod tests {
         // 缓冲区长度不足 -> None(尺寸不匹配时防越界读)
         let broken = Frame { w: 40, h: 40, rgb: vec![0u8; 10] };
         assert!(downscale(&broken, 2).is_none());
+    }
+
+    /// 轮询在就绪的那一刻立即返回, 且不多转一圈。
+    #[test]
+    fn poll_until_returns_as_soon_as_ready() {
+        let mut n = 0;
+        let ok = poll_until(Duration::from_secs(5), || {
+            n += 1;
+            n >= 3
+        });
+        assert!(ok, "第 3 次就绪时应返回 true");
+        assert_eq!(n, 3, "就绪后不该再多轮询");
+    }
+
+    /// 永远不就绪时必须超时返回 false, 而不是死循环。
+    #[test]
+    fn poll_until_times_out() {
+        let t0 = std::time::Instant::now();
+        assert!(!poll_until(Duration::from_millis(150), || false));
+        assert!(t0.elapsed() >= Duration::from_millis(150), "应至少等满超时时长");
+        assert!(t0.elapsed() < Duration::from_secs(3), "不应明显超过超时时长");
     }
 }

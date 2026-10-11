@@ -11,7 +11,7 @@
 //   run()        启动期一次性动作: 读配置 / 抢单实例锁 / 装信号 / 清 _live
 //   Loop::build  把不变参数与跨轮状态收进结构体
 //   Loop::run    主循环骨架: 停止检查 -> tick -> 按 fps 补睡眠 -> 收尾
-//   Loop::tick   一轮: 取帧 -> 帧差/静帧 -> 诊断 -> 快速确认 -> (按需)OCR -> 维护
+//   Loop::tick   一轮: 取帧 -> 帧差/静帧 -> 诊断 -> 快速确认 -> (按需)OCR -> 维护 -> 健康心跳
 mod announcer;
 mod capture;
 mod cfg;
@@ -19,6 +19,7 @@ mod dedupe;
 mod detect;
 mod logger;
 mod ocr;
+mod selfcheck;
 mod signal;
 mod tts;
 mod util;
@@ -97,6 +98,8 @@ struct Loop {
     /// 维护节拍间隔(清理去重表 + 日志轮转检查)。
     maint_every: f64,
     log_max_bytes: u64,
+    /// 「健康心跳」阈值(秒)。0 = 关闭。见 cfg.rs 的 health_alert_min。
+    health_alert_sec: f64,
 
     // ———— 组件 ————
     ocr: ocr::Ocr,
@@ -142,6 +145,10 @@ struct Loop {
     last_save: f64,
     n_saved: u32,
     last_maint: f64,
+    /// 上次"成功入队播报"的时刻(启动时即置为当前, 避免刚起就误报) —— 健康心跳用。
+    last_announce: f64,
+    /// 上次打"健康告警"的时刻。用于把告警限流成"每阈值周期最多一条", 防止刷屏。
+    last_health_warn: f64,
 }
 
 impl Loop {
@@ -174,6 +181,7 @@ impl Loop {
             save_frames: cfg.save_trigger_frames,
             maint_every: 60.0,
             log_max_bytes: (cfg.log_max_mb.max(0.0) * 1024.0 * 1024.0) as u64,
+            health_alert_sec: cfg.health_alert_min.max(0.0) * 60.0,
 
             ocr,
             ann,
@@ -202,6 +210,8 @@ impl Loop {
             last_save: 0.0,
             n_saved: 0,
             last_maint: now,
+            last_announce: now,
+            last_health_warn: now,
 
             det,
             roi,
@@ -309,6 +319,7 @@ impl Loop {
         self.fast_confirm();
         self.maybe_ocr(&frame, changed, now);
         self.maintenance(now);
+        self.health_check(now);
 
         Tick::Done
     }
@@ -387,6 +398,7 @@ impl Loop {
             let raw = self.cand_raw.get(&cand).cloned().unwrap_or_default();
             logger::log(&self.cfg.log_file, &cand.0, &cand.1, &raw, "OK");
             self.ann.speak(&cand.0, &cand.1); // 入FIFO队列, 播报线程按顺序播
+            self.last_announce = t_ann; // 健康心跳: 真有号播了, 复位闲置计时
             println!(
                 "[时序] 首见→开始播报 {:.0} ms (静帧确认{}轮, 免第二轮OCR); 另加相机/网络/轮询约 0.3~0.8 s",
                 (t_ann - first) * 1000.0,
@@ -524,6 +536,7 @@ impl Loop {
                         self.announced.insert(cand.clone(), (), now);
                         logger::log(&self.cfg.log_file, &cand.0, &cand.1, &raw, "OK");
                         self.ann.speak(&cand.0, &cand.1); // 入FIFO队列, 播报线程按顺序播
+                        self.last_announce = now; // 健康心跳: 真有号播了, 复位闲置计时
                         println!(
                             "[时序] 首见→开始播报 {:.0} ms (确认{}轮, 本轮OCR {:.1}s); 另加相机/网络/轮询约 0.3~0.8 s",
                             (now - first) * 1000.0,
@@ -550,6 +563,29 @@ impl Loop {
                 self.last_read_ok = false; // 这轮没读出内容, 屏上是什么是未知的
                 println!("[OCR失败] {}", e);
             }
+        }
+    }
+
+    /// 健康心跳: 距上次成功播报超过阈值就打一条 `[健康]` 告警。
+    ///
+    /// 为什么需要它(评审 P2-7): 本程序最危险的失效不是崩溃 —— 崩溃有 systemd 拉起。
+    /// 最危险的是"进程活着、链路悄悄死了": 摄像头黑屏 / 失焦 / 被拔掉之后, 帧差恒为 0、
+    /// OCR 永远读不出内容, 主循环一切"正常", 现场却一整天没播报且无人知晓。
+    /// 心跳把这种静默软故障变成一条可见的日志。
+    ///
+    /// 限流: 每过 `health_alert_sec` 最多打一条, 免得 60s 的维护节拍把 journal 刷满。
+    fn health_check(&mut self, now: f64) {
+        if self.health_alert_sec <= 0.0 {
+            return; // 显式关闭(config: health_alert_min = 0)
+        }
+        let idle = now - self.last_announce;
+        if idle >= self.health_alert_sec && now - self.last_health_warn >= self.health_alert_sec {
+            self.last_health_warn = now;
+            println!(
+                "[健康] 距上次成功播报已 {:.1} 分钟, 进程存活但链路疑似失效 —— \
+                 请检查取流(黑屏/失焦/断线)与 OCR; 如需关闭本告警把 health_alert_min 设为 0",
+                idle / 60.0
+            );
         }
     }
 
@@ -613,7 +649,7 @@ fn cleanup_live_dir() {
     }
 }
 
-/// 启动期: 读配置 -> 抢单实例锁 -> 装信号 -> 清残留 -> 进主循环。
+/// 启动期: 读配置 -> 抢单实例锁 -> 装信号 -> 清残留 -> 自检外部依赖 -> 进主循环。
 fn run() -> Result<(), String> {
     let cfg = Config::load("config.json")?;
     // 锁端口可配置: 便于不打扰生产实例的前提下另起模拟实例自测
@@ -626,6 +662,9 @@ fn run() -> Result<(), String> {
     // 上次若是被 kill -9 / 掉电打断的, _live/ 会留下半截 .tmp 和没人消费的 req。
     // 只清这两类"确定是垃圾"的, **不动 trig_*.jpg** —— 那是上一轮的现场证据。
     cleanup_live_dir();
+    // 启动自检: 把 ffmpeg / tesseract 的版本或缺失写进日志(P2-5)。
+    // 只做记录、不阻断启动 —— "换个靶机就变慢/识别全空"这类问题一眼可对。
+    selfcheck::report();
 
     // _lock 在本函数作用域内, Loop 是临时值: 析构顺序 = Loop(收 ffmpeg) -> _lock,
     // 与旧实现(run 内先声明 _lock 后声明 src)一致。
