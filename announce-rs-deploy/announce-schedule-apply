@@ -1,0 +1,190 @@
+#!/bin/bash
+# ============================================================
+# announce-schedule-apply — 叫号播报「工作时间」调度器
+#
+# 依据 config.json 中的 schedule 段，配置并应用「每日按时启停」：
+#   { "schedule": { "enabled": true, "work_start": "08:00", "work_end": "18:00" } }
+#
+# 生成以下 systemd 单元（幂等，可反复执行）：
+#   announce-worktime-start.service/.timer   每日 work_start 拉起 announce-rs
+#   announce-worktime-stop.service/.timer    每日 work_end  停止 announce-rs
+#   announce-worktime-boot.service           开机时按时间表校正一次运行状态
+#
+# 用法：
+#   announce-schedule-apply           # 应用时间表 + 按当前时刻校正（Web 保存后调用）
+#   announce-schedule-apply --sync    # 只按时间表校正运行状态（开机调用）
+#
+# 必须以 root 运行（Web 台经 sudoers 窄授权调用）。
+# 支持跨午夜时段（如 22:00~06:00）。
+# ============================================================
+set -euo pipefail
+
+CONF="${ANNOUNCE_CONF:-/opt/announce-rs/config.json}"
+UNIT_DIR=/etc/systemd/system
+SVC=announce-rs.service
+
+MODE="apply"
+case "${1:-}" in
+  ""|--apply) MODE="apply" ;;
+  --sync)     MODE="sync"  ;;
+  *) echo "用法: $0 [--sync]" >&2; exit 2 ;;
+esac
+
+say() { printf '[schedule] %s\n' "$*"; }
+
+# ---------- 1. 读取时间表 ----------
+read -r ENABLED START END < <(python3 - "$CONF" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    d = {}
+s = d.get("schedule") or {}
+print("1" if s.get("enabled") else "0", s.get("work_start") or "08:00", s.get("work_end") or "18:00")
+PY
+) || true
+ENABLED="${ENABLED:-0}"; START="${START:-08:00}"; END="${END:-18:00}"
+
+# ---------- 2. 严格校验（脚本以 root 运行，参数来自可写配置，必须挡住注入） ----------
+valid_hm() { [[ "$1" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]]; }
+if ! valid_hm "$START" || ! valid_hm "$END"; then
+  echo "[schedule] 时间格式非法: start='$START' end='$END'（要求 HH:MM）" >&2
+  exit 2
+fi
+if [[ "$START" == "$END" ]]; then
+  echo "[schedule] 开始时间与结束时间相同: $START（会全天生效，请改成两个不同时刻）" >&2
+  exit 2
+fi
+
+# ---------- 3. 判断当前是否处于工作窗口 ----------
+to_min() { echo $(( 10#${1%%:*} * 60 + 10#${1##*:} )); }
+N=$(( 10#$(date +%H) * 60 + 10#$(date +%M) ))
+S=$(to_min "$START"); E=$(to_min "$END")
+IN=0
+if (( S < E )); then
+  if (( N >= S && N < E )); then IN=1; fi
+elif (( S > E )); then            # 跨午夜
+  if (( N >= S || N < E )); then IN=1; fi
+else
+  IN=1
+fi
+
+if (( ENABLED == 1 )); then
+  [[ "$IN" == "1" ]] && WIN="工作时间内" || WIN="非工作时间"
+else
+  WIN="调度未启用（全天运行）"
+fi
+say "时间表: enabled=$ENABLED  $START ~ $END   当前=$WIN"
+
+# ---------- 4. 生成 / 清理 systemd 单元 ----------
+write_units() {
+  cat > "$UNIT_DIR/announce-worktime-start.service" <<EOF
+[Unit]
+Description=announce-rs 工作时间-开始（拉起播报服务）
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl start ${SVC}
+EOF
+
+  cat > "$UNIT_DIR/announce-worktime-start.timer" <<EOF
+[Unit]
+Description=announce-rs 每日开始工作 (${START})
+
+[Timer]
+# Persistent=false: 错过的触发点不补跑，由 announce-worktime-boot 在开机时统一校正，
+# 否则「机在非工作时间开机」会把当天已错过的 start 补跑，反而把服务拉起来。
+OnCalendar=*-*-* ${START}:00
+Persistent=false
+AccuracySec=5s
+Unit=announce-worktime-start.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  cat > "$UNIT_DIR/announce-worktime-stop.service" <<EOF
+[Unit]
+Description=announce-rs 工作时间-结束（停止播报服务）
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl stop ${SVC}
+EOF
+
+  cat > "$UNIT_DIR/announce-worktime-stop.timer" <<EOF
+[Unit]
+Description=announce-rs 每日结束工作 (${END})
+
+[Timer]
+OnCalendar=*-*-* ${END}:00
+Persistent=false
+AccuracySec=5s
+Unit=announce-worktime-stop.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  cat > "$UNIT_DIR/announce-worktime-boot.service" <<'EOF'
+[Unit]
+Description=announce-rs 开机按工作时间表校正运行状态
+After=announce-rs.service
+Wants=announce-rs.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/announce-schedule-apply --sync
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+remove_units() {
+  systemctl disable --now announce-worktime-start.timer announce-worktime-stop.timer \
+      >/dev/null 2>&1 || true
+  systemctl disable announce-worktime-boot.service >/dev/null 2>&1 || true
+  rm -f "$UNIT_DIR"/announce-worktime-start.{service,timer} \
+        "$UNIT_DIR"/announce-worktime-stop.{service,timer} \
+        "$UNIT_DIR"/announce-worktime-boot.service
+}
+
+if [[ "$MODE" == "apply" ]]; then
+  if (( ENABLED == 1 )); then
+    write_units
+    systemctl daemon-reload
+    systemctl enable --now announce-worktime-start.timer announce-worktime-stop.timer \
+        >/dev/null 2>&1 || true
+    systemctl enable announce-worktime-boot.service >/dev/null 2>&1 || true
+    say "已安装并启用定时器: start=${START}  stop=${END}"
+  else
+    remove_units
+    systemctl daemon-reload
+    say "调度已关闭，已移除定时器（服务保持常开）"
+  fi
+fi
+
+# ---------- 5. 校正 announce-rs 的运行状态 ----------
+if (( ENABLED == 1 )) && (( IN == 0 )); then
+  systemctl stop "$SVC"
+  say "当前在非工作时间 -> 已停止 $SVC（到 ${START} 自动拉起）"
+else
+  if [[ "$MODE" == "apply" ]]; then
+    systemctl restart "$SVC"      # 保存配置后需重启才能生效
+    say "已重启 $SVC（应用新配置）"
+  else
+    systemctl start "$SVC"
+    say "已确保 $SVC 运行"
+  fi
+fi
+
+# ---------- 6. 汇报 ----------
+# 用 systemctl show 取值（对 inactive 服务仍返回 0，不会污染输出）
+ST_ACTIVE=$(systemctl show -p ActiveState --value "$SVC" 2>/dev/null || true)
+ST_ENABLED=$(systemctl show -p UnitFileState --value "$SVC" 2>/dev/null || true)
+say "当前状态: ${ST_ACTIVE:-unknown} / ${ST_ENABLED:-unknown}"
+if (( ENABLED == 1 )); then
+  say "下次触发: $(systemctl list-timers announce-worktime-*.timer --no-pager 2>/dev/null | sed -n '2p' | awk '{print $1,$2,$3,$4}')"
+fi
+exit 0
