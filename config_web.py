@@ -31,6 +31,9 @@ CONFIG = os.path.join(HERE, "config.json")
 SIM_FRAME = os.path.join(HERE, "sim_frame.jpg")
 LOG_CSV = os.path.join(HERE, "announce_log.csv")
 RESTART_CMD = ["sudo", "-n", "/usr/bin/systemctl", "restart", "announce-rs"]
+# 工作时间调度：root 辅助脚本，负责「写 systemd timer + 按当前时刻校正运行状态」。
+# 保存配置后优先走它（未启用调度时它会退化为 restart，等价旧行为）。
+SCHED_CMD = ["sudo", "-n", "/usr/local/sbin/announce-schedule-apply"]
 NET_SCRIPT = "/usr/local/sbin/announce-net-apply.sh"
 
 NET_DEFAULT_IP = "192.168.31.1"  # 出厂默认(直连调试场景; 有路由器的现场勿用, 多为网关地址)
@@ -329,6 +332,10 @@ def validate_rtsp(src):
     return True, src
 
 
+# 工作时间 HH:MM（00:00 ~ 23:59）
+_HM_RE = re.compile(r"^([01][0-9]|2[0-3]):[0-5][0-9]$")
+
+
 def validate_and_build(body):
     """从表单 dict 构造合法 config dict, 有问题返回 (None, 错误信息)。"""
     try:
@@ -371,9 +378,25 @@ def validate_and_build(body):
             "confirm_ttl_sec": float(det["confirm_ttl_sec"]),
             "active_sec": float(det["active_sec"]),
         })
+        # 稳帧再认静置时长: 新增字段, 页面拿不到值时沿用现有配置/默认 0.5,
+        # 并钳到 [0.1, 3.0] —— 0 等于关掉稳帧(退回"一动就抓过渡帧"的旧行为)。
+        try:
+            sv = float(det.get("settle_sec"))
+        except (TypeError, ValueError):
+            sv = float(cur_det.get("settle_sec") or 0.5)
+        d["settle_sec"] = min(3.0, max(0.1, sv))
         d.setdefault("min_interval_sec", 0.5)
         if not (0 < d["changed_ratio"] < 1):
             return None, "changed_ratio 必须在 (0,1)"
+        # 三个"时段类"参数必须为正 —— 页面输入框留空会被 +'' 算成 0,
+        # 而 0 对 fallback_ocr_sec 意味着「关掉静止兜底重认」(源码 due_fallback 判 >0),
+        # 会让"只认到号码没认到窗口"的那一轮永不重读, 现场表现为只播半句话。
+        if d["fallback_ocr_sec"] <= 0:
+            d["fallback_ocr_sec"] = 3.0
+        if d["active_sec"] <= 0:
+            d["active_sec"] = 3.0
+        if d["confirm_ttl_sec"] <= 0:
+            d["confirm_ttl_sec"] = 4.0
 
         tt = body["tts"]
         t = dict(cur_tts)
@@ -382,7 +405,16 @@ def validate_and_build(body):
             "repeat": max(1, int(tt["repeat"])),
             "rate": int(tt["rate"]),
             "spell_number": bool(tt.get("spell_number", False)),
+            "speak_window_letter": bool(tt.get("speak_window_letter", False)),
         })
+        if tt.get("piper_length_scale") is not None:
+            try:
+                ls = float(tt["piper_length_scale"])
+            except (TypeError, ValueError):
+                return None, "语速必须是数字（如 1.25）"
+            if not (0.5 <= ls <= 3.0):
+                return None, "语速需在 0.5 ~ 3.0 之间（1.0=常速，越大越慢）"
+            t["piper_length_scale"] = round(ls, 2)
         t.setdefault("engine", "auto")
         t.setdefault("template", "请{number}到{window}号窗口办理")
         t.setdefault("gap_sec", 0.35)
@@ -403,6 +435,19 @@ def validate_and_build(body):
             return None, "ocr.pattern 缺失：该字段页面不可编辑，请先在 config.json 中配置正则模板"
         o["pattern"] = pat
 
+        # 工作时间调度（页面可编辑）。存成 schedule 段；真正生效由
+        # announce-schedule-apply 生成 systemd timer 完成，主程序不读该字段。
+        sc = body.get("schedule") or {}
+        sched = dict(cur.get("schedule") or {})
+        sched["enabled"] = bool(sc.get("enabled"))
+        ws = str(sc.get("work_start") or sched.get("work_start") or "08:00").strip()
+        we = str(sc.get("work_end") or sched.get("work_end") or "18:00").strip()
+        if not _HM_RE.match(ws) or not _HM_RE.match(we):
+            return None, "工作时间格式非法（需 HH:MM，如 08:00 / 18:00）"
+        if ws == we:
+            return None, "工作开始时间与结束时间不能相同"
+        sched["work_start"], sched["work_end"] = ws, we
+
         cfg = cur
         cfg.update({
             "camera_source": camera_source,
@@ -410,6 +455,7 @@ def validate_and_build(body):
             "fps": float(body["fps"]),
             "roi": roi,
             "detect": d, "tts": t, "ocr": o,
+            "schedule": sched,
         })
         return cfg, None
     except (KeyError, TypeError, ValueError) as e:
@@ -485,21 +531,34 @@ fps <input id=fps type=number value=3 step=0.5>
 <label>帧差阈值 diff_threshold <input id=d_diff type=number step=1></label>
 <label>变化占比 changed_ratio <input id=d_ratio type=number step=0.0005></label>
 <label>确认轮数 stable_frames <input id=d_stable type=number min=1 max=5></label>
-<label>确认有效期 confirm_ttl_sec <input id=d_ttl type=number step=0.5></label>
-<label>观察期 active_sec <input id=d_act type=number step=0.5></label>
-<label>兜底OCR间隔 fallback_ocr_sec <input id=d_fb type=number step=0.5></label>
+<label>确认有效期 confirm_ttl_sec <input id=d_ttl type=number step=0.5 min=1></label>
+<label>观察期 active_sec <input id=d_act type=number step=0.5 min=0.5></label>
+<label>兜底OCR间隔 fallback_ocr_sec <input id=d_fb type=number step=0.5 min=0.5></label>
+<label>稳帧再认 settle_sec <input id=d_settle type=number step=0.1 min=0.1></label>
 </fieldset>
 
 <fieldset><legend>播报</legend>
 <label><input id=t_en type=checkbox> 启用语音（现场接线后才开）</label>
 <label>次数 repeat <input id=t_rep type=number min=1 max=5></label>
-<label>语速 rate <input id=t_rate type=number min=80 max=250></label>
+<label>语速（piper，1.0=常速，越大越慢）<input id=t_len type=number step=0.05 min=0.6 max=2.0></label>
+<label>espeak 语速 rate <input id=t_rate type=number min=80 max=250>（仅 espeak 引擎生效）</label>
 <label><input id=t_spell type=checkbox> 号码逐字念（GA204→G A 二零四）</label>
+<label><input id=t_wl type=checkbox> 念窗口字母（C04→西 零 四；<b>默认不勾=不念字母</b>，只念"零 四"）</label>
 <div class=row><button class=gray type=button onclick=testTts()>🔊 测试播报</button>
 <button class=gray type=button onclick=fixAudio()>🔧 音量修复</button>
 <span id=audioinfo class=small>读音量…</span></div>
-<div class=small>「测试播报」会用当前配置立刻念一句样例（GA200→08号窗口），用来验证音箱/音量；
+<div class=small>「测试播报」用<b>上面填写的次数/语速/逐字念</b>立刻念一句样例（GA200→08号窗口），
+<b>不用先保存</b>也能试听（试听不会改动配置，正式生效仍需点「保存」）；
 <b>没声音先点「音量修复」</b>（现场九成是声卡 Master 被静音或归零）。</div>
+</fieldset>
+
+<fieldset><legend>工作时间调度（到点自动启停播报服务）</legend>
+<label><input id=s_en type=checkbox onchange=schedInfo()> 启用工作时间调度</label>
+<label>开始 <input id=s_start type=time value="08:00" onchange=schedInfo()></label>
+<label>结束 <input id=s_end type=time value="18:00" onchange=schedInfo()></label>
+<span id=sinfo class=small>…</span>
+<div class=small>开启后由系统按时自动<b>拉起/停止播报服务</b>：非工作时间不采集、不识别、不播报
+（省 CPU，也避免非营业时段误播）。保存后立即生效；跨午夜时段（如 22:00 ~ 06:00）同样支持。</div>
 </fieldset>
 
 <fieldset><legend>OCR</legend>
@@ -589,13 +648,34 @@ function fillForm(c){
  $('d_diff').value=c.detect.diff_threshold;$('d_ratio').value=c.detect.changed_ratio;
  $('d_stable').value=c.detect.stable_frames;$('d_ttl').value=c.detect.confirm_ttl_sec;
  $('d_act').value=c.detect.active_sec;$('d_fb').value=c.detect.fallback_ocr_sec;
+ $('d_settle').value=(c.detect.settle_sec!=null?c.detect.settle_sec:0.5);
  $('t_en').checked=c.tts.enabled;$('t_rep').value=c.tts.repeat;$('t_rate').value=c.tts.rate;
+ $('t_len').value=(c.tts.piper_length_scale!=null?c.tts.piper_length_scale:1.25);
+ $('t_wl').checked=c.tts.speak_window_letter||false;
  $('t_spell').checked=c.tts.spell_number||false;
+ const sc=c.schedule||{};
+ $('s_en').checked=!!sc.enabled;
+ $('s_start').value=sc.work_start||'08:00';
+ $('s_end').value=sc.work_end||'18:00';
  $('o_lang').value=c.ocr.lang;$('o_psm').value=c.ocr.psm;
  const pn=(c.ocr.pattern||[]).length;
  $('patinfo').textContent=pn?pn+' 条':'0 条（保存会被拒绝）';
  $('patinfo').style.color=pn?'':'#c00';
  srcUI();
+ schedInfo();
+}
+
+// 工作时间状态提示：用浏览器本地时间判断当前是否在窗口内（跨午夜亦支持）。
+function schedInfo(){
+ const en=$('s_en').checked,s=$('s_start').value,e=$('s_end').value,el=$('sinfo');
+ if(!en){el.textContent='未启用 —— 播报服务全天运行';el.style.color='';return;}
+ if(!s||!e){el.textContent='请填写开始与结束时间';el.style.color='#c00';return;}
+ const tm=t=>{const p=t.split(':');return (+p[0])*60+(+p[1]||0);};
+ const a=tm(s),b=tm(e),now=new Date(),n=now.getHours()*60+now.getMinutes();
+ if(a===b){el.textContent='开始与结束时间相同，保存会被拒绝';el.style.color='#c00';return;}
+ const inw=(a<b)?(n>=a&&n<b):(n>=a||n<b);
+ el.textContent=inw?'当前 处于工作时间内 —— 服务应运行中':'当前 处于非工作时间 —— 服务应已停止';
+ el.style.color=inw?'#0a7':'#c00';
 }
 
 function collect(){
@@ -604,10 +684,13 @@ function collect(){
   roi:[+$('rx').value||0,+$('ry').value||0,+$('rw').value||0,+$('rh').value||0],
   detect:{diff_threshold:+$('d_diff').value,changed_ratio:+$('d_ratio').value,
    stable_frames:+$('d_stable').value,confirm_ttl_sec:+$('d_ttl').value,
-   active_sec:+$('d_act').value,fallback_ocr_sec:+$('d_fb').value},
+   active_sec:+$('d_act').value,fallback_ocr_sec:+$('d_fb').value,
+   settle_sec:+$('d_settle').value},
   tts:{enabled:$('t_en').checked,repeat:+$('t_rep').value,rate:+$('t_rate').value,
+   piper_length_scale:+$('t_len').value,speak_window_letter:$('t_wl').checked,
    spell_number:$('t_spell').checked},
-  ocr:{lang:$('o_lang').value,psm:+$('o_psm').value}};
+  ocr:{lang:$('o_lang').value,psm:+$('o_psm').value},
+  schedule:{enabled:$('s_en').checked,work_start:$('s_start').value,work_end:$('s_end').value}};
 }
 
 let liveTimer=null,snapBusy=false,prevUrl=null,autoFail=0;
@@ -794,9 +877,18 @@ function testOcr(){
 }
 
 function testTts(){
- msg('正在合成并播放测试播报…（约 2~5 秒）');
+ // ★带上页面"当前填写"的播报参数（不必先保存就能试听）：
+ //   之前发空 body，服务端只读磁盘上已保存的 config.json，
+ //   改了次数没保存直接点测试 -> 听到的还是旧值，极易误判成程序 bug。
+ const tts={};
+ const rep=parseInt($('t_rep').value,10);   if(rep>=1) tts.repeat=rep;
+ const rat=parseInt($('t_rate').value,10);  if(rat>0) tts.rate=rat;
+ const len=parseFloat($('t_len').value);    if(len>=0.5&&len<=3.0) tts.piper_length_scale=len;
+ tts.speak_window_letter=!!$('t_wl').checked;
+ tts.spell_number=!!$('t_spell').checked;
+ msg('正在合成并播放测试播报…（约 2~15 秒）');
  fetch('/api/test_tts',{method:'POST',headers:{'Content-Type':'application/json'},
-  body:JSON.stringify({})})
+  body:JSON.stringify({tts:tts})})
  .then(r=>r.json())
  .then(d=>{msg((d.ok?'✔ ':'✘ ')+(d.msg||''));showAudio(d.audio);})
  .catch(e=>msg('测试播报失败: '+e));
@@ -879,11 +971,23 @@ def list_usb_cams():
 
 _CN_DIGIT = {"0": "零", "1": "一", "2": "二", "3": "三", "4": "四",
              "5": "五", "6": "六", "7": "七", "8": "八", "9": "九"}
+# 拉丁字母 → 中文谐音（与主程序 tts.rs 的 LETTER_CN 保持一致，两处要同步改）。
+# 为什么需要：piper 中文模型 zh_CN-huayan 的音素表是 IPA 中文集、不含英语音素，
+# 而 espeak-ng 会把孤立的拉丁字母按英语读音音素化（C -> si:），模型只能合成出
+# 又短又弱的音 —— 现场听感就是"这个字母被吞掉了"。换成中文同音字即走中文音素，
+# 发音饱满清晰（现场叫号 C08 本就念"西零八"）。
+_CN_LETTER = {"C": "西"}
 
 
 def spell_tokens(s):
-    """号码逐字念：数字转中文、字母保留（与主程序 spell_tokens 行为一致）。"""
-    return " ".join(_CN_DIGIT.get(c, c) for c in s if not c.isspace())
+    """号码逐字念：数字转中文、字母按中文谐音（与主程序 spell_tokens 行为一致）。"""
+    return " ".join(_CN_DIGIT.get(c, _CN_LETTER.get(c.upper(), c))
+                    for c in s if not c.isspace())
+
+
+def spell_digits(s):
+    """窗口号只念数字、字母不念（与主程序 spell_window(s, false) 行为一致）。"""
+    return " ".join(_CN_DIGIT[c] for c in s if c.isdigit())
 
 
 def audio_status():
@@ -956,7 +1060,9 @@ def test_tts(cfg, number="GA200", window="08"):
     tts = cfg.get("tts") or {}
     tpl = tts.get("template") or "请{number}到{window}号窗口办理"
     if tts.get("spell_number"):
-        num_s, win_s = spell_tokens(number), spell_tokens(window)
+        num_s = spell_tokens(number)
+        win_s = (spell_tokens(window) if tts.get("speak_window_letter")
+                 else spell_digits(window))
     else:
         num_s, win_s = number, window
     text = tpl.replace("{number}", num_s).replace("{window}", win_s)
@@ -974,8 +1080,12 @@ def test_tts(cfg, number="GA200", window="08"):
     if engine is None and eng in ("piper", "auto") and bin_p and model \
             and os.path.exists(bin_p) and os.path.exists(model):
         try:
-            p1 = subprocess.run([bin_p, "--model", model, "--output_file", wav],
-                                input=text.encode("utf-8"), capture_output=True, timeout=180)
+            cmd = [bin_p, "--model", model, "--output_file", wav]
+            _ls = tts.get("piper_length_scale")
+            if _ls:
+                cmd += ["--length-scale", str(_ls)]   # 与主程序一致, 试听和正式播报同速
+            p1 = subprocess.run(cmd, input=text.encode("utf-8"),
+                                capture_output=True, timeout=180)
         except (OSError, subprocess.SubprocessError) as e:
             return False, "piper 合成失败: %s" % e, text
         if p1.returncode != 0:
@@ -1260,6 +1370,27 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:  # noqa: BLE001
                 body = {}
             cfg = load_cfg()
+            # 「测试播报」允许带上页面当前填写的试听参数（未保存也能先听）:
+            # 只覆盖 tts 里这几个无副作用的字段, 其余仍以磁盘配置为准;
+            # 本函数不写盘, 试听完页面保存与否都不受影响。
+            try:
+                ov = body.get("tts") or {}
+                t = dict(cfg.get("tts") or {})
+                if ov.get("repeat") is not None:
+                    t["repeat"] = max(1, min(5, int(ov["repeat"])))
+                if ov.get("rate") is not None:
+                    t["rate"] = int(ov["rate"])
+                if ov.get("spell_number") is not None:
+                    t["spell_number"] = bool(ov["spell_number"])
+                if ov.get("speak_window_letter") is not None:
+                    t["speak_window_letter"] = bool(ov["speak_window_letter"])
+                if ov.get("piper_length_scale") is not None:
+                    _ls = float(ov["piper_length_scale"])
+                    if 0.5 <= _ls <= 3.0:
+                        t["piper_length_scale"] = round(_ls, 2)
+                cfg["tts"] = t
+            except (TypeError, ValueError):
+                pass  # 试听参数非法就忽略, 退回磁盘配置
             ok, m, text = test_tts(cfg, body.get("number") or "GA200",
                                    body.get("window") or "08")
             self._json({"ok": ok, "msg": m, "text": text, "audio": audio_status()})
@@ -1282,18 +1413,38 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": err}, 400)
             return
         save_cfg(cfg)
+        # 优先走工作时间调度脚本：它会「写 systemd timer + 按当前时刻校正运行状态」，
+        # 未启用调度时退化为 restart，与旧行为等价。失败再退回直接重启，保证配置至少生效。
+        sched = cfg.get("schedule") or {}
         try:
-            p = subprocess.run(RESTART_CMD, capture_output=True, timeout=20)
-        except subprocess.TimeoutExpired:
-            self._json({"error": "重启命令超时（服务可能仍在拉起，稍后刷新查看）"}, 500)
+            p = subprocess.run(SCHED_CMD, capture_output=True, timeout=30)
+        except (subprocess.TimeoutExpired, OSError):
+            p = None
+        if p is None or p.returncode != 0:
+            try:
+                pr = subprocess.run(RESTART_CMD, capture_output=True, timeout=20)
+            except subprocess.TimeoutExpired:
+                self._json({"error": "重启命令超时（服务可能仍在拉起，稍后刷新查看）"}, 500)
+                return
+            if pr.returncode != 0:
+                e = pr.stderr.decode("utf-8", "replace").strip() or ("code %s" % pr.returncode)
+                self._json({"error": "配置已写入，但重启失败: " + e +
+                            "（新配置将在下次重启生效）"}, 500)
+                return
+            note = ""
+            if p is not None:
+                note = "（工作时间调度未生效: %s）" % (
+                    p.stderr.decode("utf-8", "replace").strip() or ("code %s" % p.returncode))
+            self._json({"ok": True, "msg": "配置已保存并重启%s。camera_source=%r roi=%s"
+                        % (note, cfg["camera_source"], cfg["roi"])})
             return
-        if p.returncode != 0:
-            e = p.stderr.decode("utf-8", "replace").strip() or ("code %s" % p.returncode)
-            self._json({"error": "配置已写入，但重启失败: " + e +
-                        "（新配置将在下次重启生效）"}, 500)
-            return
-        self._json({"ok": True, "msg": "已保存并重启。camera_source=%r roi=%s"
-                    % (cfg["camera_source"], cfg["roi"])})
+        if sched.get("enabled"):
+            sinfo = "工作时间 %s ~ %s（非工作时间自动停机）" % (
+                sched.get("work_start"), sched.get("work_end"))
+        else:
+            sinfo = "未启用工作时间调度（全天运行）"
+        self._json({"ok": True, "msg": "已保存并生效。%s；camera_source=%r roi=%s"
+                    % (sinfo, cfg["camera_source"], cfg["roi"])})
 
 
 def main():

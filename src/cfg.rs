@@ -43,6 +43,13 @@ pub struct Detect {
     /// 纯烧 CPU(实测占满一核), 还让"变化发生时正卡在 OCR 里"的概率逼近 100%。
     /// 此场景下兜底间隔从 fallback_ocr_sec(3s) 放宽到本值(默认 10s)。
     #[serde(default = "d10s")] pub static_fb_sec: f64,
+    /// 稳帧再认: 帧差判"有变化"后, 先静置本秒数再 OCR。
+    /// 叫号屏换号带 0.3~1s 的滚动/淡入动画, 动画中间帧 OCR 会读出错号
+    /// (现场实测过渡帧把 GA174 读成 GAT174 -> 播报 AT174)。
+    /// 设 0(或远小于帧间隔的值)即几乎不静置, 退回旧行为。
+    /// 另注: 变化持续超过 SETTLE_MAX_WAIT_SECS(2s)会强制认一次, 防"画面一直在变
+    /// 导致永不 OCR"的静默失效。
+    #[serde(default = "d05")] pub settle_sec: f64,
     /// 静帧快速确认轮数。候选出现过一次 + 画面连续 N 轮无变化 -> 直接确认播报,
     /// 免掉第二轮 OCR(一轮 1.6~4.8s, 是 5~10s 端到端延迟的最大单项)。
     /// 设 0 可关闭快速确认(完全退回"两轮 OCR 投票"的旧行为)。默认 2。
@@ -86,6 +93,9 @@ pub struct Tts {
     /// 常驻合成服务地址(如 http://127.0.0.1:5001/)。设了就走服务(约2~3秒出声),
     /// 服务不可用时自动回退 CLI 直调(每次重载模型约13秒)。为空则只用 CLI。
     #[serde(default)] pub piper_url: Option<String>,
+    /// 播报窗口号时是否念字母前缀。true: C04 → "西 零 四"; false/缺省: 只念数字 "零 四"。
+    /// 现场要求不念 C(听感突兀), 故默认关; 想恢复念字母在 config.json 置 true 即可。
+    #[serde(default)] pub speak_window_letter: Option<bool>,
 }
 
 #[derive(Deserialize, Clone, Default)]

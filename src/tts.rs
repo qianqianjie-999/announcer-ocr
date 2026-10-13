@@ -326,14 +326,44 @@ pub fn make_tts(cfg: &Tts) -> Result<Box<dyn Engine>, String> {
 // ---------------------------------------------------------------- 播报文本
 const DIGIT_CN: [&str; 10] = ["零", "一", "二", "三", "四", "五", "六", "七", "八", "九"];
 
-/// 号码/窗口号逐字符展开: GA204 -> G A 二 零 四, C06 -> C 零 六。
+/// 拉丁字母 → 中文谐音字。走中文音素, 发音饱满清晰。
+///
+/// ★为什么必须映射(2026-10-13 现场实测): piper 中文模型 zh_CN-huayan 的音素表是
+///   IPA 中文集, **不含英语音素**(dZ/eI/aU/ou/N/@ 全部缺失); 而 espeak-ng 会把
+///   孤立的拉丁字母按**英语**读音音素化 —— "C" -> (en)s'i:(/siː/), 音素表里只剩
+///   s + i + : 能对上, 模型只能勉强合成出一个又短又弱的音(实测 RMS 4885, 全场最低,
+///   有声段仅 39%), 现场听感就是"这个字母被吞了、没读出来"。
+///   换成中文同音字后全程走中文音素, 现场叫号 "C08" 本就念"西零八", 听感自然。
+///   如日后现场出现别的窗口字母(B/D/...), 在此表加一行即可。
+const LETTER_CN: &[(char, &str)] = &[('C', "西")];
+
+/// 号码/窗口号逐字符展开: GA204 -> G A 二 零 四, C06 -> 西 零 六。
 /// 逐字念是人耳最不易听错的读法(窗口号 06 与 6 不会混淆)。
 pub fn spell_tokens(s: &str) -> String {
     s.chars()
-        .map(|c| match c.to_digit(10) {
-            Some(d) => DIGIT_CN[d as usize].to_string(),
-            None => c.to_string(),
+        .map(|c| {
+            if let Some(d) = c.to_digit(10) {
+                return DIGIT_CN[d as usize].to_string();
+            }
+            // 字母按中文谐音读(见 LETTER_CN), 其余字符(含未列出的字母)原样保留
+            if let Some((_, cn)) = LETTER_CN.iter().find(|(l, _)| *l == c.to_ascii_uppercase()) {
+                return (*cn).to_string();
+            }
+            c.to_string()
         })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// 窗口号展开。speak_letter=false(默认)时丢掉字母前缀只念数字: C04 → "零 四"。
+/// 为什么单独一个函数而不是在调用处 filter: 号码(GA172)与窗口(C04)对字母的处理
+/// 策略不同 —— 号码的 G/A 要念, 窗口的 C 现场要求不念; 收口在一处避免两处逻辑漂移。
+pub fn spell_window(s: &str, speak_letter: bool) -> String {
+    if speak_letter {
+        return spell_tokens(s);
+    }
+    s.chars()
+        .filter_map(|c| c.to_digit(10).map(|d| DIGIT_CN[d as usize].to_string()))
         .collect::<Vec<_>>()
         .join(" ")
 }

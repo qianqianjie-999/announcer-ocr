@@ -4,7 +4,7 @@
 //   - 队列积压 >= 3 说明叫号过密, 只告警不丢号(声音顺延);
 //   - 开了语音但 TTS 初始化失败时蜂鸣兜底; enabled=false 是用户主动静音, 不再响。
 use crate::cfg::Config;
-use crate::tts::{make_tts, spell_tokens, Engine};
+use crate::tts::{make_tts, spell_tokens, spell_window, Engine};
 use crate::util::lock; // 取锁统一走 util(不中毒版, 详见 util.rs)
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
@@ -25,6 +25,8 @@ pub struct Announcer {
     repeat: u32,
     template: String,
     spell: bool,
+    /// 播报窗口号时是否念字母前缀(见 cfg::Tts::speak_window_letter, 默认不念)。
+    speak_window_letter: bool,
 }
 
 /// Windows 版的蜂鸣(winsound.Beep x3); Linux 生产版为 no-op,
@@ -62,6 +64,7 @@ impl Announcer {
             repeat: t.repeat,
             template: t.template.clone(),
             spell: t.spell_number,
+            speak_window_letter: t.speak_window_letter.unwrap_or(false),
             tts_cfg: t,
         });
         let worker = a.clone();
@@ -96,7 +99,10 @@ impl Announcer {
                 }
             };
             let (n, w) = if self.spell {
-                (spell_tokens(&number), spell_tokens(&window))
+                (
+                    spell_tokens(&number),
+                    spell_window(&window, self.speak_window_letter),
+                )
             } else {
                 (number, window)
             };
@@ -195,7 +201,10 @@ impl Announcer {
             None => return,
         };
         let (n, w) = if self.spell {
-            (spell_tokens(number), spell_tokens(window))
+            (
+                spell_tokens(number),
+                spell_window(window, self.speak_window_letter),
+            )
         } else {
             (number.to_string(), window.to_string())
         };

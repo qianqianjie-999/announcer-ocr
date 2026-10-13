@@ -176,6 +176,11 @@ impl Ocr {
         s.replace('O', "0").replace(['I', 'l'], "1")
     }
 
+    /// 号码数字段只保留数字(去掉夹进来的字母噪声), 见 parse() 的注释。
+    fn only_digits(s: &str) -> String {
+        s.chars().filter(|c| c.is_ascii_digit()).collect()
+    }
+
     /// 解析原始文本为 (号码, 窗口) 集合。多条正则取并集; 前缀字母保留、其余归一化。
     /// 解析前先清洗 tesseract 常见噪声(靶机实测的三种稳定变异):
     ///   ① 窗口号前误插 0: "GA999到0C01" / "到003号窗口" -> "到C01"/"到03号窗口";
@@ -191,8 +196,18 @@ impl Ocr {
                 let win = c.get(2).map(|m| m.as_str()).unwrap_or("");
                 let (pre, rest) = split_prefix(num_raw);
                 // 窗口号归一化后再折叠误读的前导零: "CO01" -> norm -> "C001" -> "C01"
+                //
+                // ★号码数字段清洗(2026-10-13 现场实测): 糊帧/过渡帧会在"前缀与数字之间"
+                //   多认一个字母 —— 屏幕上的 GA174 被读成 "GAT174"。旧逻辑把 "GAT174"
+                //   的不同写法当不同号码, 且宽正则会回溯切出 "AT174" 播成"诶提一七四"
+                //   (听感像英语), 同一个号连播两遍。数字段只可能是数字, 夹进去的字母
+                //   一律是噪声, 丢掉即还原真号(GAT174 -> GA174)。
+                let num_digits = Self::only_digits(&Self::norm_digits(rest));
+                if num_digits.is_empty() {
+                    continue; // 数字段被噪声吃光 -> 这组不算候选, 别播半截号
+                }
                 out.insert((
-                    format!("{}{}", pre, Self::norm_digits(rest)),
+                    format!("{}{}", pre, num_digits),
                     fold_window_zeros(&Self::norm_digits(win)),
                 ));
             }
