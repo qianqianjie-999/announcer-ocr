@@ -7,11 +7,15 @@
 //   - 取流用 ffmpeg 子进程管道(纯 Rust 依赖, 可静态链接);
 //   - 兜底第二路放大后不做 CLAHE(纯 Rust 无 OpenCV), 仅 2x 放大重试。
 //
-// 本文件结构(二轮重构, 原 run() 单函数 428 行 -> Loop 结构体 + 分阶段方法):
-//   run()        启动期一次性动作: 读配置 / 抢单实例锁 / 装信号 / 清 _live
+// 本文件结构(三轮重构: 原 run() 单函数 428 行 -> Loop 结构体 -> OCR 阶段再拆):
+//   run()        启动期一次性动作: 读配置 / 抢单实例锁 / 装信号 / 清 _live / 自检依赖
 //   Loop::build  把不变参数与跨轮状态收进结构体
 //   Loop::run    主循环骨架: 停止检查 -> tick -> 按 fps 补睡眠 -> 收尾
 //   Loop::tick   一轮: 取帧 -> 帧差/静帧 -> 诊断 -> 快速确认 -> (按需)OCR -> 维护 -> 健康心跳
+//   Loop::maybe_ocr  只做编排; 其下 ocr_due / save_evidence / recognize_candidates /
+//                    ingest_candidates / announce_winners / note_ocr_failure 各司其职。
+// 纯判定逻辑抽成自由函数以便单测: settle_ready(稳帧) / number_votes(按号码票决) /
+//   drop_shadow_empty(空窗口影子候选)。
 mod announcer;
 mod capture;
 mod cfg;
@@ -61,6 +65,27 @@ enum Tick {
     /// 本轮已经自行等待(取帧失败 sleep 1s), 或无需等待(ROI 越界跳帧):
     /// 主循环直接进下一轮, 不再补睡眠。
     SkipSleep,
+}
+
+/// 稳帧判定(纯函数, 便于单测): 返回 `(ready, by_change)`。
+///
+/// 语义: `ready` = 画面是否已定型、可以送 OCR(静置窗口到点, 或变化已超最长等待);
+/// `by_change` = 本次是否"为这一轮变化"而认 —— 只有它为真才存证帧,
+/// 避免把换号动画的过渡帧(残影)存成证据。
+///
+/// 最长等待兜底是**必须有**的: 若画面"一直在变"(摄像头噪点 / 自动曝光漂移超过
+/// changed_ratio), 静置窗口会被每一帧无限续期 -> 永远不 ready -> 服务活着却一句话
+/// 不播(最危险的静默软故障)。所以变化持续超过 SETTLE_MAX_WAIT_SECS 就强制放行一次。
+fn settle_ready(
+    now: f64,
+    settle_until: f64,
+    change_fired: bool,
+    change_start: f64,
+) -> (bool, bool) {
+    let overdue =
+        !change_fired && change_start > 0.0 && now - change_start >= SETTLE_MAX_WAIT_SECS;
+    let ready = now >= settle_until || overdue;
+    (ready, ready && !change_fired)
 }
 
 /// 运行期诊断用的源描述(仅打印, 无逻辑作用)。
@@ -403,8 +428,7 @@ impl Loop {
             return;
         }
         // 与正式播报路径同口径: 按【号码】聚合, 窗口取票数最多的那条。
-        let mut hit: Vec<(String, String, u32, f64, f64)> = self
-            .number_votes()
+        let mut hit: Vec<(String, String, u32, f64, f64)> = number_votes(&self.confirm)
             .into_iter()
             // last_seen >= static_since: 候选必须 sighting 于"当前静帧段"内,
             // 旧静帧段残留的假影候选永远进不了快速确认(走原投票路径)。
@@ -439,239 +463,233 @@ impl Loop {
         self.active_until = 0.0;
     }
 
-    /// 按【号码】聚合确认票, 返回 `(号码, 最佳窗口, 总票数, 最早首见, 最晚最后出现)`。
-    ///
-    /// 为什么按号码而不是"号码+窗口"(2026-10-13 现场实测):
-    ///   同一个 GA174 一天被播了 4 遍 —— `GA174/C04`、`AT174/C04`(过渡帧把 G 读成 AT)、
-    ///   `GA174/CC04`、`GA174/C045`(窗口误读)。旧实现用"号码+窗口"当去重键与投票键,
-    ///   每个误读结果都是**新键**, 于是每来一个新误读就当新叫号播一遍。
-    ///   号码才是"这一次叫号"的稳定标识, 窗口只是附属信息。
-    ///
-    /// 窗口取"票数最多的那条候选"(并列取最近出现的), 避免误读窗口压过正确窗口。
-    fn number_votes(&self) -> Vec<(String, String, u32, f64, f64)> {
-        // 号码 -> (最佳窗口, 总票数, 最佳窗口票数, 最佳窗口最后时刻, 号码最晚出现时刻)
-        let mut agg: HashMap<String, (String, u32, u32, f64, f64)> = HashMap::new();
-        for ((n, w), &(cnt, last, _first)) in self.confirm.iter() {
-            let e = agg
-                .entry(n.clone())
-                .or_insert((w.clone(), 0, 0, f64::NEG_INFINITY, last));
-            e.1 += cnt;
-            if cnt > e.2 || (cnt == e.2 && last >= e.3) {
-                e.0 = w.clone();
-                e.2 = cnt;
-                e.3 = last;
-            }
-            if last > e.4 {
-                e.4 = last;
-            }
-        }
-        // 顺带把每个号码的"最早首见"补上(用于 [时序] 延时统计)
-        let mut firsts: HashMap<String, f64> = HashMap::new();
-        for ((n, _), &(_, _, first)) in self.confirm.iter() {
-            let e = firsts.entry(n.clone()).or_insert(first);
-            if first < *e {
-                *e = first;
-            }
-        }
-        agg.into_iter()
-            .map(|(n, (w, tot, _, _, last))| {
-                let f = firsts.get(&n).copied().unwrap_or(last);
-                (n, w, tot, f, last)
-            })
-            .collect()
-    }
-
     /// 按需跑一轮 OCR 并推进确认状态机。
     ///
-    /// 触发条件, 三条路径并联(全部要求"画面已定型", 见下面的 animating):
-    ///   ① 帧差判定有变化 -> 静置 settle_sec 后认一次(稳帧再认)
-    ///   ② 处于观察期(有候选待确认) -> 完成多轮确认
-    ///   ③ 距上次 OCR 超过兜底间隔 -> 保险丝(防 ROI 略大时帧差漏检)
-    ///     间隔自适应: 屏面静止且上一轮读出过内容(都知道是什么、且都已播报)时,
-    ///     重读同一批像素纯属空转, 放宽到 static_fb_sec(默认10s);
-    ///     内容未知(INVALID/启动)或有变化时维持 fb_eff 节奏(含空转退避)不变。
+    /// 只做编排: 五个步骤各自独立成方法, 便于分段阅读与单测 ——
+    ///   ocr_due              该不该认、是不是"为本轮变化"而认(纯判定)
+    ///   save_evidence        存定型帧(仅"变化路径", 不是换号动画的过渡帧残影)
+    ///   recognize_candidates OCR + 增强图兜底链路
+    ///   ingest_candidates    诊断 / 确认窗口 / 退避 / 预热 / 确认状态机 / 票决播报
+    ///   note_ocr_failure     失败归账(同样进诊断与空转退避)
     fn maybe_ocr(&mut self, frame: &Arc<capture::Frame>, changed: bool, now: f64) {
-        let gap = now - self.last_ocr_time;
-        // ★稳帧再认(2026-10-13 现场): 变化后先静置 settle_sec, 期间一律不认。
-        //   叫号屏换号有 0.3~1s 滚动/淡入动画, 动画中每一帧都判"有变化", 旧逻辑
-        //   会立刻把中间帧送去 OCR —— 实测把 GA174 读成 GAT174, 正则回溯切出 AT174,
-        //   与 GA174 是不同去重键 -> 同一个号连播两遍(听感"诶提一七四", 像英语)。
-        //   静置到点、画面不再变(定型帧)才认, 从源头掐掉过渡帧误读。
-        let animating = now < self.settle_until;
-        // ★最长等待兜底(必须有): 若画面"一直在变"(摄像头噪点/自动曝光漂移超过
-        //   changed_ratio), 静置窗口会被无限续期 -> 永远不认 -> 服务活着却一句话
-        //   不播(最危险的静默软故障)。所以变化持续超过 SETTLE_MAX_WAIT_SECS 就
-        //   不再等, 直接用当前帧认一次。
-        let settle_overdue = !self.change_fired
-            && self.change_start > 0.0
-            && now - self.change_start >= SETTLE_MAX_WAIT_SECS;
-        let ready = !animating || settle_overdue;
-        let by_change = ready && !self.change_fired;
-        let due_change = ready
-            && (by_change || now < self.active_until)
-            && gap >= self.det.min_interval_sec;
-        let ins_gap = if changed || !self.last_read_ok {
-            self.fb_eff
-        } else {
-            self.static_fb_sec.max(self.fb_eff)
+        let by_change = match self.ocr_due(changed, now) {
+            Some(v) => v,
+            None => return,
         };
-        // 兜底路径同样要避开动画窗口, 否则"保险丝"会把过渡帧重新引进来。
-        let due_fallback = ready && self.fb_sec > 0.0 && gap >= ins_gap;
-        if !(due_change || due_fallback) {
-            return;
-        }
         self.last_ocr_time = now;
         // 本轮已覆盖这次变化(不论由哪条路径触发), 同一段静止画面不再重复触发。
         self.change_fired = true;
         let iter_t0 = now_secs();
         let crop = capture::crop_rgb(frame, self.roi);
-
-        // 触发存证: 因"画面变化"跑 OCR 时把所看画面存图,
-        // 排查「心跳有变化但读不出」直接看图。
-        // ★条件用 by_change(静置后为本轮变化跑的那一次)而不是 changed —— 现在存的
-        //   是"定型帧", 不再是一动就抓到的过渡帧残影。
-        if self.save_frames && by_change && now - self.last_save >= 2.0 && self.n_saved < 20 {
-            self.last_save = now;
-            self.n_saved += 1;
-            let _ = std::fs::create_dir_all(SAVE_DIR);
-            let p = format!("{}/trig_{:02}.jpg", SAVE_DIR, self.n_saved);
-            let res = std::fs::File::create(&p).and_then(|f| {
-                let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(
-                    std::io::BufWriter::new(f),
-                    92,
-                );
-                enc.encode_image(&image::DynamicImage::ImageRgb8(crop.clone()))
-                    .map_err(std::io::Error::other)
-            });
-            match res {
-                Ok(()) => println!("[存证] OCR所见画面 -> {}", p),
-                Err(e) => println!("[存证失败] {}", e),
-            }
-        }
-
-        // 先取出结果再分支, 让 recognize 对 self.ocr 的借用立即结束。
-        let recognized = self.ocr.recognize(&crop);
-        match recognized {
-            Ok(raw) => {
-                let mut raw = raw;
-                let mut cands = self.ocr.parse(&raw);
-                if cands.is_empty() && self.roi.2 <= 1280 {
-                    // 兜底增强识别链: 原图(上面已跑) -> 增强图 psm11 -> 增强图 psm6。
-                    // ★为什么要增强: 真实摄像头画面是"白字深底+小字+糊", tesseract 对
-                    //   原图几乎全乱码(靶机实测 [播报] 长期为 0 的根因之一), 沙盒用干净
-                    //   测试卡测不出来。2x放大+红通道+自动对比度+反相后靶机实测能把
-                    //   "GA777到C03号窗口/GA999到C01号窗口"读出来。psm11 与 psm6 错误
-                    //   模式不同(实测同一图一个读对窗口、一个读对号码), 各试一次先中先用。
-                    let up = detect::enhance_for_ocr(&crop);
-                    for psm in [self.ocr.default_psm(), 6u32] {
-                        if !cands.is_empty() {
-                            break;
-                        }
-                        if let Ok(raw2) = self.ocr.recognize_psm(&up, psm) {
-                            let c2 = self.ocr.parse(&raw2);
-                            if !c2.is_empty() {
-                                cands = c2;
-                                raw = raw2;
-                            }
-                        }
-                    }
-                }
-                // 同一号码若另有带窗口的候选, 丢弃它的空窗口版本 —— 否则同一号码会
-                // 先后播 "请GA170到号窗口办理"(半截话) 和 "请GA170到C06号窗口办理"。
-                // 详见 drop_shadow_empty() 的注释。
-                cands = drop_shadow_empty(cands);
-                // 本轮 OCR 总耗时(含可能的 2x 兜底) —— 主循环被它阻塞的时长
+        self.save_evidence(&crop, by_change, now);
+        match self.recognize_candidates(&crop) {
+            Ok((raw, cands)) => {
                 let iter_secs = now_secs() - iter_t0;
-                self.diag_ocr_n += 1;
-                self.diag_ocr_total += iter_secs;
-                if iter_secs > self.diag_ocr_max {
-                    self.diag_ocr_max = iter_secs;
-                }
-                // ★确认窗口自适应: OCR 一步就要 1.5~10s 时, 固定 4s 的 TTL 会在
-                //   下一轮到来前把候选清掉 -> 永远凑不齐 stable_frames 轮 -> 不播报。
-                //   (靶机实测就是这样死的: 圈速 24s > TTL 4s。)
-                //   有效 TTL = max(配置值, 3×本轮OCR耗时), 静止的号不会被误清。
-                let ttl_eff = self.ttl.max(3.0 * iter_secs);
-                // 空转退避: 连续无候选就把兜底间隔翻倍(上限 30s), 有候选立刻复位。
-                if cands.is_empty() {
-                    self.empty_streak = self.empty_streak.saturating_add(1);
-                    let k = 1u32 << self.empty_streak.min(4);
-                    self.fb_eff = (self.fb_sec * k as f64).min(30.0);
-                } else {
-                    self.empty_streak = 0;
-                    self.fb_eff = self.fb_sec;
-                }
-                // TTS 预热: 第一轮看到候选就后台合成(结果落在常驻服务缓存里),
-                // 等第 stable_frames 轮确认通过再播时即命中缓存(~毫秒),
-                // 相当于把 1.8s 的合成耗时从关键路径上整体藏掉。
-                self.last_read_ok = !cands.is_empty();
-                for cand in &cands {
-                    self.cand_raw.insert(cand.clone(), raw.clone(), now);
-                    // 预热按【号码】判重, 与播报去重键保持一致。
-                    if !self.announced.contains_key(&cand.0)
-                        && self.prefetched.insert(cand.clone())
-                    {
-                        if self.prefetched.len() > 64 {
-                            self.prefetched.clear();
-                        }
-                        self.ann.prefetch(&cand.0, &cand.1);
-                    }
-                }
-                // 只对"尚未播报"的候选续观察期。若对已播报的号码也续期,
-                // 屏幕一直显示号码时观察期会被无限续期 -> OCR 变相常开白烧 CPU。
-                if cands.iter().any(|c| !self.announced.contains_key(&c.0)) {
-                    self.active_until = now + self.active_sec;
-                }
-                // 清理超时未再出现的候选(闪变残留), 不立即清零 -> 短暂被替换的号码仍保留计数
-                self.confirm.retain(|_, v| now - v.1 <= ttl_eff);
-                let mut sorted: Vec<(String, String)> = cands.iter().cloned().collect();
-                sorted.sort();
-                for cand in sorted {
-                    let (cnt, first) = match self.confirm.get(&cand) {
-                        Some(&(c, _, f)) => (c + 1, f),
-                        None => (1, now), // 首次出现时刻 = 真正的"屏幕变化"起点
-                    };
-                    self.confirm.insert(cand.clone(), (cnt, now, first));
-                }
-                // —— 按【号码】票决后播报 ————————————————————————————————
-                // 见 number_votes(): 同一号码的所有窗口候选票数合并, 窗口取票数最多者。
-                // 这样"GA174/C04"、"GA174/CC04"、"GA174/C045" 只会播一次。
-                let mut winners: Vec<(String, String, u32, f64, f64)> = self.number_votes();
-                winners.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
-                for (number, window, votes, first, _last) in winners {
-                    if votes < self.need_stable || self.announced.contains_key(&number) {
-                        continue;
-                    }
-                    self.announced.insert(number.clone(), (), now);
-                    logger::log(&self.cfg.log_file, &number, &window, &raw, "OK");
-                    self.ann.speak(&number, &window); // 入FIFO队列, 播报线程按顺序播
-                    self.last_announce = now; // 健康心跳: 真有号播了, 复位闲置计时
-                    println!(
-                        "[时序] 首见→开始播报 {:.0} ms (确认{}轮, 本轮OCR {:.1}s); 另加相机/网络/轮询约 0.3~0.8 s",
-                        (now - first) * 1000.0,
-                        votes,
-                        iter_secs
-                    );
-                }
-                if cands.is_empty() && by_change {
-                    logger::log(&self.cfg.log_file, "", "", &raw, "INVALID");
-                }
+                self.ingest_candidates(cands, &raw, iter_secs, by_change, now);
             }
             Err(e) => {
                 let iter_secs = now_secs() - iter_t0;
-                self.diag_ocr_n += 1;
-                self.diag_ocr_total += iter_secs;
-                if iter_secs > self.diag_ocr_max {
-                    self.diag_ocr_max = iter_secs;
-                }
-                // 超时/失败同样计入空转退避, 别让病态帧把兜底间隔钉在基础值上
-                self.empty_streak = self.empty_streak.saturating_add(1);
-                let k = 1u32 << self.empty_streak.min(4);
-                self.fb_eff = (self.fb_sec * k as f64).min(30.0);
-                self.last_read_ok = false; // 这轮没读出内容, 屏上是什么是未知的
-                println!("[OCR失败] {}", e);
+                self.note_ocr_failure(&e, iter_secs);
             }
         }
+    }
+
+    /// 本轮该不该跑 OCR(纯判定, 不改状态)。
+    ///
+    /// 返回 `Some(by_change)`: 要跑, 且 `by_change=true` 表示这次是"为这一轮变化"
+    /// 而认(决定要不要存证定型帧); 返回 `None`: 不跑。稳帧细节见 `settle_ready`。
+    ///
+    /// 触发路径并联(全部要求"画面已定型"):
+    ///   ① 帧差判定有变化 -> 静置 settle_sec 后认一次(稳帧再认, 现场调优)
+    ///   ② 处于观察期(有候选待确认) -> 完成多轮确认
+    ///   ③ 距上次 OCR 超过兜底间隔 -> 保险丝(防 ROI 略大时帧差漏检);
+    ///      间隔自适应: 屏面静止且上轮读出过内容时放宽到 static_fb_sec(省 CPU)。
+    fn ocr_due(&self, changed: bool, now: f64) -> Option<bool> {
+        let gap = now - self.last_ocr_time;
+        let (ready, by_change) =
+            settle_ready(now, self.settle_until, self.change_fired, self.change_start);
+        if !ready {
+            return None;
+        }
+        // ①②受 min_interval 节流; ③(兜底保险丝)不受它管 —— 它自带自适应间隔。
+        let throttled = gap < self.det.min_interval_sec;
+        if (by_change || now < self.active_until) && !throttled {
+            return Some(by_change);
+        }
+        let ins_gap = if changed || !self.last_read_ok {
+            self.fb_eff
+        } else {
+            self.static_fb_sec.max(self.fb_eff)
+        };
+        if self.fb_sec > 0.0 && gap >= ins_gap {
+            return Some(by_change);
+        }
+        None
+    }
+
+    /// 触发存证: 因"画面变化"跑 OCR 时把所看画面存图,
+    /// 排查「心跳有变化但读不出」时直接看图。
+    ///
+    /// ★条件用 `by_change`(静置后为本轮变化跑的那一次)而不是"这一轮有没有变" ——
+    ///   现在存的是**定型帧**, 不再是一动就抓到的过渡帧残影(现场调优 2026-10-13)。
+    fn save_evidence(&mut self, crop: &image::RgbImage, by_change: bool, now: f64) {
+        if !(self.save_frames && by_change && now - self.last_save >= 2.0 && self.n_saved < 20) {
+            return;
+        }
+        self.last_save = now;
+        self.n_saved += 1;
+        let _ = std::fs::create_dir_all(SAVE_DIR);
+        let p = format!("{}/trig_{:02}.jpg", SAVE_DIR, self.n_saved);
+        let res = std::fs::File::create(&p).and_then(|f| {
+            let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(
+                std::io::BufWriter::new(f),
+                92,
+            );
+            enc.encode_image(&image::DynamicImage::ImageRgb8(crop.clone()))
+                .map_err(std::io::Error::other)
+        });
+        match res {
+            Ok(()) => println!("[存证] OCR所见画面 -> {}", p),
+            Err(e) => println!("[存证失败] {}", e),
+        }
+    }
+
+    /// 对裁剪图跑 OCR 并解析候选; 原图读不出且 ROI 不大时自动走"增强图"兜底链路。
+    /// 返回 `(本轮原始文本, 候选集合)`; 只有 tesseract 子进程本身失败才返 Err。
+    fn recognize_candidates(
+        &self,
+        crop: &image::RgbImage,
+    ) -> Result<(String, HashSet<(String, String)>), String> {
+        let mut raw = self.ocr.recognize(crop)?;
+        let mut cands = self.ocr.parse(&raw);
+        if cands.is_empty() && self.roi.2 <= 1280 {
+            // 兜底增强识别链: 原图(上面已跑) -> 增强图 psm11 -> 增强图 psm6。
+            // ★为什么要增强: 真实摄像头画面是"白字深底+小字+糊", tesseract 对
+            //   原图几乎全乱码(靶机实测 [播报] 长期为 0 的根因之一), 沙盒用干净
+            //   测试卡测不出来。2x放大+红通道+自动对比度+反相后靶机实测能把
+            //   "GA777到C03号窗口/GA999到C01号窗口"读出来。psm11 与 psm6 错误
+            //   模式不同(实测同一图一个读对窗口、一个读对号码), 各试一次先中先用。
+            let up = detect::enhance_for_ocr(crop);
+            for psm in [self.ocr.default_psm(), 6u32] {
+                if !cands.is_empty() {
+                    break;
+                }
+                if let Ok(raw2) = self.ocr.recognize_psm(&up, psm) {
+                    let c2 = self.ocr.parse(&raw2);
+                    if !c2.is_empty() {
+                        cands = c2;
+                        raw = raw2;
+                    }
+                }
+            }
+        }
+        // 同一号码若另有带窗口的候选, 丢弃它的空窗口版本 —— 否则同一号码会
+        // 先后播 "请GA170到号窗口办理"(半截话) 和 "请GA170到C06号窗口办理"。
+        // 详见 drop_shadow_empty() 的注释。
+        Ok((raw, drop_shadow_empty(cands)))
+    }
+
+    /// 把本轮识别结果归账: 诊断计数 -> 确认窗口/退避 -> 预热 -> 确认状态机 -> 票决播报。
+    fn ingest_candidates(
+        &mut self,
+        cands: HashSet<(String, String)>,
+        raw: &str,
+        iter_secs: f64,
+        by_change: bool,
+        now: f64,
+    ) {
+        self.note_ocr_cost(iter_secs);
+        // ★确认窗口自适应: OCR 一步就要 1.5~10s 时, 固定 4s 的 TTL 会在
+        //   下一轮到来前把候选清掉 -> 永远凑不齐 stable_frames 轮 -> 不播报。
+        //   (靶机实测就是这样死的: 圈速 24s > TTL 4s。)
+        //   有效 TTL = max(配置值, 3×本轮OCR耗时), 静止的号不会被误清。
+        let ttl_eff = self.ttl.max(3.0 * iter_secs);
+        // 空转退避: 连续无候选就把兜底间隔翻倍(上限 30s), 有候选立刻复位。
+        if cands.is_empty() {
+            self.empty_streak = self.empty_streak.saturating_add(1);
+            let k = 1u32 << self.empty_streak.min(4);
+            self.fb_eff = (self.fb_sec * k as f64).min(30.0);
+        } else {
+            self.empty_streak = 0;
+            self.fb_eff = self.fb_sec;
+        }
+        // TTS 预热: 第一轮看到候选就后台合成(结果落在常驻服务缓存里),
+        // 等第 stable_frames 轮确认通过再播时即命中缓存(~毫秒),
+        // 相当于把 1.8s 的合成耗时从关键路径上整体藏掉。
+        self.last_read_ok = !cands.is_empty();
+        for cand in &cands {
+            self.cand_raw.insert(cand.clone(), raw.to_string(), now);
+            // 预热按【号码】判重, 与播报去重键保持一致。
+            if !self.announced.contains_key(&cand.0) && self.prefetched.insert(cand.clone()) {
+                if self.prefetched.len() > 64 {
+                    self.prefetched.clear();
+                }
+                self.ann.prefetch(&cand.0, &cand.1);
+            }
+        }
+        // 只对"尚未播报"的候选续观察期。若对已播报的号码也续期,
+        // 屏幕一直显示号码时观察期会被无限续期 -> OCR 变相常开白烧 CPU。
+        if cands.iter().any(|c| !self.announced.contains_key(&c.0)) {
+            self.active_until = now + self.active_sec;
+        }
+        // 清理超时未再出现的候选(闪变残留), 不立即清零 -> 短暂被替换的号码仍保留计数
+        self.confirm.retain(|_, v| now - v.1 <= ttl_eff);
+        let mut sorted: Vec<(String, String)> = cands.iter().cloned().collect();
+        sorted.sort();
+        for cand in sorted {
+            let (cnt, first) = match self.confirm.get(&cand) {
+                Some(&(c, _, f)) => (c + 1, f),
+                None => (1, now), // 首次出现时刻 = 真正的"屏幕变化"起点
+            };
+            self.confirm.insert(cand.clone(), (cnt, now, first));
+        }
+        self.announce_winners(raw, now, iter_secs);
+        // 只对"因变化而跑"的那一轮记 INVALID: 兜底轮读到空属正常, 记了会刷屏。
+        if cands.is_empty() && by_change {
+            logger::log(&self.cfg.log_file, "", "", raw, "INVALID");
+        }
+    }
+
+    /// 按【号码】票决后播报: 票数达到 need_stable 且该号码未播报过才入队。
+    /// 聚合口径见 number_votes() —— 同一号码的多个窗口候选并成一票, 只播一次。
+    fn announce_winners(&mut self, raw: &str, now: f64, iter_secs: f64) {
+        let mut winners = number_votes(&self.confirm);
+        winners.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        for (number, window, votes, first, _last) in winners {
+            if votes < self.need_stable || self.announced.contains_key(&number) {
+                continue;
+            }
+            self.announced.insert(number.clone(), (), now);
+            logger::log(&self.cfg.log_file, &number, &window, raw, "OK");
+            self.ann.speak(&number, &window); // 入FIFO队列, 播报线程按顺序播
+            self.last_announce = now; // 健康心跳: 真有号播了, 复位闲置计时
+            println!(
+                "[时序] 首见→开始播报 {:.0} ms (确认{}轮, 本轮OCR {:.1}s); 另加相机/网络/轮询约 0.3~0.8 s",
+                (now - first) * 1000.0,
+                votes,
+                iter_secs
+            );
+        }
+    }
+
+    /// 记一轮 OCR 的耗时进诊断窗口(诊断心跳的 [监测] 行用)。
+    fn note_ocr_cost(&mut self, secs: f64) {
+        self.diag_ocr_n += 1;
+        self.diag_ocr_total += secs;
+        if secs > self.diag_ocr_max {
+            self.diag_ocr_max = secs;
+        }
+    }
+
+    /// OCR 失败(超时/子进程非零退出)的归账: 同样计入诊断与空转退避, 别让病态帧
+    /// 把兜底间隔钉在基础值上; 同时记下"内容未知", 下一轮兜底不放宽。
+    fn note_ocr_failure(&mut self, e: &str, iter_secs: f64) {
+        self.note_ocr_cost(iter_secs);
+        self.empty_streak = self.empty_streak.saturating_add(1);
+        let k = 1u32 << self.empty_streak.min(4);
+        self.fb_eff = (self.fb_sec * k as f64).min(30.0);
+        self.last_read_ok = false;
+        println!("[OCR失败] {}", e);
     }
 
     /// 健康心跳: 距上次成功播报超过阈值就打一条 `[健康]` 告警。
@@ -732,12 +750,51 @@ impl Loop {
     }
 }
 
-/// 清理 `_live/` 里"确定是上一轮残留"的临时文件: 预览原子写留下的半截 `.tmp`、
-/// 以及没人消费的预览请求 `req`。
+/// 按【号码】聚合确认票, 返回 `(号码, 最佳窗口, 总票数, 最早首见, 最晚最后出现)`。
 ///
-/// **故意不动 `trig_*.jpg`**: 那是触发时刻的存证帧, 是现场排障最想看的东西 ——
-/// 启动就删等于把上一轮出问题时的证据抹掉。它们的保留期由部署层
-/// `deploy/announce-cleanup.sh` 按 7 天统一管理。
+/// 为什么按号码而不是"号码+窗口"(2026-10-13 现场实测):
+///   同一个 GA174 一天被播了 4 遍 —— `GA174/C04`、`AT174/C04`(过渡帧把 G 读成 AT)、
+///   `GA174/CC04`、`GA174/C045`(窗口误读)。旧实现用"号码+窗口"当去重键与投票键,
+///   每个误读结果都是**新键**, 于是每来一个新误读就当新叫号播一遍。
+///   号码才是"这一次叫号"的稳定标识, 窗口只是附属信息。
+///
+/// 窗口取"票数最多的那条候选"(并列取最近出现的), 避免误读窗口压过正确窗口。
+/// 抽成自由函数(只读 confirm 表)是为了可单测 —— 这是现场调优的核心逻辑。
+fn number_votes(
+    confirm: &HashMap<(String, String), (u32, f64, f64)>,
+) -> Vec<(String, String, u32, f64, f64)> {
+    // 号码 -> (最佳窗口, 总票数, 最佳窗口票数, 最佳窗口最后时刻, 号码最晚出现时刻)
+    let mut agg: HashMap<String, (String, u32, u32, f64, f64)> = HashMap::new();
+    for ((n, w), &(cnt, last, _first)) in confirm.iter() {
+        let e = agg
+            .entry(n.clone())
+            .or_insert((w.clone(), 0, 0, f64::NEG_INFINITY, last));
+        e.1 += cnt;
+        if cnt > e.2 || (cnt == e.2 && last >= e.3) {
+            e.0 = w.clone();
+            e.2 = cnt;
+            e.3 = last;
+        }
+        if last > e.4 {
+            e.4 = last;
+        }
+    }
+    // 顺带把每个号码的"最早首见"补上(用于 [时序] 延时统计)
+    let mut firsts: HashMap<String, f64> = HashMap::new();
+    for ((n, _), &(_, _, first)) in confirm.iter() {
+        let e = firsts.entry(n.clone()).or_insert(first);
+        if first < *e {
+            *e = first;
+        }
+    }
+    agg.into_iter()
+        .map(|(n, (w, tot, _, _, last))| {
+            let f = firsts.get(&n).copied().unwrap_or(last);
+            (n, w, tot, f, last)
+        })
+        .collect()
+}
+
 /// 丢弃"同一号码另有带窗口候选"的空窗口候选。
 ///
 /// 起因(2026-10-13 现场实测): OCR 配了两条正则 —— pattern1 只匹配号码
@@ -763,6 +820,12 @@ fn drop_shadow_empty(cands: HashSet<(String, String)>) -> HashSet<(String, Strin
         .collect()
 }
 
+/// 清理 `_live/` 里"确定是上一轮残留"的临时文件: 预览原子写留下的半截 `.tmp`、
+/// 以及没人消费的预览请求 `req`。
+///
+/// **故意不动 `trig_*.jpg`**: 那是触发时刻的存证帧, 是现场排障最想看的东西 ——
+/// 启动就删等于把上一轮出问题时的证据抹掉。它们的保留期由部署层
+/// `deploy/announce-cleanup.sh` 按 7 天统一管理。
 fn cleanup_live_dir() {
     let rd = match std::fs::read_dir(SAVE_DIR) {
         Ok(r) => r,
@@ -812,4 +875,145 @@ fn main() {
     }
     // 正常路径(run 返回 Ok)只可能是收到停止信号后 break —— 退出码 0 表示
     // "优雅停机", systemd 看到 Result=success 就不会记为失败。
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{drop_shadow_empty, number_votes, settle_ready, SETTLE_MAX_WAIT_SECS};
+    use std::collections::{HashMap, HashSet};
+
+    // ———— 稳帧判定 settle_ready: 现场调优新增逻辑的回归(此前零覆盖) ————
+
+    #[test]
+    fn settle_not_ready_during_animation() {
+        // 静置窗口未到、变化也未超最长等待 -> 不 ready, 更不该存证
+        let (ready, by_change) = settle_ready(10.0, 10.5, false, 10.0);
+        assert!(!ready, "换号动画期(静置未到)不该 ready");
+        assert!(!by_change);
+    }
+
+    #[test]
+    fn settle_ready_after_window_marks_by_change() {
+        // 静置到点、且这轮变化尚未被认过 -> ready 且标记 by_change(才存定型帧)
+        let (ready, by_change) = settle_ready(10.6, 10.5, false, 10.0);
+        assert!(ready, "静置到点应 ready");
+        assert!(by_change, "未认过的变化应标 by_change");
+    }
+
+    #[test]
+    fn settle_already_fired_is_ready_but_not_by_change() {
+        // 同一段变化已被认过 -> 画面定型(ready), 但不再"为本轮变化"而认
+        let (ready, by_change) = settle_ready(10.6, 10.5, true, 10.0);
+        assert!(ready);
+        assert!(!by_change, "已认过的变化不该重复存证");
+    }
+
+    #[test]
+    fn settle_overdue_forces_ready_under_persistent_change() {
+        // ★关键兜底: 画面一直在变(噪点/曝光漂移)时静置窗口被无限续期,
+        //   超过 SETTLE_MAX_WAIT_SECS 必须强制放行, 否则永不 OCR -> 静默不播报。
+        let start = 100.0;
+        let (ready, by_change) =
+            settle_ready(start + SETTLE_MAX_WAIT_SECS, start + 999.0, false, start);
+        assert!(ready, "变化持续超最长等待必须强制 ready");
+        assert!(by_change, "放行的这一次仍属\"为本轮变化\"而认");
+    }
+
+    #[test]
+    fn settle_not_overdue_before_max_wait() {
+        let start = 100.0;
+        let (ready, _) =
+            settle_ready(start + SETTLE_MAX_WAIT_SECS - 0.01, start + 999.0, false, start);
+        assert!(!ready, "未到最长等待前仍应等画面定型");
+    }
+
+    #[test]
+    fn settle_zero_change_start_is_never_overdue() {
+        // change_start=0.0(启动初值)不该被当成"超长等待"
+        let (ready, _) = settle_ready(1e9, 1e9 + 1.0, false, 0.0);
+        assert!(!ready, "change_start 未初始化时不应触发最长等待兜底");
+    }
+
+    // ———— 按号码票决 number_votes: 修"同一号连播 4 遍"的核心逻辑 ————
+
+    fn conf(items: &[(&str, &str, u32)]) -> HashMap<(String, String), (u32, f64, f64)> {
+        items
+            .iter()
+            .enumerate()
+            .map(|(i, (n, w, c))| ((n.to_string(), w.to_string()), (*c, i as f64, i as f64)))
+            .collect()
+    }
+
+    #[test]
+    fn number_votes_merges_windows_into_one_number() {
+        // 现场实况: GA174 被窗口误读成 C04/CC04/C045 三个键 -> 必须并成一个号码
+        let m = conf(&[("GA174", "C04", 2), ("GA174", "CC04", 1), ("GA174", "C045", 1)]);
+        let v = number_votes(&m);
+        assert_eq!(v.len(), 1, "三个窗口候选应并入同一号码");
+        assert_eq!(v[0].0, "GA174");
+        assert_eq!(v[0].2, 4, "票数应为各窗口之和");
+        assert_eq!(v[0].1, "C04", "窗口应取票数最多者");
+    }
+
+    #[test]
+    fn number_votes_keeps_numbers_separate() {
+        let m = conf(&[("GA174", "C04", 3), ("GA175", "C05", 3)]);
+        assert_eq!(number_votes(&m).len(), 2, "不同号码不该被合并");
+    }
+
+    #[test]
+    fn number_votes_tie_takes_latest_window() {
+        // 票数并列 -> 取"最近出现"的窗口, 结果与 HashMap 迭代顺序无关
+        let mut m: HashMap<(String, String), (u32, f64, f64)> = HashMap::new();
+        m.insert(("GA100".into(), "C01".into()), (2, 5.0, 5.0));
+        m.insert(("GA100".into(), "C02".into()), (2, 9.0, 9.0));
+        let v = number_votes(&m);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].1, "C02", "并列时取最近出现的窗口");
+        assert_eq!(v[0].2, 4, "总票数=2+2");
+    }
+
+    #[test]
+    fn number_votes_reports_earliest_first_seen() {
+        // 同号码两个窗口首见时刻不同(3.0 / 7.0) -> [时序] 应取最早的 3.0
+        let mut m: HashMap<(String, String), (u32, f64, f64)> = HashMap::new();
+        m.insert(("GA200".into(), "C01".into()), (1, 20.0, 3.0));
+        m.insert(("GA200".into(), "C02".into()), (1, 25.0, 7.0));
+        let v = number_votes(&m);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].3, 3.0, "首见应取最早的一个");
+    }
+
+    #[test]
+    fn number_votes_empty_is_empty() {
+        let m: HashMap<(String, String), (u32, f64, f64)> = HashMap::new();
+        assert!(number_votes(&m).is_empty());
+    }
+
+    // ———— 空窗口影子候选 drop_shadow_empty ————
+
+    #[test]
+    fn drop_shadow_empty_removes_empty_when_windowed_exists() {
+        let s: HashSet<(String, String)> = [
+            ("GA170".to_string(), "".to_string()),
+            ("GA170".to_string(), "C06".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let out = drop_shadow_empty(s);
+        assert_eq!(out.len(), 1, "同号码有带窗口版本时应丢掉空窗口那条");
+        assert!(out.contains(&("GA170".to_string(), "C06".to_string())));
+    }
+
+    #[test]
+    fn drop_shadow_empty_keeps_empty_when_no_windowed_sibling() {
+        let s: HashSet<(String, String)> = [
+            ("GA170".to_string(), "".to_string()),
+            ("GA171".to_string(), "".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let out = drop_shadow_empty(s);
+        assert_eq!(out.len(), 2, "没有带窗口版本时, 空窗口候选应原样保留");
+    }
 }
