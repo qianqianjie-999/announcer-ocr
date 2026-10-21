@@ -233,7 +233,9 @@ impl Drop for PipeGrabber {
 }
 
 fn to_rgb(bgr: &mut [u8]) {
-    for px in bgr.chunks_exact_mut(3) {
+    // clippy 1.99 起 chunks_exact_mut(常量) 会被 chunks_exact_to_as_chunks 拦下,
+    // 按建议改 as_chunks_mut::<3>: 每 3 字节一个 BGR 像素, 首尾交换成 RGB。
+    for px in bgr.as_chunks_mut::<3>().0 {
         px.swap(0, 2);
     }
 }
