@@ -44,6 +44,36 @@ const SAVE_DIR: &str = "_live";
 /// 防"摄像头噪点/亮度漂移一直判有变化 -> 静置窗口无限续期 -> 永不 OCR"的静默失效。
 const SETTLE_MAX_WAIT_SECS: f64 = 2.0;
 
+/// 「号码闸门」的长时间静默兜底: 连续本秒数没有任何播报、而又有更大的号被
+/// 硬上限挡住时, 强制放行一次。防"基线被一次误读带偏 -> 后面全被挡 -> 整天不播"。
+/// 取 20s(原 60s): 分档确认上线后, 挡住的只剩"跳幅 > JUMP_HARD_MAX"的极端情况,
+/// 20s 足够判定它是真号而不是误读, 又不至于让现场等一分钟。
+const GATE_FORCE_SECS: f64 = 20.0;
+
+/// 跳幅分档(2026-10-21 现场要求): 叫号员会过号, 卡死 +2 会漏播真号。
+///   ≤JUMP_INSTANT      —— 立即播(和原来一样, 覆盖绝大多数 +1/+2)
+///   ≤max_jump          —— 多要 2 个确认量(静帧 tick 或投票轮), 防"过渡帧残影"
+///   ≤JUMP_HARD_MAX     —— 多要 4 个确认量, 覆盖大过号
+///   >JUMP_HARD_MAX     —— 直接挡, 只留 GATE_FORCE_SECS 兜底(基本只可能是误读)
+const JUMP_INSTANT: u32 = 3;
+const JUMP_HARD_MAX: u32 = 30;
+
+/// 跳幅 -> 额外需要的确认量。0 表示"够票即播, 不额外等"。
+/// 抽成自由函数便于单测: 这是现场调参的核心决策, 不能让口径藏在方法里。
+fn jump_extra_confirm(delta: u32, max_jump: u32) -> u32 {
+    if max_jump == 0 {
+        return 0; // 闸门关闭
+    }
+    let instant = JUMP_INSTANT.min(max_jump);
+    if delta <= instant {
+        0
+    } else if delta <= max_jump {
+        2
+    } else {
+        4
+    }
+}
+
 /// 绑定本机回环端口作为单实例锁。端口被占 -> 已有实例在跑。
 /// 与 Python 版一致: 不设 SO_REUSEADDR(std 默认就不设), 进程死操作系统自动释放。
 fn acquire_lock(port: u16) -> Result<TcpListener, String> {
@@ -189,6 +219,67 @@ struct Loop {
     last_announce: f64,
     /// 上次打"健康告警"的时刻。用于把告警限流成"每阈值周期最多一条", 防止刷屏。
     last_health_warn: f64,
+    /* —— 号码闸门(2026-10-21) ————————————————————————————————
+     * 屏幕改三行列表后, 单数字误读会产出"看起来合理"的号(GA158→GA198、GA150→GA190),
+     * 播报后还占住当日去重表, 真号反而不再响。现场编号严格 +1 递增, 用"跳幅上限"
+     * 即可拦掉这类误读: 只放行 (上次号, 上次号+max_jump] 区间内的候选。
+     */
+    /// 每个前缀(GA/G…)上次已播报的号码数值。
+    last_num: HashMap<String, u32>,
+    /// 跳幅上限。0 = 关闭闸门。
+    max_jump: u32,
+    /// 闸门拦截日志节流时刻(被拦的号每 10s 最多打一行, 防刷屏)。
+    gate_log_at: f64,
+    /* —— 多行列表(2026-10-21) ————————————————————————————————
+     * 叫号屏改成三行列表后, 最新号不一定在第一行(现场见过落到第二行)。
+     * 检测框要覆盖多行才看得见变化, 但识别仍按单行裁 —— 整块喂 tesseract 会掉精度。
+     */
+    /// 识别行数(1 = 只读 ROI 那一行, 退回旧行为)。
+    rows: usize,
+    /// 行距(像素), 0 表示不分行。
+    pitch: usize,
+    /// 帧差检测框 = ROI 首行 +（rows-1)个行距, 覆盖整块列表。
+    det_roi: (usize, usize, usize, usize),
+}
+
+/// 号码分解: "GA158" -> Some(("GA", 158))。无数字段返回 None(该候选不参与闸门)。
+fn split_num(number: &str) -> Option<(String, u32)> {
+    let i = number.find(|c: char| c.is_ascii_digit())?;
+    let (pre, digits) = number.split_at(i);
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse::<u32>().ok().map(|v| (pre.to_string(), v))
+}
+
+/// 启动时从播报日志(CSV)恢复"今天最后一次成功播报的号码"。
+///
+/// 为什么必须恢复: 重启(改配置就会重启)会清空内存里的 last_num 与去重表,
+/// 若闸门没有基线, 第一轮就会把屏上那个"已经播过的号"再播一遍 —— 这正是
+/// 2026-10-21 13:56 现场听到的重复播报。只认当天记录, 避免跨天编号重置后
+/// 拿昨天的号码当基线, 把早上的低号码全挡在门外。
+fn seed_last_numbers(log_file: &str) -> HashMap<String, u32> {
+    use chrono::Local;
+    let mut out = HashMap::new();
+    let today = Local::now().format("%Y-%m-%d").to_string();
+    let text = match std::fs::read_to_string(log_file) {
+        Ok(t) => t,
+        Err(_) => return out, // 首次部署还没有日志, 属正常
+    };
+    for line in text.lines().rev().take(400) {
+        let cols: Vec<&str> = line.split(',').collect();
+        if cols.len() < 5 || cols[cols.len() - 1].trim() != "OK" {
+            continue;
+        }
+        if !cols[0].trim().trim_start_matches('\u{feff}').starts_with(&today) {
+            continue;
+        }
+        if let Some((pre, v)) = split_num(cols[1].trim()) {
+            // 倒序扫描: 只认每个前缀"最新"的那条
+            out.entry(pre).or_insert(v);
+        }
+    }
+    out
 }
 
 impl Loop {
@@ -207,6 +298,12 @@ impl Loop {
 
         let det = cfg.detect.clone();
         let fb_sec = det.fallback_ocr_sec;
+        // 多行列表: row_pitch 是相邻两行文字框的纵向间距(像素), 0 表示不分行。
+        // 行距为 0 时强制退化为单行, 免得"rows=3 但步长 0"把同一行读三遍。
+        let pitch = det.row_pitch as usize;
+        let rows = if pitch == 0 { 1 } else { det.rows.max(1) as usize };
+        // 检测框向下扩到覆盖 rows 行; 识别仍按 pitch 逐行裁。
+        let det_roi = (roi.0, roi.1, roi.2, roi.3 + (rows - 1) * pitch);
         let now = now_secs();
         Ok(Loop {
             interval: 1.0 / cfg.fps.max(0.1),
@@ -256,6 +353,14 @@ impl Loop {
             last_maint: now,
             last_announce: now,
             last_health_warn: now,
+
+            last_num: seed_last_numbers(&cfg.log_file),
+            max_jump: det.max_jump,
+            gate_log_at: 0.0,
+
+            rows,
+            pitch,
+            det_roi,
 
             det,
             roi,
@@ -320,14 +425,15 @@ impl Loop {
         //   谁先看到 req 谁写 —— 主循环抢到时配置台就会读到半张图。
         capture::serve_preview(&frame, "主循环");
 
-        let prepared = detect::prepare(&frame, self.roi);
+        // 帧差用"检测框"(rows>1 时覆盖整块列表), 这样第 2/3 行换号也能被看见。
+        let prepared = detect::prepare(&frame, self.det_roi);
         // ROI 落在帧外(源尺寸变化/配置不匹配): 跳帧防 panic, 只告警一次不刷屏
         if prepared.gray.width() == 0 {
             if !self.roi_warned {
                 self.roi_warned = true;
                 eprintln!(
                     "[警告] ROI {:?} 超出帧 {}x{}, 跳帧等待恢复",
-                    self.roi, frame.w, frame.h
+                    self.det_roi, frame.w, frame.h
                 );
             }
             return Tick::SkipSleep;
@@ -428,12 +534,18 @@ impl Loop {
             return;
         }
         // 与正式播报路径同口径: 按【号码】聚合, 窗口取票数最多的那条。
+        // ★分档确认(2026-10-21): 跳幅越大, 多要几个静帧 tick 才放行 —— 普通 +1/+2
+        //   仍是原来的 2 tick 立即播; +4~+10 多等约 0.6s; 大过号多等约 1.2s。
+        //   静帧 tick 是"画面确实稳住"的直接测量, 比多跑一轮 OCR(1.5~5s)便宜得多。
+        let streak = self.static_streak;
         let mut hit: Vec<(String, String, u32, f64, f64)> = number_votes(&self.confirm)
             .into_iter()
             // last_seen >= static_since: 候选必须 sighting 于"当前静帧段"内,
             // 旧静帧段残留的假影候选永远进不了快速确认(走原投票路径)。
             .filter(|(n, _, _, _, last)| {
-                !self.announced.contains_key(n) && *last >= self.static_since
+                !self.announced.contains_key(n)
+                    && *last >= self.static_since
+                    && streak >= self.confirm_ticks + self.jump_extra(n)
             })
             .collect();
         if hit.is_empty() {
@@ -443,7 +555,9 @@ impl Loop {
         hit.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
         let t_ann = now_secs();
         for (number, window, _votes, first, _last) in hit {
+            let extra = self.jump_extra(&number); // 必须在 note_announced 之前算
             self.announced.insert(number.clone(), (), t_ann);
+            self.note_announced(&number);
             let raw = self
                 .cand_raw
                 .get(&(number.clone(), window.clone()))
@@ -453,9 +567,10 @@ impl Loop {
             self.ann.speak(&number, &window); // 入FIFO队列, 播报线程按顺序播
             self.last_announce = t_ann; // 健康心跳: 真有号播了, 复位闲置计时
             println!(
-                "[时序] 首见→开始播报 {:.0} ms (静帧确认{}轮, 免第二轮OCR); 另加相机/网络/轮询约 0.3~0.8 s",
+                "[时序] 首见→开始播报 {:.0} ms (静帧确认{}轮, 免第二轮OCR, 跳幅多确认+{}); 另加相机/网络/轮询约 0.3~0.8 s",
                 (t_ann - first) * 1000.0,
-                self.static_streak
+                self.static_streak,
+                extra
             );
         }
         // 已无待确认候选: 撤观察期。否则 active_until 还会让主循环
@@ -480,9 +595,11 @@ impl Loop {
         // 本轮已覆盖这次变化(不论由哪条路径触发), 同一段静止画面不再重复触发。
         self.change_fired = true;
         let iter_t0 = now_secs();
-        let crop = capture::crop_rgb(frame, self.roi);
-        self.save_evidence(&crop, by_change, now);
-        match self.recognize_candidates(&crop) {
+        // 存证图存"检测区"(rows>1 时是三行整块), 排查时一眼能看到全貌;
+        // 识别则按行分别裁 —— 整块喂给 tesseract 会明显掉识别率(现场实测)。
+        let det_box = capture::crop_rgb(frame, self.det_roi);
+        self.save_evidence(&det_box, by_change, now);
+        match self.recognize_candidates(frame) {
             Ok((raw, cands)) => {
                 let iter_secs = now_secs() - iter_t0;
                 self.ingest_candidates(cands, &raw, iter_secs, by_change, now);
@@ -554,9 +671,57 @@ impl Loop {
         }
     }
 
-    /// 对裁剪图跑 OCR 并解析候选; 原图读不出且 ROI 不大时自动走"增强图"兜底链路。
-    /// 返回 `(本轮原始文本, 候选集合)`; 只有 tesseract 子进程本身失败才返 Err。
+    /// 多行列表识别: 按行距逐行裁切、逐行 OCR, 返回 `(本轮原始文本, 候选集合)`。
+    ///
+    /// ★为什么按行裁而不是把三行框一起喂给 tesseract(2026-10-21 现场实测):
+    ///   同一帧、同样参数下, 三行整块 psm11 读出来是 "D理 10， GA1 TD" 这类碎片;
+    ///   切回单行 220x49 立刻恢复 "请GA192到C06号窗口办理"。原因是这块屏每行只有
+    ///   约 24px 高, 行间还有色带分隔, tesseract 在整块上的版面切分一乱, 号码就断。
+    ///   所以检测框覆盖多行、识别仍按单行做, 两者互不影响。
+    ///
+    /// 提前退出: 第一行就命中"该播的号"时不再往下读 —— 最新号在最上面是常态,
+    /// 此时 OCR 次数与单行方案完全一样; 只有"最新号落到第 2/3 行"才会多读一两行。
     fn recognize_candidates(
+        &self,
+        frame: &Arc<capture::Frame>,
+    ) -> Result<(String, HashSet<(String, String)>), String> {
+        let rows = self.rows.max(1);
+        let mut cands: HashSet<(String, String)> = HashSet::new();
+        let mut raws: Vec<String> = Vec::new();
+        for i in 0..rows {
+            if i > 0 && cands.iter().any(|c| self.gate_accepts(&c.0)) {
+                break;
+            }
+            let y = self.roi.1 + i * self.pitch;
+            if self.pitch == 0 || y + self.roi.3 > frame.h {
+                break;
+            }
+            let crop = capture::crop_rgb(frame, (self.roi.0, y, self.roi.2, self.roi.3));
+            // 第一行失败才真报错(与单行时代语义一致); 后续行失败只当这一行没读出来,
+            // 不能因为第二行糊了就把第一行已经读到的结果丢掉。
+            let (raw_i, c_i) = match self.recognize_one(&crop) {
+                Ok(v) => v,
+                Err(e) if i == 0 => return Err(e),
+                Err(_) => continue,
+            };
+            if !raw_i.trim().is_empty() {
+                raws.push(if rows > 1 {
+                    format!("[行{}]{}", i + 1, raw_i)
+                } else {
+                    raw_i.clone()
+                });
+            }
+            cands.extend(c_i);
+        }
+        // 同一号码若另有带窗口的候选, 丢弃它的空窗口版本 —— 否则同一号码会
+        // 先后播 "请GA170到号窗口办理"(半截话) 和 "请GA170到C06号窗口办理"。
+        // 详见 drop_shadow_empty() 的注释。
+        Ok((raws.join(" "), drop_shadow_empty(cands)))
+    }
+
+    /// 单行裁剪图的识别: 原图 -> (读不出时)增强图 psm11 -> 增强图 psm6。
+    /// 返回 `(原始文本, 候选集合)`; 只有 tesseract 子进程本身失败才返 Err。
+    fn recognize_one(
         &self,
         crop: &image::RgbImage,
     ) -> Result<(String, HashSet<(String, String)>), String> {
@@ -583,10 +748,7 @@ impl Loop {
                 }
             }
         }
-        // 同一号码若另有带窗口的候选, 丢弃它的空窗口版本 —— 否则同一号码会
-        // 先后播 "请GA170到号窗口办理"(半截话) 和 "请GA170到C06号窗口办理"。
-        // 详见 drop_shadow_empty() 的注释。
-        Ok((raw, drop_shadow_empty(cands)))
+        Ok((raw, cands))
     }
 
     /// 把本轮识别结果归账: 诊断计数 -> 确认窗口/退避 -> 预热 -> 确认状态机 -> 票决播报。
@@ -599,13 +761,19 @@ impl Loop {
         now: f64,
     ) {
         self.note_ocr_cost(iter_secs);
+        // ★号码闸门(2026-10-21): 先把"老号/跳号"滤掉 —— 三行列表里就只剩最新那个。
+        // 另外两个判断(空转退避、last_read_ok)必须用**过滤前**的 raw_has:
+        // 屏幕上只有老号时, 说明读得很清楚, 不该被当成"没读到"去翻倍兜底间隔,
+        // 否则下一个新号要靠兜底轮才发现, 反应会被拖慢到 30s。
+        let raw_has = !cands.is_empty();
+        let (cands, jump_blocked) = self.gate_filter(cands, now);
         // ★确认窗口自适应: OCR 一步就要 1.5~10s 时, 固定 4s 的 TTL 会在
         //   下一轮到来前把候选清掉 -> 永远凑不齐 stable_frames 轮 -> 不播报。
         //   (靶机实测就是这样死的: 圈速 24s > TTL 4s。)
         //   有效 TTL = max(配置值, 3×本轮OCR耗时), 静止的号不会被误清。
         let ttl_eff = self.ttl.max(3.0 * iter_secs);
         // 空转退避: 连续无候选就把兜底间隔翻倍(上限 30s), 有候选立刻复位。
-        if cands.is_empty() {
+        if !raw_has {
             self.empty_streak = self.empty_streak.saturating_add(1);
             let k = 1u32 << self.empty_streak.min(4);
             self.fb_eff = (self.fb_sec * k as f64).min(30.0);
@@ -616,7 +784,7 @@ impl Loop {
         // TTS 预热: 第一轮看到候选就后台合成(结果落在常驻服务缓存里),
         // 等第 stable_frames 轮确认通过再播时即命中缓存(~毫秒),
         // 相当于把 1.8s 的合成耗时从关键路径上整体藏掉。
-        self.last_read_ok = !cands.is_empty();
+        self.last_read_ok = raw_has;
         for cand in &cands {
             self.cand_raw.insert(cand.clone(), raw.to_string(), now);
             // 预热按【号码】判重, 与播报去重键保持一致。
@@ -632,6 +800,11 @@ impl Loop {
         if cands.iter().any(|c| !self.announced.contains_key(&c.0)) {
             self.active_until = now + self.active_sec;
         }
+        // 有跳号嫌疑被拦 -> 同样保持观察期, 让下一轮 OCR 尽快重认。
+        // 误读在下一轮多半就变对了; 真跳号连续被拦超过 GATE_FORCE_SECS 会强制放行。
+        if jump_blocked {
+            self.active_until = now + self.active_sec;
+        }
         // 清理超时未再出现的候选(闪变残留), 不立即清零 -> 短暂被替换的号码仍保留计数
         self.confirm.retain(|_, v| now - v.1 <= ttl_eff);
         let mut sorted: Vec<(String, String)> = cands.iter().cloned().collect();
@@ -644,9 +817,125 @@ impl Loop {
             self.confirm.insert(cand.clone(), (cnt, now, first));
         }
         self.announce_winners(raw, now, iter_secs);
-        // 只对"因变化而跑"的那一轮记 INVALID: 兜底轮读到空属正常, 记了会刷屏。
-        if cands.is_empty() && by_change {
+        // 只对"因变化而跑、且真的什么都没解析出来"的那一轮记 INVALID:
+        // 兜底轮读到空属正常; 屏幕只有老号(被闸门滤掉)也不该记 INVALID。
+        if !raw_has && by_change {
             logger::log(&self.cfg.log_file, "", "", raw, "INVALID");
+        }
+    }
+
+    /// 单个号码是否"够格播"(纯判定, 不改状态)。逐行识别时用它判断要不要继续往下读。
+    fn gate_accepts(&self, number: &str) -> bool {
+        if self.max_jump == 0 {
+            return true;
+        }
+        let (pre, v) = match split_num(number) {
+            Some(x) => x,
+            None => return true,
+        };
+        match self.last_num.get(&pre) {
+            None => true,
+            // 硬上限放到 JUMP_HARD_MAX: 段内靠"多要确认量"分级把关, 不再一刀切。
+            Some(&last) => v > last && v <= last + JUMP_HARD_MAX,
+        }
+    }
+
+    /// 该号码在"当前基线"下需要额外几个确认量(静帧 tick / 投票轮)。
+    /// 基线未知或号码不参与闸门时返回 0 —— 退化成原来的行为, 不会卡住。
+    fn jump_extra(&self, number: &str) -> u32 {
+        if self.max_jump == 0 {
+            return 0;
+        }
+        let (pre, v) = match split_num(number) {
+            Some(x) => x,
+            None => return 0,
+        };
+        match self.last_num.get(&pre) {
+            None => 0,
+            Some(&last) if v > last => jump_extra_confirm(v - last, self.max_jump),
+            _ => 0,
+        }
+    }
+
+    /// 按下述规则过滤候选(多行列表下同时承担"挑最新号")。
+    /// 返回 `(放行的候选, 是否有跳号被拦)` —— 后者用来让主循环保持快速重读,
+    /// 因为被拦的多半是误读, 下一轮 OCR 往往就变对了; 真跳号则靠静默兜底放行。
+    fn gate_filter(
+        &mut self,
+        cands: HashSet<(String, String)>,
+        now: f64,
+    ) -> (HashSet<(String, String)>, bool) {
+        if self.max_jump == 0 || cands.is_empty() {
+            return (cands, false);
+        }
+        let mut by_pre: HashMap<String, Vec<(String, String, u32)>> = HashMap::new();
+        let mut out: HashSet<(String, String)> = HashSet::new();
+        for (n, w) in cands {
+            match split_num(&n) {
+                Some((pre, v)) => by_pre.entry(pre).or_default().push((n, w, v)),
+                // 拆不出数字段的候选(理论上不会出现)不参与闸门, 原样放行
+                None => {
+                    out.insert((n, w));
+                }
+            }
+        }
+        let silent = now - self.last_announce;
+        let mut blocked: Vec<String> = Vec::new();
+        for (pre, items) in by_pre {
+            match self.last_num.get(&pre).copied() {
+                // 无基线(刚部署/跨天): 只取最大号 —— 三行列表里最新的一行在最上面,
+                // 号码又是递增的, 所以"最大"就是"最新"。
+                None => {
+                    if let Some(mx) = items.iter().map(|x| x.2).max() {
+                        for (n, w, v) in &items {
+                            if *v == mx {
+                                out.insert((n.clone(), w.clone()));
+                            }
+                        }
+                    }
+                }
+                Some(last) => {
+                    let mut any = false;
+                    for (n, w, v) in &items {
+                        // 放行区间: (上次号, 上次号 + JUMP_HARD_MAX] —— 老号(≤基线)与
+                        // 离谱跳号(>硬上限, 基本是误读)都挡; 中间段靠分档确认把关。
+                        if *v > last && *v <= last + JUMP_HARD_MAX {
+                            out.insert((n.clone(), w.clone()));
+                            any = true;
+                        } else if *v > last {
+                            blocked.push(format!("{}(+{})", n, *v - last));
+                        }
+                    }
+                    // 兜底: 长时间一句没播, 而又有"更大的号"被硬上限挡住
+                    // (多半是基线被某次误读带偏了) -> 强制放行最大的那个, 防整天静默。
+                    if !any && silent >= GATE_FORCE_SECS {
+                        if let Some(mx) = items.iter().filter(|x| x.2 > last).max_by_key(|x| x.2) {
+                            println!(
+                                "[闸门] 已静默 {:.0}s, {} 超出硬上限 +{} -> 强制放行(基线 {} 可能被误读带偏)",
+                                silent, mx.0, JUMP_HARD_MAX, last
+                            );
+                            out.insert((mx.0.clone(), mx.1.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        if !blocked.is_empty() && now - self.gate_log_at >= 10.0 {
+            self.gate_log_at = now;
+            println!(
+                "[闸门] 拦截 {} (上限 +{}, 当前基线 {:?})",
+                blocked.join(", "),
+                self.max_jump,
+                self.last_num
+            );
+        }
+        (out, !blocked.is_empty())
+    }
+
+    /// 记一次成功播报, 推进闸门基线。
+    fn note_announced(&mut self, number: &str) {
+        if let Some((pre, v)) = split_num(number) {
+            self.last_num.insert(pre, v);
         }
     }
 
@@ -656,17 +945,22 @@ impl Loop {
         let mut winners = number_votes(&self.confirm);
         winners.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
         for (number, window, votes, first, _last) in winners {
-            if votes < self.need_stable || self.announced.contains_key(&number) {
+            // 跳幅大 -> 多要几票(每票≈一轮 OCR), 防过渡帧/反光残影把大号送出去。
+            let extra = self.jump_extra(&number);
+            if votes < self.need_stable + extra || self.announced.contains_key(&number) {
                 continue;
             }
             self.announced.insert(number.clone(), (), now);
+            self.note_announced(&number);
             logger::log(&self.cfg.log_file, &number, &window, raw, "OK");
             self.ann.speak(&number, &window); // 入FIFO队列, 播报线程按顺序播
             self.last_announce = now; // 健康心跳: 真有号播了, 复位闲置计时
             println!(
-                "[时序] 首见→开始播报 {:.0} ms (确认{}轮, 本轮OCR {:.1}s); 另加相机/网络/轮询约 0.3~0.8 s",
+                "[时序] 首见→开始播报 {:.0} ms (确认{}轮/需{}, 跳幅多确认+{}, 本轮OCR {:.1}s); 另加相机/网络/轮询约 0.3~0.8 s",
                 (now - first) * 1000.0,
                 votes,
+                self.need_stable + extra,
+                extra,
                 iter_secs
             );
         }
@@ -879,8 +1173,29 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{drop_shadow_empty, number_votes, settle_ready, SETTLE_MAX_WAIT_SECS};
+    use super::{
+        drop_shadow_empty, jump_extra_confirm, number_votes, settle_ready, SETTLE_MAX_WAIT_SECS,
+    };
     use std::collections::{HashMap, HashSet};
+
+    // ———— 跳幅分档: 叫号员会过号, 卡 +2 会漏播; 分档后大跳只多等确认, 不丢号 ————
+    #[test]
+    fn jump_tiers_by_extra_confirm() {
+        // +1~+3: 立即播(与旧行为一致)
+        assert_eq!(jump_extra_confirm(1, 10), 0);
+        assert_eq!(jump_extra_confirm(3, 10), 0);
+        // +4~+max_jump: 多要 2 个确认量
+        assert_eq!(jump_extra_confirm(4, 10), 2);
+        assert_eq!(jump_extra_confirm(10, 10), 2);
+        // 超过 max_jump 但仍 <= 硬上限: 多要 4 个
+        assert_eq!(jump_extra_confirm(11, 10), 4);
+        assert_eq!(jump_extra_confirm(30, 10), 4);
+        // max_jump=0 表示闸门关闭: 全都不要额外确认
+        assert_eq!(jump_extra_confirm(40, 0), 0);
+        // 上限被调得比"立即档"还小时, 立即档跟着收缩, 不越界放行
+        assert_eq!(jump_extra_confirm(1, 1), 0);
+        assert_eq!(jump_extra_confirm(2, 1), 4);
+    }
 
     // ———— 稳帧判定 settle_ready: 现场调优新增逻辑的回归(此前零覆盖) ————
 
