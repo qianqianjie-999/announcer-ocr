@@ -20,8 +20,10 @@
     python3 -m unittest discover -s tests -v
     或  python3 tests/test_config_web.py
 """
+import json
 import os
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -477,6 +479,117 @@ class TestValidateAndBuild(unittest.TestCase):
             schedule={"enabled": "on", "work_start": "08:00", "work_end": "08:00"})
         self.assertIsNone(cfg)
         self.assertIn("不能相同", err)
+
+
+# ---------------------------------------------------------------- NaN/Inf 穿透防御
+
+class TestFiniteFloatGuard(unittest.TestCase):
+    """★回归(2026-10-22 第三轮审查): NaN/Inf 穿透校验打崩 announce-rs。
+
+    NaN 与任何数比较恒 False, validate 里全部范围校验形同虚设;
+    json.dump 默认 allow_nan=True 把字面量 NaN 写进 config.json,
+    serde_json 拒读 → announce-rs 启动即崩循环, 且页面上看不出异常。
+    """
+
+    def setUp(self):
+        # validate_and_build 会读磁盘 config 取"未编辑字段"，统一打桩
+        p = mock.patch.object(cw, "load_cfg", return_value=_base_cur())
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _build(self, **over):
+        body = _base_body()
+        body.update(over)
+        return cw.validate_and_build(body)
+
+    def test_detect_nan_inf_rejected(self):
+        for field in ("diff_threshold", "changed_ratio", "fallback_ocr_sec",
+                      "confirm_ttl_sec", "active_sec"):
+            for bad in ("nan", "inf", "-inf", "NaN", "Infinity"):
+                b = _base_body()
+                b["detect"][field] = bad
+                cfg, err = cw.validate_and_build(b)
+                self.assertIsNone(cfg, (field, bad))
+                self.assertIn("有限", err, (field, bad))
+
+    def test_fps_nan_inf_rejected(self):
+        for bad in ("nan", "inf", "-inf"):
+            cfg, err = self._build(fps=bad)
+            self.assertIsNone(cfg, bad)
+            self.assertIn("有限", err, bad)
+
+    def test_settle_sec_nan_inf_rejected(self):
+        for bad in ("nan", "inf", "-inf"):
+            b = _base_body()
+            b["detect"]["settle_sec"] = bad
+            cfg, err = cw.validate_and_build(b)
+            self.assertIsNone(cfg, bad)
+            self.assertIn("有限", err, bad)
+
+    def test_piper_length_scale_nan_inf_rejected(self):
+        for bad in ("nan", "inf", "-inf"):
+            b = _base_body()
+            b["tts"]["piper_length_scale"] = bad
+            cfg, err = cw.validate_and_build(b)
+            self.assertIsNone(cfg, bad)
+            self.assertIn("语速需在", err, bad)
+
+    def test_valid_floats_still_accepted(self):
+        # 防御不能误伤: 正常值(含字符串小数)照常通过
+        b = _base_body()
+        b["detect"].update({"diff_threshold": "25.5", "settle_sec": "1.2"})
+        b["tts"]["piper_length_scale"] = "1.25"
+        cfg, err = cw.validate_and_build(b)
+        self.assertIsNone(err)
+        self.assertEqual(cfg["detect"]["diff_threshold"], 25.5)
+        self.assertEqual(cfg["detect"]["settle_sec"], 1.2)
+        self.assertEqual(cfg["tts"]["piper_length_scale"], 1.25)
+
+
+class TestSaveCfgNanGuard(unittest.TestCase):
+    """save_cfg 是最后一道防线: 含 nan/inf 的 dict 必须抛错且不碰旧配置。
+
+    原子写语义下异常路径要清掉 .tmp 残留, 旧 config.json 原样保留 ——
+    主服务(serde_json)宁可读旧配置也不能读到带 NaN 的半截文件。
+    """
+
+    def setUp(self):
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        self.cfg_path = os.path.join(tmpdir.name, "config.json")
+        self.old = {"fps": 5.0, "tts": {"rate": 135}}
+        with open(self.cfg_path, "w", encoding="utf-8") as f:
+            json.dump(self.old, f)
+        p = mock.patch.object(cw, "CONFIG", self.cfg_path)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _old_on_disk(self):
+        with open(self.cfg_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_nan_dict_raises_and_old_cfg_intact(self):
+        with self.assertRaises(ValueError):
+            cw.save_cfg({"fps": float("nan")})
+        self.assertEqual(self._old_on_disk(), self.old)
+        self.assertFalse(os.path.exists(self.cfg_path + ".tmp"),
+                         "异常路径必须清理 .tmp 残留")
+
+    def test_inf_dict_raises_and_old_cfg_intact(self):
+        with self.assertRaises(ValueError):
+            cw.save_cfg({"x": float("inf")})
+        self.assertEqual(self._old_on_disk(), self.old)
+
+    def test_nested_nan_raises(self):
+        # nan 藏在嵌套结构里, json 编码时同样拦下
+        with self.assertRaises(ValueError):
+            cw.save_cfg({"detect": {"diff_threshold": float("nan")}})
+        self.assertEqual(self._old_on_disk(), self.old)
+
+    def test_normal_save_replaces(self):
+        cw.save_cfg({"fps": 3.0})
+        self.assertEqual(self._old_on_disk(), {"fps": 3.0})
+        self.assertFalse(os.path.exists(self.cfg_path + ".tmp"))
 
 
 # ---------------------------------------------------------------- 试听参数合并

@@ -192,16 +192,41 @@ impl Ocr {
         let mut out = HashSet::new();
         for p in &self.pats {
             for c in p.captures_iter(&flat) {
-                let num_raw = c.get(1).map(|m| m.as_str()).unwrap_or("");
+                // ★前导大写字母守卫(2026-10-22 第三轮审查): 生产正则的号码组是
+                //   [A-Z]{1,2}\d{3,6} 这类"宽前缀"写法, 从号码中间起也能切出合法匹配
+                //   —— "GAT174" 会在 A 处切出 "AT174", 杂字母 T 落进前缀, 同号变新号
+                //   重复播报。旧修法指望下面的数字段清洗兜底, 但宽正则切出的数字段
+                //   恒为纯数字, 该清洗对生产正则恒为空操作 —— 宣称的修复实际无效。
+                //   守卫: 匹配起点前一字符是大写 A-Z ⇒ 该匹配咬掉了真前缀的尾巴,
+                //   丢弃原切分, 把前一字符并回号码头交给原清洗链:
+                //   "G"+"AT174" -> 前缀 GA + 数字段 "T174" -> only_digits 清掉 T
+                //   -> 还原真号 GA174。行首或前一字符为中文/标点/数字的匹配照常放行
+                //   (如 "青GA174" 的 "青"), 真号不受影响。
+                let num_raw = match c.get(1) {
+                    Some(m) => {
+                        let s = m.start();
+                        if s > 0 && flat.as_bytes()[s - 1].is_ascii_uppercase() {
+                            // 前一字符必为单字节 ASCII 大写字母, 直接取字节拼回
+                            let mut owned = String::with_capacity(m.as_str().len() + 1);
+                            owned.push(flat.as_bytes()[s - 1] as char);
+                            owned.push_str(m.as_str());
+                            owned
+                        } else {
+                            m.as_str().to_string()
+                        }
+                    }
+                    None => String::new(),
+                };
                 let win = c.get(2).map(|m| m.as_str()).unwrap_or("");
-                let (pre, rest) = split_prefix(num_raw);
+                let (pre, rest) = split_prefix(&num_raw);
                 // 窗口号归一化后再折叠误读的前导零: "CO01" -> norm -> "C001" -> "C01"
                 //
                 // ★号码数字段清洗(2026-10-13 现场实测): 糊帧/过渡帧会在"前缀与数字之间"
                 //   多认一个字母 —— 屏幕上的 GA174 被读成 "GAT174"。旧逻辑把 "GAT174"
                 //   的不同写法当不同号码, 且宽正则会回溯切出 "AT174" 播成"诶提一七四"
                 //   (听感像英语), 同一个号连播两遍。数字段只可能是数字, 夹进去的字母
-                //   一律是噪声, 丢掉即还原真号(GAT174 -> GA174)。
+                //   一律是噪声, 丢掉即还原真号(GAT174 -> GA174)。该清洗要真正生效,
+                //   依赖上面的前导大写字母守卫先把被宽正则吞掉的前缀字母并回来。
                 let num_digits = Self::only_digits(&Self::norm_digits(rest));
                 if num_digits.is_empty() {
                     continue; // 数字段被噪声吃光 -> 这组不算候选, 别播半截号
@@ -320,6 +345,13 @@ fn promote_prefix_lookalikes(chars: &[char]) -> Vec<char> {
                 j += 1;
             }
             if (3..=4).contains(&n) && j < chars.len() && (chars[j] == '到' || chars[j] == '至') {
+                // ★前导大写字母守卫(2026-10-22 第三轮审查): 候选段前一位已是真前缀的
+                //   大写字母时, 段里的"数字"是号码数字段的首位(如 "GA6123" 的 "A6"/"6"),
+                //   不是冒充字母 —— 还原会把 "GA6123" 变形 "GAG123", 正则再切出 "AG123",
+                //   前缀被改导致号码闸门放行最大号、误播错号。禁用该段还原, 原样保留。
+                if i > 0 && chars[i - 1].is_ascii_uppercase() {
+                    continue;
+                }
                 for m in pre {
                     out.push(m);
                 }
@@ -413,6 +445,24 @@ mod tests {
     fn parse_question_noise_in_number() {
         let (num, win) = one(&parse("青GA9?99到C01号窗"));
         assert_eq!((num, win), ("GA999".into(), "C01".into()));
+    }
+
+    #[test]
+    fn parse_guard_restores_true_prefix_from_stray_letter() {
+        // ★第三轮审查回归: 宽正则会从 "GAT174" 的 A 处切出 "AT174"(杂字母 T 落进
+        //   前缀, 旧修法 only_digits 对此恒空操作) → 同号变新号重复播报。
+        //   守卫须把前一字符并回号码头, 走原清洗链还原真号 GA174, 窗口照常解析。
+        let (num, win) = one(&parse("请GAT174到C04号窗"));
+        assert_eq!((num, win), ("GA174".into(), "C04".into()));
+    }
+
+    #[test]
+    fn parse_promote_guard_keeps_four_digit_number() {
+        // ★第三轮审查回归: "GA6123" 的首位 6 曾被当"数字冒充字母"还原 → "GAG123"
+        //   再被正则切出 "AG123", 前缀被改导致号码闸门放行最大号、误播错号。
+        //   真号必须原样保留。
+        let (num, win) = one(&parse("GA6123到C01号窗"));
+        assert_eq!((num, win), ("GA6123".into(), "C01".into()));
     }
 
     #[test]

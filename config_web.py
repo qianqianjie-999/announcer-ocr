@@ -15,6 +15,7 @@ import errno
 import fcntl
 import glob
 import json
+import math
 import os
 import re
 import struct
@@ -56,8 +57,19 @@ def load_cfg():
 def save_cfg(cfg):
     tmp = CONFIG + ".tmp"
     with CONFIG_LOCK:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                # ★allow_nan=False(2026-10-22 第三轮审查): nan/inf 一旦落盘成字面量
+                #   NaN/Infinity, 主服务 serde_json 拒读 config.json → announce-rs
+                #   启动即崩循环; Python json.load 又宽容读得回, 页面看不出异常。
+                #   写出前就抛错(原子写保证旧配置原样), 异常路径清掉半截 tmp。
+                json.dump(cfg, f, ensure_ascii=False, indent=2, allow_nan=False)
+        except ValueError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
         os.replace(tmp, CONFIG)  # 原子替换, 主服务/配置器永不读到半截文件
 
 
@@ -340,6 +352,20 @@ def validate_rtsp(src):
 _HM_RE = re.compile(r"^([01][0-9]|2[0-3]):[0-5][0-9]$")
 
 
+def _finite(v, name):
+    """float 转换并要求有限值，非有限(nan/inf)抛 ValueError。
+
+    ★为什么要专门拦(2026-10-22 第三轮审查): NaN/Inf 与任何数比较恒为 False，
+    会穿透 validate 里全部范围/正负校验；json.dump 默认 allow_nan=True 又把
+    字面量 NaN 写进 config.json —— 主服务 serde_json 拒读 → announce-rs
+    启动即崩循环，且 Python json.load 宽容读回，页面上看不出任何异常。
+    """
+    f = float(v)
+    if not math.isfinite(f):
+        raise ValueError("%s 必须是有限数字（不能为 nan/inf）" % name)
+    return f
+
+
 def validate_and_build(body):
     """从表单 dict 构造合法 config dict, 有问题返回 (None, 错误信息)。"""
     try:
@@ -375,12 +401,12 @@ def validate_and_build(body):
         det = body["detect"]
         d = dict(cur_det)
         d.update({
-            "diff_threshold": float(det["diff_threshold"]),
-            "changed_ratio": float(det["changed_ratio"]),
-            "fallback_ocr_sec": float(det["fallback_ocr_sec"]),
+            "diff_threshold": _finite(det["diff_threshold"], "diff_threshold"),
+            "changed_ratio": _finite(det["changed_ratio"], "changed_ratio"),
+            "fallback_ocr_sec": _finite(det["fallback_ocr_sec"], "fallback_ocr_sec"),
             "stable_frames": int(det["stable_frames"]),
-            "confirm_ttl_sec": float(det["confirm_ttl_sec"]),
-            "active_sec": float(det["active_sec"]),
+            "confirm_ttl_sec": _finite(det["confirm_ttl_sec"], "confirm_ttl_sec"),
+            "active_sec": _finite(det["active_sec"], "active_sec"),
         })
         # 稳帧再认静置时长: 新增字段, 页面拿不到值时沿用现有配置/默认 0.5,
         # 并钳到 [0.1, 3.0] —— 0 等于关掉稳帧(退回"一动就抓过渡帧"的旧行为)。
@@ -388,6 +414,9 @@ def validate_and_build(body):
             sv = float(det.get("settle_sec"))
         except (TypeError, ValueError):
             sv = float(cur_det.get("settle_sec") or 0.5)
+        else:
+            if not math.isfinite(sv):
+                return None, "settle_sec 必须是有限数字（不能为 nan/inf）"
         d["settle_sec"] = min(3.0, max(0.1, sv))
         # 号码闸门(2026-10-21): 新号相对上次播报号的最大跳幅。
         # 现场编号严格 +1 递增, 2 足以吸收"漏叫一个号"; 填 0 关闭闸门。
@@ -438,7 +467,7 @@ def validate_and_build(body):
                 ls = float(tt["piper_length_scale"])
             except (TypeError, ValueError):
                 return None, "语速必须是数字（如 1.25）"
-            if not (0.5 <= ls <= 3.0):
+            if not math.isfinite(ls) or not (0.5 <= ls <= 3.0):
                 return None, "语速需在 0.5 ~ 3.0 之间（1.0=常速，越大越慢）"
             t["piper_length_scale"] = round(ls, 2)
         t.setdefault("engine", "auto")
@@ -478,7 +507,7 @@ def validate_and_build(body):
         cfg.update({
             "camera_source": camera_source,
             "capture_width": w, "capture_height": h,
-            "fps": float(body["fps"]),
+            "fps": _finite(body["fps"], "fps"),
             "roi": roi,
             "detect": d, "tts": t, "ocr": o,
             "schedule": sched,
