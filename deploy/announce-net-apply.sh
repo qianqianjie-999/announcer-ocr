@@ -64,10 +64,13 @@ case "$cmd" in
       if [ "$GW" != "-" ]; then echo "    gateway $GW"; fi
       if [ "$DNS" != "-" ]; then echo "    dns-nameservers $DNS"; fi
     } > "$IFACES_FILE" || die "写入配置失败"
-    systemctl restart networking || die "networking 重启失败(90秒后将自动回滚)"
+    # ★2026-10-23 中危修复: 回滚 timer 必须在 restart 之前建 —— 旧版先 restart
+    #   再建 timer, restart 失败即 die, interfaces 已写入但回滚不存在,
+    #   die 消息还谎称"90秒后将自动回滚"。
     systemd-run --on-active=90 --unit=announce-net-rollback \
       /bin/sh -c "cp $BAK $IFACES_FILE && systemctl restart networking" >/dev/null \
       || die "回滚定时器创建失败(请手动检查网络)"
+    systemctl restart networking || die "networking 重启失败(90秒后将自动回滚)"
     echo "OK ip=$IP/$PREFIX gw=$GW dns=$DNS rollback=90s"
     ;;
   confirm)

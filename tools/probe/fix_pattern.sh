@@ -14,13 +14,14 @@ set -e
 P=/opt/announce-rs/config.json
 cp -a "$P" "$P.bak.$(date +%Y%m%d-%H%M%S)"
 python3 - <<'PY'
-import json
+import json, os
 p = "/opt/announce-rs/config.json"
 d = json.load(open(p, encoding="utf-8"))
 old = d["ocr"].get("pattern")
 new = ["([A-Z]{1,2}\\d{3,6})[到至]([A-Z]{0,2}\\d{1,3})"]
 d["ocr"]["pattern"] = new
-json.dump(d, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+json.dump(d, open(p + ".tmp", "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+os.replace(p + ".tmp", p)
 print("旧 pattern:", old)
 print("新 pattern:", new)
 PY

@@ -28,14 +28,17 @@ case "$RID" in ""|"$RAW") RID="";; esac
 stamp() { date '+%F %T'; }
 
 if [[ ! "$T" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\ [0-9]{2}:[0-9]{2}:[0-9]{2}$ ]]; then
-    echo "$(stamp) ERR ${RID}|时间格式必须是 YYYY-MM-DD HH:MM:SS（收到: ${T:0:40}）" > "$RES"
+    # ★2026-10-23 低危修复: 原子写 —— 旧版直接 > "$RES", Web 端 5s 轮询可能读到半行
+    echo "$(stamp) ERR ${RID}|时间格式必须是 YYYY-MM-DD HH:MM:SS（收到: ${T:0:40}）" > "$RES.tmp.$$"
+    mv "$RES.tmp.$$" "$RES"
     chmod 644 "$RES" 2>/dev/null; exit 2
 fi
 
 Y=${T:0:4}; M=${T:5:2}; D=${T:8:2}; h=${T:11:2}; m=${T:14:2}; s=${T:17:2}
 if (( Y < 2020 || Y > 2099 || 10#$M < 1 || 10#$M > 12 || 10#$D < 1 || 10#$D > 31 \
       || 10#$h > 23 || 10#$m > 59 || 10#$s > 59 )); then
-    echo "$(stamp) ERR ${RID}|时间数值越界: $T" > "$RES"
+    echo "$(stamp) ERR ${RID}|时间数值越界: $T" > "$RES.tmp.$$"
+    mv "$RES.tmp.$$" "$RES"
     chmod 644 "$RES" 2>/dev/null; exit 3
 fi
 
@@ -44,7 +47,8 @@ timedatectl set-ntp false >/dev/null 2>&1 || true
 
 OLD=$(date '+%F %T')
 if ! date -s "$T" >/dev/null 2>&1; then
-    echo "$(stamp) ERR ${RID}|date -s 失败（缺少 CAP_SYS_TIME？）" > "$RES"
+    echo "$(stamp) ERR ${RID}|date -s 失败（缺少 CAP_SYS_TIME？）" > "$RES.tmp.$$"
+    mv "$RES.tmp.$$" "$RES"
     chmod 644 "$RES" 2>/dev/null; exit 4
 fi
 
@@ -53,7 +57,8 @@ HW=$(command -v hwclock || echo /sbin/hwclock)
 WARN=""
 "$HW" -w >/dev/null 2>&1 || WARN="（RTC 写入失败，重启后可能回退）"
 
-echo "$(stamp) OK ${RID}|$OLD -> $(date '+%F %T') $WARN" > "$RES"
+echo "$(stamp) OK ${RID}|$OLD -> $(date '+%F %T') $WARN" > "$RES.tmp.$$"
+mv "$RES.tmp.$$" "$RES"
 chmod 644 "$RES" 2>/dev/null
 echo "$RID" > "$MARK" 2>/dev/null
 exit 0

@@ -218,7 +218,13 @@ impl Engine for Piper {
                     }
                     std::thread::sleep(Duration::from_millis(100));
                 }
-                Err(e) => return Err(format!("piper 等待失败: {}", e)),
+                // ★2026-10-23 低危修复: try_wait 出错也收尸 —— 与 ocr.rs/util.rs
+                //   同款模式, 旧版直接返回会把子进程留成孤儿
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("piper 等待失败: {}", e));
+                }
             }
         };
         if !status.success() {

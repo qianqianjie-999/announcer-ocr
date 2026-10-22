@@ -8,15 +8,16 @@ cp -a "$CFG" "$CFG.bak.$(date +%Y%m%d-%H%M%S)"
 echo "备份完成:"; ls -1t "$CFG".bak.* 2>/dev/null | head -3
 
 python3 - "$CFG" "$NEW" <<'PY'
-import json, sys
+import json, os, sys
 p, new = sys.argv[1], float(sys.argv[2])
 d = json.load(open(p, encoding="utf-8"))
 tts = d.setdefault("tts", {})
 old = tts.get("piper_length_scale")
 tts["piper_length_scale"] = new
-json.dump(d, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+json.dump(d, open(p + ".tmp", "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+os.replace(p + ".tmp", p)
 print("语速 piper_length_scale: %s -> %s" % (old, new))
 PY
 
 echo "--- 复核 ---"
-python3 -c "import json;d=json.load(open('$CFG'));print(json.dumps(d['tts'],ensure_ascii=False,indent=2))"
+python3 -c "import json, os;d=json.load(open('$CFG'));print(json.dumps(d['tts'],ensure_ascii=False,indent=2))"

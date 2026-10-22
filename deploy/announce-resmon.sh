@@ -13,8 +13,8 @@ MU=$(free -m | awk '/^Mem:/{print $3}')
 MA=$(free -m | awk '/^Mem:/{print $7}')
 FR=$(ps -eo rss,args | awk '/[f]fmpeg/{r+=$1} END{print r+0}')
 FC=$(ps -eo pcpu,args | awk '/[f]fmpeg/{c+=$1} END{print c+0}')
-RR=$(ps -eo rss,args | awk '/[a]nnounce-rs /{r+=$1} END{print r+0}')
-RC=$(ps -eo pcpu,args | awk '/[a]nnounce-rs /{c+=$1} END{print c+0}')
+RR=$(ps -eo rss,args | awk '/[a]nnounce-rs$/{r+=$1} END{print r+0}')
+RC=$(ps -eo pcpu,args | awk '/[a]nnounce-rs$/{c+=$1} END{print c+0}')
 L=$(cut -d' ' -f1 /proc/loadavg)
 T=$(cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null | sort -n | tail -1)
 if [ -n "${T:-}" ]; then T=$((T / 1000)); else T=""; fi
@@ -22,6 +22,7 @@ if [ -n "${T:-}" ]; then T=$((T / 1000)); else T=""; fi
 echo "$(date '+%F %T'),${MU},${MA},${FR},${FC},${RR},${RC},${L},${T}" >> "$OUT"
 
 # 5 分钟一条: 10000 行 ≈ 35 天，超出就先砍掉最老的
+# ★2026-10-23 低危修复: tail 截断后首行表头丢失, 补回
 if [ "$(wc -l < "$OUT")" -gt 10000 ]; then
-    tail -9000 "$OUT" > "$OUT.tmp" && mv "$OUT.tmp" "$OUT"
+    { head -1 "$OUT"; tail -9000 "$OUT"; } > "$OUT.tmp" && mv "$OUT.tmp" "$OUT"
 fi

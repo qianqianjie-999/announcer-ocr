@@ -1,0 +1,6 @@
+[Unit]
+Description=Resource monitor for announce-rs
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/announce-resmon.sh

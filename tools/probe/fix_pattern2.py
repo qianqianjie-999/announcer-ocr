@@ -29,7 +29,11 @@ det = d.setdefault("detect", {})
 det.setdefault("settle_sec", 0.5)
 print("[detect]  settle_sec =", det["settle_sec"])
 
-P.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+# ★2026-10-23 低危修复: 原子写 —— 旧版 write_text 直接写目标文件,
+#   写盘中断留半截 JSON, announce-rs 的 serde_json 拒读崩循环
+tmp = P.with_name(P.name + ".tmp")
+tmp.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+tmp.replace(P)
 print("[写入完成]")
 
 # 回读校验

@@ -184,8 +184,10 @@ class TestValidateRtsp(unittest.TestCase):
 
         危害有限（只是让 ffmpeg 去连本机，读文件类攻击已由伪协议黑名单拦死），
         但属纵深防御的漏网。修复方向：解析出 host 后做 is_loopback 判定而非字面比对。
-        一旦修复，本用例应改为断言"拒绝"。
+        ★2026-10-23 低危修复: 加 skip 标记, 修复后取消 skip 并改为断言"拒绝"。
         """
+        self.skipTest("已知安全缺口: rtsp://[::1]/s 和 rtsp://127.1/s 仍能通过回环校验, "
+                      "修复后取消 skip 并改为 assertFalse")
         self.assertTrue(cw.validate_rtsp("rtsp://[::1]/s")[0])
         self.assertTrue(cw.validate_rtsp("rtsp://127.1/s")[0])
 
@@ -217,16 +219,25 @@ class TestSpell(unittest.TestCase):
         self.assertEqual(cw.spell_digits(""), "")
 
     def test_tables_match_rust_side(self):
-        """锁定"两处要同步改"的不变量：Python 表必须与 tts.rs 对齐。
+        """锁定"两处要同步改"的不变量：Python 表必须与 tts.rs 源码真实对齐。
 
-        tts.rs: LETTER_CN = [('C',"西")]；DIGIT_CN 为 零..九。
-        任一侧改了这里就红，提醒同步另一侧。
+        ★2026-10-23 低危修复: 旧版只把 Python 表与字面量比对, tts.rs 改
+        LETTER_CN/DIGIT_CN 不会红 —— "交叉锁定"是假的。改为真正解析 tts.rs 源码。
         """
-        self.assertEqual(cw._CN_LETTER, {"C": "西"})
-        self.assertEqual(
-            cw._CN_DIGIT,
-            {"0": "零", "1": "一", "2": "二", "3": "三", "4": "四",
-             "5": "五", "6": "六", "7": "七", "8": "八", "9": "九"})
+        tts_rs = os.path.join(_REPO_ROOT, "src", "tts.rs")
+        with open(tts_rs, encoding="utf-8") as f:
+            src = f.read()
+        # 从 tts.rs 提取 LETTER_CN 映射: ('C',"西") 格式
+        import re
+        letters = dict(re.findall(r"\('([A-Z])',\s*\"([^\"]+)\"\)", src))
+        # DIGIT_CN 是纯字符串数组 ["零","一",...], 用索引作为键
+        m = re.search(r'DIGIT_CN[^=]*=\s*\[([^\]]+)\]', src)
+        digits = {}
+        if m:
+            for i, d in enumerate(re.findall(r'"([^"]+)"', m.group(1))):
+                digits[str(i)] = d
+        self.assertEqual(cw._CN_LETTER, letters)
+        self.assertEqual(cw._CN_DIGIT, digits)
 
 
 # ---------------------------------------------------------------- validate_and_build
@@ -844,6 +855,156 @@ class TestRequestBodyLimit(unittest.TestCase):
         resp = self._raw(req)
         self.assertEqual(self._status(resp), 200, resp[:80])
         self.assertIn(b'"rev"', resp)
+
+
+class TestCsrfHttpWiring(unittest.TestCase):
+    """do_POST 的 _same_origin 接线(2026-10-23 第七轮中危⑤)。
+
+    纯函数 _same_origin 已有 9 条单测, 但 do_POST 里的调用点/403 行为
+    无人测 —— 把 1704 行删掉全部测试仍绿。起真实服务器验证接线。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        tmpdir = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(tmpdir.cleanup)
+        cls.cfg_path = os.path.join(tmpdir.name, "config.json")
+        with open(cls.cfg_path, "w", encoding="utf-8") as f:
+            json.dump(_base_cur(), f)
+        for attr, val in (("CONFIG", cls.cfg_path),
+                          ("RESTART_CMD", ["true"]),
+                          ("SCHED_CMD", ["false"])):
+            p = mock.patch.object(cw, attr, val)
+            p.start()
+            cls.addClassCleanup(p.stop)
+        import threading
+        from http.server import ThreadingHTTPServer
+        cls.srv = ThreadingHTTPServer(("127.0.0.1", 0), cw.Handler)
+        cls.addClassCleanup(cls.srv.shutdown)
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+        cls.port = cls.srv.server_address[1]
+
+    def _post(self, path: str, headers: dict, body: bytes = b"{}") -> bytes:
+        import socket
+        req = (b"POST " + path.encode() + b" HTTP/1.1\r\n"
+               b"Connection: close\r\n"
+               b"Content-Type: application/json\r\n"
+               b"Content-Length: " + str(len(body)).encode() + b"\r\n")
+        for k, v in headers.items():
+            req += k.encode() + b": " + v.encode() + b"\r\n"
+        req += b"\r\n" + body
+        with socket.create_connection(("127.0.0.1", self.port), timeout=5) as s:
+            s.sendall(req)
+            chunks = []
+            while True:
+                try:
+                    b = s.recv(65536)
+                except socket.timeout:
+                    break
+                if not b:
+                    break
+                chunks.append(b)
+        return b"".join(chunks)
+
+    def _status(self, resp: bytes) -> int:
+        return int(resp.split(b"\r\n", 1)[0].split()[1])
+
+    def test_cross_origin_rejected(self):
+        resp = self._post("/api/save", {"Host": "127.0.0.1", "Origin": "http://evil.com"})
+        self.assertEqual(self._status(resp), 403, resp[:80])
+
+    def test_same_origin_allowed(self):
+        resp = self._post("/api/save", {"Host": "127.0.0.1", "Origin": "http://127.0.0.1"})
+        # 走到正常处理(validate_and_build 可能 400, 但不是 403)
+        self.assertNotEqual(self._status(resp), 403, resp[:80])
+
+    def test_no_origin_no_referer_allowed(self):
+        # curl/脚本客户端: 无 Origin 无 Referer 放行
+        resp = self._post("/api/save", {"Host": "127.0.0.1"})
+        self.assertNotEqual(self._status(resp), 403, resp[:80])
+
+    def test_origin_null_rejected(self):
+        resp = self._post("/api/save", {"Host": "127.0.0.1", "Origin": "null"})
+        self.assertEqual(self._status(resp), 403, resp[:80])
+
+    def test_origin_no_host_rejected(self):
+        # 带 Origin 却无 Host 的畸形请求: 防御优先直接拒
+        resp = self._post("/api/save", {"Origin": "http://127.0.0.1"})
+        self.assertEqual(self._status(resp), 403, resp[:80])
+
+
+class TestOptimisticLock(unittest.TestCase):
+    """__rev 乐观锁 409 冲突路径(2026-10-23 第七轮中危⑤)。
+
+    config_rev() 有单测, 但 /api/save 的 __rev 比对与 409 返回无用例。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        tmpdir = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(tmpdir.cleanup)
+        cls.cfg_path = os.path.join(tmpdir.name, "config.json")
+        with open(cls.cfg_path, "w", encoding="utf-8") as f:
+            json.dump(_base_cur(), f)
+        for attr, val in (("CONFIG", cls.cfg_path),
+                          ("RESTART_CMD", ["true"]),
+                          ("SCHED_CMD", ["false"])):
+            p = mock.patch.object(cw, attr, val)
+            p.start()
+            cls.addClassCleanup(p.stop)
+        import threading
+        from http.server import ThreadingHTTPServer
+        cls.srv = ThreadingHTTPServer(("127.0.0.1", 0), cw.Handler)
+        cls.addClassCleanup(cls.srv.shutdown)
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+        cls.port = cls.srv.server_address[1]
+
+    def _req(self, method: str, path: str, body: bytes = b"") -> bytes:
+        import socket
+        req = (method.encode() + b" " + path.encode() + b" HTTP/1.1\r\n"
+               b"Host: 127.0.0.1\r\nConnection: close\r\n")
+        if body:
+            req += (b"Content-Type: application/json\r\n"
+                    b"Content-Length: " + str(len(body)).encode() + b"\r\n")
+        req += b"\r\n" + body
+        with socket.create_connection(("127.0.0.1", self.port), timeout=5) as s:
+            s.sendall(req)
+            chunks = []
+            while True:
+                try:
+                    b = s.recv(65536)
+                except socket.timeout:
+                    break
+                if not b:
+                    break
+                chunks.append(b)
+        return b"".join(chunks)
+
+    def _status(self, resp: bytes) -> int:
+        return int(resp.split(b"\r\n", 1)[0].split()[1])
+
+    def _json_body(self, resp: bytes) -> dict:
+        return json.loads(resp.split(b"\r\n\r\n", 1)[1])
+
+    def test_wrong_rev_409(self):
+        body = json.dumps(dict(_base_body(), __rev="wrong-rev")).encode()
+        resp = self._req("POST", "/api/save", body)
+        self.assertEqual(self._status(resp), 409, resp[:80])
+        self.assertIn("配置已被其他窗口修改", self._json_body(resp)["error"])
+
+    def test_correct_rev_200(self):
+        # 先 GET /api/config 拿 rev
+        resp = self._req("GET", "/api/config")
+        rev = self._json_body(resp)["rev"]
+        body = json.dumps(dict(_base_body(), __rev=rev)).encode()
+        resp = self._req("POST", "/api/save", body)
+        self.assertEqual(self._status(resp), 200, resp[:80])
+
+    def test_no_rev_200_compat(self):
+        # 脚本工具不带 __rev 不拦(向后兼容)
+        body = json.dumps(_base_body()).encode()
+        resp = self._req("POST", "/api/save", body)
+        self.assertEqual(self._status(resp), 200, resp[:80])
 
 
 if __name__ == "__main__":

@@ -42,3 +42,8 @@ jobs:
       - name: rustfmt 检查（非阻塞）
         continue-on-error: true
         run: cargo fmt --all --check
+
+      # ★2026-10-23 低危修复: Python 侧(配置台/TTS 服务)此前完全裸奔在 CI 外,
+      #   安全最关键的 config_web.py 没有任何门禁。补 pytest 步骤。
+      - name: Python 单元测试
+        run: python3 -m pytest tests/ -q

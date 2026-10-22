@@ -22,6 +22,13 @@ echo "== 4/4 systemd 开机自启 =="
 # ★2026-10-23 低危修复: root 直接登录执行时 $SUDO_USER 未设, User= 被替换成
 #   空值 —— 部分 systemd 版本拒绝解析该 unit。回退为当前用户(root)。
 RUN_USER="${SUDO_USER:-$(id -un)}"
+# ★2026-10-23 中危修复: 互斥检查 —— announce-rs(Rust 版) 与 announce(Python 版)
+#   抢同一摄像头/锁端口, 二选一。若 announce-rs 已存在, 拒绝安装 Python 版。
+if systemctl cat announce-rs.service >/dev/null 2>&1; then
+  echo "ERROR: 检测到 announce-rs.service 已存在(两者抢同一摄像头), 请先卸载再安装 Python 版" >&2
+  echo "       或确认要同时运行(不推荐), 则手动执行: systemctl enable announce" >&2
+  exit 1
+fi
 sed "s|__APP_DIR__|$APP_DIR|g; s|__USER__|$RUN_USER|g" "$APP_DIR/announce.service" > /etc/systemd/system/announce.service
 systemctl daemon-reload
 systemctl enable announce

@@ -1,0 +1,10 @@
+[Unit]
+Description=Resource monitor timer (every 5 min)
+
+[Timer]
+OnBootSec=60s
+OnUnitActiveSec=300s
+Unit=announce-resmon.service
+
+[Install]
+WantedBy=timers.target
