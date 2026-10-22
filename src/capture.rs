@@ -241,7 +241,12 @@ impl PipeGrabber {
                         age
                     );
                     // kill + wait: 管道写端关闭 => 抓帧线程的 read_exact 返回 UnexpectedEof。
-                    if let Some(mut c) = util::lock(&child_slot).take() {
+                    // ★2026-10-23 高危修复: 必须 take 出来再收尸 —— if-let scrutinee 的
+                    //   临时 MutexGuard 存活到块尾, "if let Some(c)=lock().take(){wait}"
+                    //   实际是持锁 wait; ffmpeg 收 SIGKILL 后可能进 D 状态, 会把重拉
+                    //   线程的换槽与 Drop 收尸一起堵死。与抓帧线程重拉处同模式。
+                    let victim = util::lock(&child_slot).take();
+                    if let Some(mut c) = victim {
                         let _ = c.kill();
                         let _ = c.wait();
                     }
@@ -306,8 +311,11 @@ fn spawn_ffmpeg(args: &[String]) -> std::io::Result<Child> {
 
 impl PipeGrabber {
     /// kill + wait 掉当前槽里的子进程(不管有没有)。幂等, 可反复调用。
+    /// ★2026-10-23 高危修复: 先 take 再收尸 —— if-let scrutinee 的临时 MutexGuard
+    ///   存活到块尾, 旧写法是持锁 wait(D 状态时堵死所有收尸方)。见看门狗处同注。
     fn reap_child(&self) {
-        if let Some(mut c) = util::lock(&self.child).take() {
+        let victim = util::lock(&self.child).take();
+        if let Some(mut c) = victim {
             let _ = c.kill();
             let _ = c.wait();
         }

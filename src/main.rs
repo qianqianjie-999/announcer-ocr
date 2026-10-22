@@ -636,6 +636,38 @@ impl Loop {
         self.diag_ocr_max = 0.0;
     }
 
+    /// 作息闸统一入口(2026-10-23 高危修复): schedule.enabled 且当前不在工作时段
+    /// -> false。两条播报路径(fast_confirm 静帧快路 / announce_winners 投票路)
+    /// 都必须过这一关 —— 旧版只闸投票路, 现场主力是静帧快路, "夜里整夜播报"
+    /// 的修复被快路打穿。静音提示只打一次, 回到窗口复位; 静音不写 announced/
+    /// 日志/基线, 恢复后照常播。health_check 的"链路失效"告警也要做同样豁免。
+    fn announcement_allowed(&mut self) -> bool {
+        if !self.cfg.schedule.enabled {
+            return true;
+        }
+        let hm = chrono::Local::now().format("%H:%M").to_string();
+        let inside = in_work_window(
+            &hm,
+            &self.cfg.schedule.work_start,
+            &self.cfg.schedule.work_end,
+        );
+        if inside {
+            if self.mute_warned {
+                self.mute_warned = false;
+                println!("[作息] 已进入工作时段, 恢复播报");
+            }
+            return true;
+        }
+        if !self.mute_warned {
+            self.mute_warned = true;
+            println!(
+                "[作息] 当前 {} 不在工作时段 {}~{}, 静音中(OCR 照常, 到点自动续播)",
+                hm, self.cfg.schedule.work_start, self.cfg.schedule.work_end
+            );
+        }
+        false
+    }
+
     /// 静帧快速确认: 候选出现过一次, 且画面已连续 confirm_ticks 轮无变化 -> 直接确认
     /// 播报, 免掉第二轮 OCR。原理: tesseract 对相同输入是确定性的, 像素不变复读必然
     /// 同文; 第二轮唯一防的是"转瞬即逝的假影", 而静帧观察直接测量了"画面稳定",
@@ -645,6 +677,11 @@ impl Loop {
     /// 落在旧段而永远凑不齐快速确认 -> 只能走原投票路径(和旧行为一致)。
     /// 观察期内一旦又出现变化(changed=true), streak 清零, 自动退回两轮投票。
     fn fast_confirm(&mut self) {
+        // ★2026-10-23 高危修复: 播报前过作息闸 —— 本函数是现场主力播报路径
+        //   (静帧稳住即播, 免第二轮 OCR), 不闸的话静音期照常出声。
+        if !self.announcement_allowed() {
+            return;
+        }
         if self.confirm_ticks < 1
             || self.static_streak < self.confirm_ticks
             || self.confirm.is_empty()
@@ -1077,32 +1114,13 @@ impl Loop {
     /// 按【号码】票决后播报: 票数达到 need_stable 且该号码未播报过才入队。
     /// 聚合口径见 number_votes() —— 同一号码的多个窗口候选并成一票, 只播一次。
     fn announce_winners(&mut self, raw: &str, now: f64, iter_secs: f64) {
-        // ★作息闸(2026-10-22 中危): schedule.enabled 且当前不在工作时段 -> 不播。
-        //   OCR 链照常跑(确认/日志/诊断不受影响), 回到时段自动续播 —— 这是
-        //   "夜里重启主机服务整夜播报"的程序侧防线, 与 systemd worktime timer
-        //   互为兜底。放在 announced.insert 之前: 静音期号码不占当日去重表,
-        //   恢复后屏幕上的现有号还能正常报出来。
-        if self.cfg.schedule.enabled {
-            let hm = chrono::Local::now().format("%H:%M").to_string();
-            let inside = in_work_window(
-                &hm,
-                &self.cfg.schedule.work_start,
-                &self.cfg.schedule.work_end,
-            );
-            if !inside {
-                if !self.mute_warned {
-                    self.mute_warned = true;
-                    println!(
-                        "[作息] 当前 {} 不在工作时段 {}~{}, 静音中(OCR 照常, 到点自动续播)",
-                        hm, self.cfg.schedule.work_start, self.cfg.schedule.work_end
-                    );
-                }
-                return;
-            }
-            if self.mute_warned {
-                self.mute_warned = false;
-                println!("[作息] 已进入工作时段, 恢复播报");
-            }
+        // ★作息闸(2026-10-22 中危, 2026-10-23 收敛到统一入口): schedule.enabled
+        //   且当前不在工作时段 -> 不播。OCR 链照常跑(确认/日志/诊断不受影响),
+        //   回到时段自动续播 —— "夜里重启主机服务整夜播报"的程序侧防线, 与
+        //   systemd worktime timer 互为兜底。放在 announced.insert 之前: 静音期
+        //   号码不占当日去重表, 恢复后屏幕上的现有号还能正常报出来。
+        if !self.announcement_allowed() {
+            return;
         }
         let mut winners = number_votes(&self.confirm);
         winners.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
@@ -1159,6 +1177,18 @@ impl Loop {
     fn health_check(&mut self, now: f64) {
         if self.health_alert_sec <= 0.0 {
             return; // 显式关闭(config: health_alert_min = 0)
+        }
+        // ★2026-10-23 中危修复: 作息静音期 last_announce 停更是设计行为, 不是
+        //   链路失效 —— 不豁免的话静音期整夜每 health_alert_sec 刷一条误导告警。
+        if self.cfg.schedule.enabled {
+            let hm = chrono::Local::now().format("%H:%M").to_string();
+            if !in_work_window(
+                &hm,
+                &self.cfg.schedule.work_start,
+                &self.cfg.schedule.work_end,
+            ) {
+                return;
+            }
         }
         let idle = now - self.last_announce;
         if idle >= self.health_alert_sec && now - self.last_health_warn >= self.health_alert_sec {

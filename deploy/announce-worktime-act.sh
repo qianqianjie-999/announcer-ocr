@@ -9,13 +9,24 @@
 #          23:00 补跑 08:00 事件 -> 不在窗口 -> 跳过, 防整夜跑)
 #   stop : 只有当前不在窗口内才执行(18:00 触发时已过 end -> 执行;
 #          白天补跑 stop 事件 -> 仍在窗口 -> 跳过, 防白天被误停)
-# 作息参数读 /opt/announce-rs/config.json 的 schedule 键; 读不到/损坏时
+# 作息参数读 config.json(路径探测见下)的 schedule 键; 读不到/损坏时
 # 保守放行原动作(退回旧版行为, 由主程序自身的作息闸兜底)。
 set -u
 ACT=${1:?用法: announce-worktime-act.sh start|stop}
-CFG=${ANNOUNCE_CFG:-/opt/announce-rs/config.json}
 
 SVC="announce-piper.service announce-rs.service announce-web.service"
+
+# ★2026-10-23 中危修复: config 路径探测 —— 旧版写死 /opt/announce-rs/ 而生产机
+#   实际是 /home/debian/anntest/ 布局, 读不到 schedule 就退回"照常执行"旧行为,
+#   补跑竞态修复静默失效。按优先级探测, ANNOUNCE_CFG 环境变量可显式指定
+#   (在 unit 里加 Environment=ANNOUNCE_CFG=/path/config.json)。
+CFG=""
+for c in "${ANNOUNCE_CFG:-}" \
+         /opt/announce-rs/config.json \
+         /home/debian/anntest/config.json \
+         /root/anntest/config.json; do
+    if [ -n "$c" ] && [ -r "$c" ]; then CFG="$c"; break; fi
+done
 
 # 从 config.json 读 schedule(纯 python3, 现场必有); 失败 => 空串表示读不到
 read_cfg() {

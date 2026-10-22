@@ -106,8 +106,24 @@ pub(crate) fn http_post_wav(url: &str, text: &str) -> Result<Vec<u8>, String> {
         .and_then(|_| s.write_all(body))
         .map_err(|e| format!("发送请求失败: {}", e))?;
     let mut buf = Vec::with_capacity(1 << 18);
-    s.read_to_end(&mut buf)
-        .map_err(|e| format!("读取响应失败: {}", e))?;
+    // ★2026-10-23 中危修复: 总时限 —— set_read_timeout(60s) 只覆盖单次 recv,
+    //   僵死服务端每 60s 吐 1 字节就能让 read_to_end 永不返回, 播报线程被
+    //   无限期拖住且没有看门狗覆盖(预热线程持续堆积)。90s 硬截止。
+    let deadline = std::time::Instant::now() + Duration::from_secs(90);
+    let mut chunk = [0u8; 8192];
+    loop {
+        match s.read(&mut chunk) {
+            Ok(0) => break, // 对端关闭
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e) => return Err(format!("读取响应失败: {}", e)),
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("读取响应超总时限 90s(服务端疑似僵死)".to_string());
+        }
+    }
     let pos = buf
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
@@ -241,19 +257,20 @@ impl Engine for Espeak {
 /// 探测可用的中文音色: 优先 cmn(espeak-ng 1.5x 的普通话),
 /// 没有则退回 zh(老版别名)。写死 zh 在老版可用、新版虽能别名解析但语义不明确。
 fn espeak_voice(exe: &str) -> String {
-    let out = Command::new(exe)
-        .args(["--voices=cmn"])
-        .output();
-    match out {
-        Ok(o) => {
-            let txt = String::from_utf8_lossy(&o.stdout);
-            if txt.lines().any(|l| l.split_whitespace().nth(1) == Some("cmn")) {
-                "cmn".into()
-            } else {
-                "zh".into()
-            }
-        }
-        Err(_) => "zh".into(),
+    // ★2026-10-23 中危修复: 5s 超时 —— 本函数跑在播报线程的自愈重建路径上,
+    //   旧版 Command::output() 无超时, espeak-ng 损坏/挂死时播报线程永久阻塞,
+    //   drain(10s) 也等不回。超时按"探测失败"处理, 与 spawn 失败同走 zh 兜底。
+    let mut probe = Command::new(exe);
+    probe.args(["--voices=cmn"]);
+    let out = match run_timeout(&mut probe, Duration::from_secs(5)) {
+        Ok(o) => o,
+        Err(_) => return "zh".into(),
+    };
+    let txt = String::from_utf8_lossy(&out.stdout);
+    if txt.lines().any(|l| l.split_whitespace().nth(1) == Some("cmn")) {
+        "cmn".into()
+    } else {
+        "zh".into()
     }
 }
 
