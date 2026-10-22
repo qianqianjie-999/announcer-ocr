@@ -79,14 +79,20 @@ def synthesize(text):
     return data, False
 
 
+# 请求体上限(字节): 一句播报模板几十个汉字 ≈ 60B, 4KB 宽裕百倍。
+# ★2026-10-22 低危修复: 旧版对 Content-Length 不设限 —— 超大 body 会整段读进
+# 内存, 且超长文本的合成要占住 LOCK 数十秒, 阻塞所有正常播报。
+MAX_BODY_BYTES = 4096
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def log_message(self, *a):  # 静默, systemd journal 只留启动与错误
         pass
 
-    def _send(self, body, ctype, extra=None):
-        self.send_response(200)
+    def _send(self, body, ctype, extra=None, code=200):
+        self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         for k, v in (extra or {}).items():
@@ -114,7 +120,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
-            n = int(self.headers.get("Content-Length", 0))
+            try:
+                n = int(self.headers.get("Content-Length", 0))
+            except ValueError:
+                self._send("Content-Length 非法".encode("utf-8"), "text/plain", code=400)
+                return
+            if n > MAX_BODY_BYTES:
+                # body 没读就回 413: keep-alive 下连接不能复用, 必须断开重连
+                self.close_connection = True
+                self._send("请求体过大".encode("utf-8"), "text/plain", code=413)
+                return
             text = self.rfile.read(n).decode("utf-8").strip()
             # 清缓存要放在 text 判空之前: 该请求自身 body 就是空的
             if self.path.startswith("/cache/clear"):

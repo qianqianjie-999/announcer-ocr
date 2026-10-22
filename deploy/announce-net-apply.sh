@@ -16,10 +16,13 @@ ROLLBACK_TIMER=announce-net-rollback.timer
 
 die() { echo "ERR: $*" >&2; exit 1; }
 
-# 严格白名单: 只允许 0-9 和点(不含空格/换行/字母)
+# 严格白名单: 只允许 0-9 和点(不含空格/换行/字母), 且必须恰好 4 段、每段 0-255。
+# ★2026-10-22 低危修复: 旧版只查每段数值范围, 段数不查 —— "1.2.3"/"1.2.3.4.5"
+# 都能过校验写入 interfaces, ifupdown 解析失败或行为怪异, 且现场难以定位。
 valid_host() { [[ $1 =~ ^[0-9.]+$ ]] || return 1
-  local o; for o in ${1//./ }; do [ -n "$o" ] && [ "$o" -le 255 ] 2>/dev/null || return 1; done
-  return 0; }
+  local o n=0
+  for o in ${1//./ }; do [ -n "$o" ] && [ "$o" -le 255 ] 2>/dev/null || return 1; n=$((n+1)); done
+  [ "$n" -eq 4 ]; }
 # DNS: 数字/点/空格(可多个); 正则含空格必须经变量传递, 否则 [[ =~ ]] 解析失败
 valid_dns() { local re='^[0-9. ]+$'; [[ $1 =~ $re ]] || return 1; }
 
