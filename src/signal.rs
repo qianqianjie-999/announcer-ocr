@@ -22,8 +22,10 @@ extern "C" fn on_stop_signal(_sig: i32) {
     STOP.store(true, Ordering::SeqCst);
 }
 
-/// 安装 SIGTERM/SIGINT 处理器。幂等: 重复调用只是覆盖同一个处理函数。
+/// 安装 SIGTERM/SIGINT/SIGHUP 处理器。幂等: 重复调用只是覆盖同一个处理函数。
 /// 必须在主循环开始前调用 —— 否则启动窗口期内收到的 SIGTERM 仍会直接终止进程。
+/// ★2026-10-23 中危修复: 补 SIGHUP —— SSH 断连默认终止进程, 析构不执行,
+///   ffmpeg 孤儿占 /dev/video0, 与 SIGTERM/SIGINT 同根因。
 pub fn install() {
     // SAFETY: signal(2) 只是把信号与一个 extern "C" 函数指针绑定。
     // 处理函数签名 (i32) -> () 与 sighandler_t 一致, 且函数体内只做一次原子写。
@@ -33,6 +35,7 @@ pub fn install() {
         let handler = on_stop_signal as *const () as libc::sighandler_t;
         libc::signal(libc::SIGTERM, handler);
         libc::signal(libc::SIGINT, handler);
+        libc::signal(libc::SIGHUP, handler);
     }
 }
 
@@ -61,5 +64,6 @@ mod tests {
     fn signal_numbers_are_canonical() {
         assert_eq!(libc::SIGTERM, 15);
         assert_eq!(libc::SIGINT, 2);
+        assert_eq!(libc::SIGHUP, 1);
     }
 }
