@@ -163,7 +163,14 @@ impl Announcer {
         let deadline = std::time::Instant::now() + timeout;
         loop {
             if self.is_idle() {
-                return true;
+                // ★2026-10-23 低危修复: 复查防 TOCTOU —— worker 在 pop_front(出队)
+                //   与置 busy=true 之间隔着模板替换/println(毫秒级), 此窗口内
+                //   is_idle() 会误判排空, 退出掐掉最后一条已出队的播报。
+                //   睡一个播报起步的时长后再确认一次, 仍空闲才算真排空。
+                std::thread::sleep(std::time::Duration::from_millis(60));
+                if self.is_idle() {
+                    return true;
+                }
             }
             if std::time::Instant::now() >= deadline {
                 return false;

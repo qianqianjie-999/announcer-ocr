@@ -162,7 +162,14 @@ if not img_path:
 roi = [100, 180, 1400, 650]
 if os.path.exists("config.json"):
     try:
-        roi = json.load(open("config.json", encoding="utf-8")).get("roi") or roi
+        cand = json.load(open("config.json", encoding="utf-8")).get("roi") or roi
+        # ★2026-10-23 低危修复: roi 非 4 个数字(手改坏/字段缺)时旧版直接拼 %d
+        #   抛 TypeError, 体检脚本中途崩; 改为回退默认值并提示
+        if isinstance(cand, list) and len(cand) == 4 \
+                and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in cand):
+            roi = cand
+        else:
+            print("  ⚠ config.json 的 roi 非法(%r), 回退默认值" % (cand,))
         print("  读取 config.json 的 roi =", roi)
     except Exception:
         pass

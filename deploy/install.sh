@@ -19,7 +19,10 @@ echo "== 3/4 音频与摄像头自检 =="
 if ls /dev/video* >/dev/null 2>&1; then echo "USB摄像头: $(ls /dev/video* | tr '\n' ' ')"; else echo "USB摄像头: 未检测到(用RTSP可忽略)"; fi
 
 echo "== 4/4 systemd 开机自启 =="
-sed "s|__APP_DIR__|$APP_DIR|g; s|__USER__|$SUDO_USER|g" "$APP_DIR/announce.service" > /etc/systemd/system/announce.service
+# ★2026-10-23 低危修复: root 直接登录执行时 $SUDO_USER 未设, User= 被替换成
+#   空值 —— 部分 systemd 版本拒绝解析该 unit。回退为当前用户(root)。
+RUN_USER="${SUDO_USER:-$(id -un)}"
+sed "s|__APP_DIR__|$APP_DIR|g; s|__USER__|$RUN_USER|g" "$APP_DIR/announce.service" > /etc/systemd/system/announce.service
 systemctl daemon-reload
 systemctl enable announce
 echo ""

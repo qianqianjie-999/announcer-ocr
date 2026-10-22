@@ -1,0 +1,10 @@
+[Unit]
+# 手工校时请求轮询: 每 5 秒拉一次 announce-time.service, 取走 config_web.py
+# 写入 /var/lib/announce-rs/time/request 的校时请求(2026-10-23 补入库内)。
+Description=Poll announce-web time-set requests every 5 seconds
+[Timer]
+OnBootSec=10s
+OnUnitActiveSec=5s
+Unit=announce-time.service
+[Install]
+WantedBy=timers.target

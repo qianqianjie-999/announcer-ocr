@@ -70,9 +70,14 @@ impl Ocr {
         let tmp = self.tmp.with_extension(format!("{}.png", n));
 
         let file = std::fs::File::create(&tmp).map_err(|e| format!("临时文件创建失败: {}", e))?;
-        image::DynamicImage::ImageRgb8(img.clone())
+        // ★2026-10-23 低危修复: PNG 编码失败也要删临时文件 —— 磁盘满等场景下旧版
+        //   提前 return, 每次失败残留一个 announce_rs_ocr.N.png, 长期叠加占 SD 卡。
+        if let Err(e) = image::DynamicImage::ImageRgb8(img.clone())
             .write_to(&mut std::io::BufWriter::new(&file), image::ImageOutputFormat::Png)
-            .map_err(|e| format!("PNG 编码失败: {}", e))?;
+        {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("PNG 编码失败: {}", e));
+        }
         drop(file);
 
         let res = self.run_tesseract(&tmp, psm);
@@ -140,7 +145,14 @@ impl Ocr {
                     }
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
-                Err(e) => break Err(format!("tesseract 等待失败: {}", e)),
+                Err(e) => {
+                    // ★2026-10-23 低危修复: try_wait 出错(罕见)也要收尸 —— 旧版直接
+                    //   返回, Child 被 drop 但 std 不自动 reap, tesseract 继续跑完
+                    //   成僵尸占进程表, CPU 白烧到自然退出。
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break Err(format!("tesseract 等待失败: {}", e));
+                }
             }
         };
         // ★通道数据只能取一次: mpsc 的 recv 是消费性的, 取走即没了。

@@ -302,7 +302,10 @@ fn seed_last_numbers(log_file: &str) -> HashMap<String, u32> {
         Ok(t) => t,
         Err(_) => return out, // 首次部署还没有日志, 属正常
     };
-    for line in text.lines().rev().take(400) {
+    for line in text.lines().rev().take(4000) {
+        // ★2026-10-23 低危修复: 400 行容易被"最后一条 OK 之后出现 400+ 行 INVALID"
+        //   的病态帧(连续 by_change 空读)挤掉当日基线, 重启后屏上已播号会再播一遍
+        //   —— 这正是本函数要防的原始事故。日志每行 <100B, 4000 行扫描开销可忽略。
         let cols: Vec<&str> = line.split(',').collect();
         if cols.len() < 5 || cols[cols.len() - 1].trim() != "OK" {
             continue;
@@ -767,6 +770,11 @@ impl Loop {
     fn save_evidence(&mut self, crop: &image::RgbImage, by_change: bool, now: f64) {
         if !(self.save_frames && by_change && now - self.last_save >= 2.0 && self.n_saved < 20) {
             return;
+        }
+        // ★2026-10-23 低危修复: 存证满 20 张后旧版静默停用 —— 排障时以为还在
+        //   存证其实早停了。到达上限只提示一次, 别每帧刷屏。
+        if self.n_saved + 1 == 20 {
+            println!("[存证] 已达 20 张上限, 本进程内停止存证(重启后重计)");
         }
         self.last_save = now;
         self.n_saved += 1;

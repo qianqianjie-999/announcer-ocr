@@ -20,9 +20,14 @@ python3 -m venv "$DEST/env"
 "$DEST/env/bin/pip" install --index-url "$PIP_MIRROR" piper-tts
 
 echo "[3/4] 下载中文女声模型(约 63MB)"
+# ★2026-10-23 低危修复: --fail 必须加 —— 旧版 HTTP 404/5xx 时 curl 退出码为 0,
+#   错误页 HTML 被当 .onnx 落盘, set -e 一步不错直到 [4/4] piper 才失败,
+#   伪模型残留现场, 报错极具迷惑性。
 cd "$DEST"
-curl -sL --max-time 900 -o zh_CN-huayan-medium.onnx        "$HF/zh_CN-huayan-medium.onnx"
-curl -sL --max-time 120 -o zh_CN-huayan-medium.onnx.json   "$HF/zh_CN-huayan-medium.onnx.json"
+curl -sfL --max-time 900 -o zh_CN-huayan-medium.onnx        "$HF/zh_CN-huayan-medium.onnx" \
+  || { echo "ERROR 模型下载失败($HF), 请检查网络/URL"; exit 1; }
+curl -sfL --max-time 120 -o zh_CN-huayan-medium.onnx.json   "$HF/zh_CN-huayan-medium.onnx.json" \
+  || { echo "ERROR 模型配置下载失败, 请检查网络/URL"; exit 1; }
 ls -l zh_CN-huayan-medium.onnx*
 
 echo "[4/4] 合成自测"

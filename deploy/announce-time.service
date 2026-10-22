@@ -1,0 +1,8 @@
+[Unit]
+# 消费配置台提交的手工校时请求(deploy/announce-time-apply.sh, root 侧执行)
+# ★2026-10-23 低危修复: 脚本注释一直声明由 announce-time.timer 驱动, 但
+#   unit 文件从未入库 —— 校时请求无人消费, 页面"已提交"却永远无结果。
+Description=Apply manual time-set requests from announce-web
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/announce-time-apply.sh

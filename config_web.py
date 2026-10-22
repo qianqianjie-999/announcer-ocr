@@ -21,6 +21,7 @@ import os
 import re
 import struct
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -1356,7 +1357,17 @@ def test_tts(cfg, number="GA200", window="08"):
     text = tpl.replace("{number}", num_s).replace("{window}", win_s)
     times = max(1, min(5, int(tts.get("repeat") or 1)))
 
-    wav = "/tmp/_wb_tts_test.wav"
+    # ★2026-10-23 低危修复: 固定 /tmp 名两人同时点测试会互踩(播到半截 wav)。
+    # mkstemp 唯一化; 顺带清掉 60s 前的遗留(异常路径可能跳过删除, 不清会累积;
+    # 只删超时旧文件, 不会碰到并发中他人正在用的)。
+    for _old in glob.glob("/tmp/_wb_tts_test_*.wav"):
+        try:
+            if time.time() - os.path.getmtime(_old) > 60:
+                os.remove(_old)
+        except OSError:
+            pass
+    fd, wav = tempfile.mkstemp(prefix="_wb_tts_test_", suffix=".wav")
+    os.close(fd)
     bin_p = tts.get("piper_bin") or ""
     model = tts.get("piper_model") or ""
     eng = tts.get("engine") or "auto"
@@ -1467,7 +1478,18 @@ def test_ocr(cfg):
     if data is None:
         return {"ok": False, "msg": err}
 
-    full, roi_f = "/tmp/_wb_ocr_full.jpg", "/tmp/_wb_ocr_roi.jpg"
+    # ★2026-10-23 低危修复: 同 test_tts —— 唯一临时名 + 清 60s 前遗留
+    for _pat in ("/tmp/_wb_ocr_full_*.jpg", "/tmp/_wb_ocr_roi_*.jpg"):
+        for _old in glob.glob(_pat):
+            try:
+                if time.time() - os.path.getmtime(_old) > 60:
+                    os.remove(_old)
+            except OSError:
+                pass
+    fd, full = tempfile.mkstemp(prefix="_wb_ocr_full_", suffix=".jpg")
+    os.close(fd)
+    fd, roi_f = tempfile.mkstemp(prefix="_wb_ocr_roi_", suffix=".jpg")
+    os.close(fd)
     try:
         with open(full, "wb") as f:
             f.write(data)
@@ -1721,7 +1743,12 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": ok, "msg": m, "logs": logs_status()}, 200 if ok else 400)
             return
         if u.path == "/api/test_ocr":
-            self._json(test_ocr(load_cfg()))
+            # ★2026-10-23 低危修复: test_ocr 内部(ffprobe/tesseract 缺失、pattern
+            #   非字符串、config.json 损坏)异常会直接逃逸 —— 客户端无响应、连接硬断。
+            try:
+                self._json(test_ocr(load_cfg()))
+            except Exception as e:  # noqa: BLE001
+                self._json({"ok": False, "msg": "测试 OCR 失败: %s" % e}, 500)
             return
         if u.path == "/api/test_tts":
             raw, berr, bcode = self._read_body()
@@ -1736,13 +1763,24 @@ class Handler(BaseHTTPRequestHandler):
             # 「测试播报」允许带上页面当前填写的试听参数（未保存也能先听）:
             # 只覆盖无副作用字段、不写盘, 试听完页面保存与否都不受影响 —— 详见
             # apply_tts_preview_overrides（独立成函数是为了能进单测）。
-            apply_tts_preview_overrides(cfg, body.get("tts") or {})
-            ok, m, text = test_tts(cfg, body.get("number") or "GA200",
-                                   body.get("window") or "08")
+            # ★2026-10-23 低危修复: body 传数组/数字、config 的 gap_sec 非法等
+            #   也会抛异常逃逸 —— 与 test_ocr 同样兜底。
+            try:
+                apply_tts_preview_overrides(cfg, body.get("tts") or {})
+                ok, m, text = test_tts(cfg, body.get("number") or "GA200",
+                                       body.get("window") or "08")
+            except Exception as e:  # noqa: BLE001
+                self._json({"ok": False, "msg": "测试播报失败: %s" % e}, 500)
+                return
             self._json({"ok": ok, "msg": m, "text": text, "audio": audio_status()})
             return
         if u.path == "/api/audio_fix":
-            ok, m = audio_fix()
+            # ★2026-10-23 低危修复: 同上兜底(amixer/aplay 缺失等)
+            try:
+                ok, m = audio_fix()
+            except Exception as e:  # noqa: BLE001
+                self._json({"ok": False, "msg": "音频修复失败: %s" % e}, 500)
+                return
             self._json({"ok": ok, "msg": m, "audio": audio_status()})
             return
         if u.path == "/api/time":
