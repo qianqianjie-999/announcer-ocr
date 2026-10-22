@@ -98,6 +98,41 @@ CLI 模式每次重载 onnx 模型。部署常驻合成服务（`piper_url`）�
 espeak-ng：`apt download` + `dpkg -x` 解包到用户目录 + 环境变量注入（05-tts.md）。
 piper：目标机 python 重建 venv（**3.11 的 venv 在 3.12 不可用**），模型文件可复用。
 
+### 没声音，要拔插 3.5mm 才恢复（2026-10-22 现场，3.5mm 接口死机）
+
+板载 **ALC662（HDA）**的失效其实分两种，**对策完全不同**，别混为一谈：
+
+| 失效模式 | 能否软件根治 | 处理 |
+|---|---|---|
+| ① 省电掉电唤不醒（`power_save`） | ✅ 能 | `snd_hda_intel.power_save=0` + `power_save_controller=N` |
+| ② codec 状态机死锁 / ESD / 接触不良 | ❌ 不能 | 只能整机重启；**换 USB 声卡才是根治** |
+
+已落地的软件措施（都在 `deploy/audio_health.sh`）：
+- 关省电（运行时 + `/etc/modprobe.d/` 持久化）、`Auto-Mute Mode=Disabled`、混音器 unmute
+- systemd 硬件看门狗 `RuntimeWatchdogSec=25`
+- 四层自愈：混音器复位 → **USB 热复位** → 重启 announce-rs → 整机重启（限 30 分钟 1 次、最多 3 次）
+
+**为什么软件兜底不够**：整机重启有 **60 秒空窗**，且 `REBOOT_MAX=3` 用完后只剩告警；
+更要紧的是检测有延迟——**没声音之后才发现**，期间的叫号就是漏播。
+
+**换 USB 声卡为什么是根治**：HD Audio codec 焊在主板上，软件唯一的复位手段就是重启整机；
+USB 设备可以 `unbind/bind` **热复位，2 秒完成、可无限次、无需人在现场**：
+
+```bash
+echo -n "1-2" > /sys/bus/usb/drivers/usb/unbind; sleep 2
+echo -n "1-2" > /sys/bus/usb/drivers/usb/bind
+```
+`audio_health.sh` 已内置该分支（`usb_syspath`/`usb_reset`），会自动判断当前声卡是不是 USB：
+是 USB 就热复位，是板载 HDA 才升级到重启整机。
+
+**换 USB 的三个坑（不处理等于换个花样掉线）**：
+1. **必须关 USB autosuspend**，否则把"HDA 省电掉线"换成"USB 自动挂起掉线"：
+   `echo on > /sys/bus/usb/devices/1-2/power/control` 或内核参数 `usbcore.autosuspend=-1`
+   （脚本每次自检会顺手纠正）
+2. **设备号会漂移**：别写死 `plughw:0,0`，用 `plughw:CARD=Device,DEV=0` 按名字引用，
+   或在 BIOS 里禁掉板载 HD Audio 让 USB 稳定占 0
+3. 重新枚举后卡号可能变，复位完要 `aplay -l` 复查
+
 ## 程序与系统
 
 ### 重复启动直接退出
