@@ -765,5 +765,86 @@ class TestConfigRev(unittest.TestCase):
             self.assertEqual(json.load(f), {"fps": 9.0})
 
 
+# ---------------------------------------------------------------- POST 请求体上限
+
+class TestRequestBodyLimit(unittest.TestCase):
+    """Handler._read_body —— POST 请求体上限（2026-10-22 第五轮）。
+
+    旧版 5 个 POST 端点对 Content-Length 不设限: 负值(int("-1") 合法)让
+    read(-1) 阻塞到 EOF 线程永久挂起; 超大 body 整段读进内存撑爆
+    announce-web 的 MemoryMax。用 raw socket 精确控制请求头。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        tmpdir = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(tmpdir.cleanup)
+        cls.cfg_path = os.path.join(tmpdir.name, "config.json")
+        with open(cls.cfg_path, "w", encoding="utf-8") as f:
+            json.dump(_base_cur(), f)
+        for attr, val in (("CONFIG", cls.cfg_path),
+                          ("RESTART_CMD", ["true"]),   # save 后的重启打桩为真跑
+                          ("SCHED_CMD", ["false"])):   # 调度脚本必败 -> 退回 RESTART
+            p = mock.patch.object(cw, attr, val)
+            p.start()
+            cls.addClassCleanup(p.stop)
+        import threading
+        from http.server import ThreadingHTTPServer
+        cls.srv = ThreadingHTTPServer(("127.0.0.1", 0), cw.Handler)
+        cls.addClassCleanup(cls.srv.shutdown)
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+        cls.port = cls.srv.server_address[1]
+
+    def _raw(self, req: bytes) -> bytes:
+        import socket
+        with socket.create_connection(("127.0.0.1", self.port), timeout=5) as s:
+            s.sendall(req)
+            chunks = []
+            while True:
+                try:
+                    b = s.recv(65536)
+                except socket.timeout:
+                    break
+                if not b:
+                    break
+                chunks.append(b)
+        return b"".join(chunks)
+
+    def _status(self, resp: bytes) -> int:
+        # BaseHTTPRequestHandler 默认 HTTP/1.0, 只取首行状态码不挑协议版本
+        return int(resp.split(b"\r\n", 1)[0].split()[1])
+
+    def test_negative_content_length_400(self):
+        # int("-1") 合法 -> 旧版 read(-1) 阻塞挂线程; 现在必须 400 拒绝
+        req = (b"POST /api/logs HTTP/1.1\r\nHost: t\r\nConnection: close\r\n"
+               b"Content-Type: application/json\r\nContent-Length: -1\r\n\r\n")
+        resp = self._raw(req)
+        self.assertEqual(self._status(resp), 400, resp[:60])
+
+    def test_oversized_content_length_413(self):
+        req = (b"POST /api/logs HTTP/1.1\r\nHost: t\r\nConnection: close\r\n"
+               b"Content-Type: application/json\r\n"
+               b"Content-Length: " + str(cw.MAX_BODY_BYTES + 1).encode() + b"\r\n\r\n")
+        resp = self._raw(req)
+        self.assertEqual(self._status(resp), 413, resp[:60])
+
+    def test_non_numeric_content_length_400(self):
+        req = (b"POST /api/logs HTTP/1.1\r\nHost: t\r\nConnection: close\r\n"
+               b"Content-Type: application/json\r\nContent-Length: abc\r\n\r\n")
+        resp = self._raw(req)
+        self.assertEqual(self._status(resp), 400, resp[:60])
+
+    def test_normal_save_unaffected(self):
+        # 完整合法表单不受上限影响: 保存走通并返回 200+rev
+        import json as _json
+        body = _json.dumps(_base_body()).encode("utf-8")
+        req = (b"POST /api/save HTTP/1.1\r\nHost: t\r\nConnection: close\r\n"
+               b"Content-Type: application/json\r\nContent-Length: "
+               + str(len(body)).encode() + b"\r\n\r\n" + body)
+        resp = self._raw(req)
+        self.assertEqual(self._status(resp), 200, resp[:80])
+        self.assertIn(b'"rev"', resp)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -1530,6 +1530,10 @@ def test_ocr(cfg):
 
 # ---------------------------------------------------------------- handler
 
+# POST 请求体上限: 表单 JSON 1~2KB, 64KB 宽裕百倍(见 Handler._read_body)
+MAX_BODY_BYTES = 64 << 10
+
+
 def _same_origin(origin, referer, host):
     """CSRF 纵深防御(2026-10-22 第四轮): 判断浏览器请求是否同源。
 
@@ -1647,6 +1651,29 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
+    def _read_body(self):
+        """读 POST 请求体, 返回 (bytes|None, 错误信息|None, http状态码)。
+
+        ★2026-10-22 第五轮审查: 旧版 5 个 POST 端点对 Content-Length 不设限 ——
+        负值(int("-1") 合法)让 read(-1) 阻塞到 EOF, 线程永久挂起; 超大 body 整段
+        读进内存撑爆 announce-web 的 MemoryMax 被 cgroup 反复杀。一句表单 JSON
+        1~2KB, 64KB 已宽裕百倍。
+        """
+        try:
+            n = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            return None, "Content-Length 非法", 400
+        if n < 0:
+            return None, "Content-Length 非法", 400
+        if n > MAX_BODY_BYTES:
+            # body 没读就回 413: keep-alive 下连接不能复用, 必须断开重连
+            self.close_connection = True
+            return None, "请求体过大", 413
+        try:
+            return self.rfile.read(n), None, 0
+        except OSError as e:
+            return None, "读取请求体失败: %s" % e, 400
+
     def do_POST(self):
         u = urllib.parse.urlparse(self.path)
         # ★CSRF 防御(2026-10-22): 本服务无认证, 所有 POST 都是"改配置/断网/重启"
@@ -1668,9 +1695,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": False, "msg": str(e)}, 500)
             return
         if u.path == "/api/network":
+            raw, berr, bcode = self._read_body()
+            if berr:
+                self._json({"ok": False, "msg": berr}, bcode)
+                return
             try:
-                n = int(self.headers.get("Content-Length", 0))
-                body = json.loads(self.rfile.read(n).decode("utf-8"))
+                body = json.loads(raw.decode("utf-8"))
             except Exception as e:  # noqa: BLE001
                 self._json({"ok": False, "msg": "请求体非法: %s" % e}, 400)
                 return
@@ -1679,9 +1709,12 @@ class Handler(BaseHTTPRequestHandler):
                        200 if ok else 400)
             return
         if u.path == "/api/logs":
+            raw, berr, bcode = self._read_body()
+            if berr:
+                self._json({"ok": False, "msg": berr, "logs": logs_status()}, bcode)
+                return
             try:
-                n = int(self.headers.get("Content-Length", 0))
-                body = json.loads(self.rfile.read(n).decode("utf-8")) if n else {}
+                body = json.loads(raw.decode("utf-8")) if raw else {}
             except Exception:  # noqa: BLE001
                 body = {}
             ok, m = logs_action(str(body.get("action") or ""))
@@ -1691,9 +1724,12 @@ class Handler(BaseHTTPRequestHandler):
             self._json(test_ocr(load_cfg()))
             return
         if u.path == "/api/test_tts":
+            raw, berr, bcode = self._read_body()
+            if berr:
+                self._json({"ok": False, "msg": berr}, bcode)
+                return
             try:
-                n = int(self.headers.get("Content-Length", 0))
-                body = json.loads(self.rfile.read(n).decode("utf-8")) if n else {}
+                body = json.loads(raw.decode("utf-8")) if raw else {}
             except Exception:  # noqa: BLE001
                 body = {}
             cfg = load_cfg()
@@ -1710,9 +1746,12 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": ok, "msg": m, "audio": audio_status()})
             return
         if u.path == "/api/time":
+            raw, berr, bcode = self._read_body()
+            if berr:
+                self._json({"ok": False, "msg": berr}, bcode)
+                return
             try:
-                n = int(self.headers.get("Content-Length", 0))
-                body = json.loads(self.rfile.read(n).decode("utf-8")) if n else {}
+                body = json.loads(raw.decode("utf-8")) if raw else {}
             except Exception:  # noqa: BLE001
                 body = {}
             ok, m, rid = time_submit(body if isinstance(body, dict) else {})
@@ -1723,8 +1762,11 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "not found"}, 404)
             return
         try:
-            n = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(n).decode("utf-8"))
+            raw, berr, bcode = self._read_body()
+            if berr:
+                self._json({"error": berr}, bcode)
+                return
+            body = json.loads(raw.decode("utf-8"))
         except Exception as e:  # noqa: BLE001
             self._json({"error": "请求体非法: %s" % e}, 400)
             return

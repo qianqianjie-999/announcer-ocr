@@ -487,6 +487,13 @@ impl Loop {
                 println!("[错误] 取帧失败，1秒后重试");
                 std::thread::sleep(Duration::from_secs(1));
                 self.prev_gray = None;
+                // ★2026-10-22 第五轮审查: 早退也必须跑维护与健康心跳 —— 断流期间
+                //   恰是"链路死了"的时段, 之前 dedupe 清理/日志轮转/跨日重置/
+                //   [健康] 告警全被跳过, 与健康心跳的设计初衷正好相反。
+                //   maintenance 内部自带节流, 每秒调一次是安全的。
+                let now = now_secs();
+                self.maintenance(now);
+                self.health_check(now);
                 return Tick::SkipSleep;
             }
         };
@@ -511,6 +518,11 @@ impl Loop {
                     self.det_roi, frame.w, frame.h
                 );
             }
+            // ★2026-10-22 第五轮审查: 与取帧失败同理 —— ROI 越界(换码流分辨率)期间
+            //   健康心跳/维护不能停, 否则告警一次后就零日志, 正是"进程活着但链路死了"。
+            let now = now_secs();
+            self.maintenance(now);
+            self.health_check(now);
             return Tick::SkipSleep;
         }
         let mut prepared = prepared;
@@ -774,7 +786,11 @@ impl Loop {
                 break;
             }
             let y = self.roi.1 + i * self.pitch;
-            if self.pitch == 0 || y + self.roi.3 > frame.h {
+            // ★2026-10-22 第五轮审查: pitch==0(单行/默认配置)时首轮 i=0 也会命中,
+            //   连第一行都不裁不认 -> 候选恒空 -> 整条播报链静默全灭(93912f3 多行
+            //   重构引入; 现场三行配置恰好配了 row_pitch 才没暴露)。
+            //   "pitch==0 不再切下一行"只该约束 i>0; 单行模式下第一行必须照常识别。
+            if (i > 0 && self.pitch == 0) || y + self.roi.3 > frame.h {
                 break;
             }
             let crop = capture::crop_rgb(frame, (self.roi.0, y, self.roi.2, self.roi.3));
