@@ -74,6 +74,23 @@ fn jump_extra_confirm(delta: u32, max_jump: u32) -> u32 {
     }
 }
 
+/// 确认窗口的有效 TTL(秒) —— 取四个下界的最大值。
+///
+/// - `ttl`: 配置值 `confirm_ttl_sec`;
+/// - `3 × 本轮 OCR 耗时`: OCR 一步就要 1.5~10s 时, 固定 4s 的 TTL 会在下一轮
+///   到来之前把候选清掉, 确认数永远凑不齐 -> 不播报;
+/// - `1.5 × fb_prev` / `1.5 × fb_next`(本轮实际等待的、下一轮将要等待的兜底间隔):
+///   ★死锁防线(2026-10-22 现场): 过曝/条纹帧下 tesseract 是 0.1s 就正常退出 +
+///   空输出, **不算失败**, 于是 empty_streak 一路涨到 4 → 兜底间隔被拉到 30s,
+///   而 TTL 按 3×0.1s 只算出 4s → 下一轮开头 retain 就把候选连计数一起清掉,
+///   确认数永远是 1(现场 16:14~16:54 的静默不播就是这个死法)。
+///   退避的语义是"少跑几次 OCR", 不该连带惩罚已经确认过的候选。
+///
+/// 抽成自由函数便于单测: 这条防线一旦退化, 症状是"屏幕有号但永远不播", 极难定位。
+fn effective_ttl(ttl: f64, iter_secs: f64, fb_prev: f64, fb_next: f64) -> f64 {
+    ttl.max(3.0 * iter_secs).max(1.5 * fb_prev).max(1.5 * fb_next)
+}
+
 /// 绑定本机回环端口作为单实例锁。端口被占 -> 已有实例在跑。
 /// 与 Python 版一致: 不设 SO_REUSEADDR(std 默认就不设), 进程死操作系统自动释放。
 fn acquire_lock(port: u16) -> Result<TcpListener, String> {
@@ -771,7 +788,14 @@ impl Loop {
         //   下一轮到来前把候选清掉 -> 永远凑不齐 stable_frames 轮 -> 不播报。
         //   (靶机实测就是这样死的: 圈速 24s > TTL 4s。)
         //   有效 TTL = max(配置值, 3×本轮OCR耗时), 静止的号不会被误清。
-        let ttl_eff = self.ttl.max(3.0 * iter_secs);
+        // ★死锁防线(2026-10-22 现场): 上面那一项只覆盖"OCR 本身慢", 覆盖不了
+        //   "空转退避把兜底间隔拉到 30s"。过曝/条纹帧下 tesseract 是 0.1s 就
+        //   正常退出 + 空输出(不算失败), empty_streak 一路涨到 4 → 兜底间隔 30s,
+        //   而 TTL 按 3×0.1s 只算出 4s → 下一轮开头 retain 就把候选连计数清掉,
+        //   确认数永远是 1, 静默不播(现场 16:14~16:54 就是这个死法)。
+        //   退避的语义是"少跑几次 OCR", 不该连带惩罚已经确认过的候选,
+        //   所以把"本轮实际等待的间隔"和"下一轮将要等待的间隔"都计入 TTL 下界。
+        let fb_prev = self.fb_eff;
         // 空转退避: 连续无候选就把兜底间隔翻倍(上限 30s), 有候选立刻复位。
         if !raw_has {
             self.empty_streak = self.empty_streak.saturating_add(1);
@@ -781,6 +805,7 @@ impl Loop {
             self.empty_streak = 0;
             self.fb_eff = self.fb_sec;
         }
+        let ttl_eff = effective_ttl(self.ttl, iter_secs, fb_prev, self.fb_eff);
         // TTS 预热: 第一轮看到候选就后台合成(结果落在常驻服务缓存里),
         // 等第 stable_frames 轮确认通过再播时即命中缓存(~毫秒),
         // 相当于把 1.8s 的合成耗时从关键路径上整体藏掉。
@@ -1174,7 +1199,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        drop_shadow_empty, jump_extra_confirm, number_votes, settle_ready, SETTLE_MAX_WAIT_SECS,
+        drop_shadow_empty, effective_ttl, jump_extra_confirm, number_votes, settle_ready,
+        SETTLE_MAX_WAIT_SECS,
     };
     use std::collections::{HashMap, HashSet};
 
@@ -1195,6 +1221,34 @@ mod tests {
         // 上限被调得比"立即档"还小时, 立即档跟着收缩, 不越界放行
         assert_eq!(jump_extra_confirm(1, 1), 0);
         assert_eq!(jump_extra_confirm(2, 1), 4);
+    }
+
+    // ———— 确认窗口有效 TTL: 空转退避 vs 确认计数的死锁防线(2026-10-22 现场) ————
+
+    #[test]
+    fn ttl_covers_slow_ocr() {
+        // OCR 一步 2s: TTL 至少 3 倍耗时, 否则慢机器上一轮都认不完就被清
+        assert!(effective_ttl(4.0, 2.0, 3.0, 3.0) >= 6.0);
+    }
+
+    #[test]
+    fn ttl_survives_backoff_deadlock() {
+        // ★回归现场死锁: 过曝帧 0.1s 空输出 -> 兜底间隔被退避拉到 30s,
+        //   若 TTL 仍按 3×0.1s 算出 4s, 下一轮开头 retain 就把计数清掉 -> 永不播报。
+        let ttl = effective_ttl(4.0, 0.1, 24.0, 30.0);
+        assert!(ttl > 30.0, "TTL 必须大于等待间隔(30s), 否则候选每轮被清零: {ttl}");
+    }
+
+    #[test]
+    fn ttl_never_shrinks_below_config() {
+        // 配置被调大时不能被其他下界压回去
+        assert_eq!(effective_ttl(40.0, 0.1, 3.0, 3.0), 40.0);
+    }
+
+    #[test]
+    fn ttl_normal_case_stays_tight() {
+        // 正常情况下不该被过度放大: 帧间隔 3s、OCR 0.5s -> 取 1.5×3=4.5
+        assert_eq!(effective_ttl(4.0, 0.5, 3.0, 3.0), 4.5);
     }
 
     // ———— 稳帧判定 settle_ready: 现场调优新增逻辑的回归(此前零覆盖) ————
