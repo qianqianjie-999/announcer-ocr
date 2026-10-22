@@ -175,7 +175,23 @@ impl Config {
     pub fn load(path: &str) -> Result<Config, String> {
         let txt = std::fs::read_to_string(path)
             .map_err(|e| format!("读不到配置 {}: {}", path, e))?;
-        serde_json::from_str(&txt).map_err(|e| format!("配置解析失败: {}", e))
+        let cfg: Config =
+            serde_json::from_str(&txt).map_err(|e| format!("配置解析失败: {}", e))?;
+        cfg.validate().map(|_| cfg)
+    }
+
+    /// 启动前语义校验 —— 抓"serde 类型合法但运行期致命"的配置。
+    /// ★capture_width/height ≥ 1(2026-10-22 第三轮审查): 0 会合法通过 serde(u32),
+    ///   capture.rs 按它分配 frame 缓冲, 0 字节缓冲上 read_exact 恒 Ok -> 抓帧线程
+    ///   100% CPU 死循环且每帧刷"[预览失败]"。宁可拒启, 不带病运行。
+    pub fn validate(&self) -> Result<(), String> {
+        if self.capture_width == 0 || self.capture_height == 0 {
+            return Err(format!(
+                "capture_width/height 不能为 0 (当前 {}x{}): 0 尺寸会让抓帧线程死循环",
+                self.capture_width, self.capture_height
+            ));
+        }
+        Ok(())
     }
 
     /// camera_source: 数字(USB索引) / "simulate" / "rtsp://..." / "/dev/videoN"
@@ -219,4 +235,66 @@ pub enum SourceKind {
     Simulate,
     Net(String),
     Device(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 写临时配置文件(项目不带 tempfile 依赖, 用 pid+原子计数保证并发唯一)。
+    fn write_tmp_cfg(json: &str) -> String {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!(
+            "anntest_cfg_{}_{}.json",
+            std::process::id(),
+            n
+        ));
+        std::fs::write(&p, json).expect("写临时配置失败");
+        p.to_string_lossy().into_owned()
+    }
+
+    /// Config 未 derive Debug(无需为测试加派生), 用 match 解包 Err。
+    fn expect_load_err(json: &str) -> String {
+        match Config::load(&write_tmp_cfg(json)) {
+            Err(e) => e,
+            Ok(_) => panic!("配置应被 validate 拒绝: {json}"),
+        }
+    }
+
+    /// 核心回归(2026-10-22 第三轮审查): capture_width=0 会被 serde(u32) 合法接受,
+    /// 旧版 Config::load 照单全收 -> capture.rs 分配 0 字节缓冲 -> 抓帧线程
+    /// 100% CPU 死循环。修复后必须在启动时拒绝。
+    #[test]
+    fn load_rejects_zero_width() {
+        let err = expect_load_err(r#"{"capture_width": 0}"#);
+        assert!(err.contains("不能为 0"), "错误信息应可读: {err}");
+    }
+
+    #[test]
+    fn load_rejects_zero_height() {
+        let err = expect_load_err(r#"{"capture_height": 0}"#);
+        assert!(err.contains("不能为 0"), "错误信息应可读: {err}");
+    }
+
+    #[test]
+    fn load_accepts_normal_size_and_empty_json() {
+        // 显式正常尺寸: 必须原样通过
+        let p = write_tmp_cfg(r#"{"capture_width": 1280, "capture_height": 720}"#);
+        let cfg = match Config::load(&p) {
+            Ok(c) => c,
+            Err(e) => panic!("正常尺寸不应被拒: {e}"),
+        };
+        assert_eq!((cfg.capture_width, cfg.capture_height), (1280, 720));
+        std::fs::remove_file(&p).ok();
+        // 全默认(空对象): 默认 1920x1080, 也必须放行 —— 防止校验误伤缺省路径
+        let p = write_tmp_cfg("{}");
+        let cfg = match Config::load(&p) {
+            Ok(c) => c,
+            Err(e) => panic!("默认配置不应被拒: {e}"),
+        };
+        assert!(cfg.capture_width > 0 && cfg.capture_height > 0);
+        std::fs::remove_file(&p).ok();
+    }
 }
