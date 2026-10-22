@@ -412,6 +412,34 @@ class TestValidateAndBuild(unittest.TestCase):
         cfg, _ = self._build()
         self.assertNotIn("piper_length_scale", cfg["tts"])
 
+    # ---- 播放设备 aplay_device ----
+
+    def test_aplay_device_saved(self):
+        """★回归(2026-10-22): 表单里的播放设备必须落盘。
+
+        旧实现 tts 合并块漏了 aplay_device —— 页面上改了设备点保存,
+        返回"保存成功", 配置里却还是 None, 试听/播报永远走默认设备。
+        """
+        b = _base_body()
+        b["tts"]["aplay_device"] = "plughw:1,0"
+        cfg, err = cw.validate_and_build(b)
+        self.assertIsNone(err)
+        self.assertEqual(cfg["tts"]["aplay_device"], "plughw:1,0")
+
+    def test_aplay_device_blank_falls_back_to_none(self):
+        # 留空(页面 JS 会送 null) -> 归一成 None(默认设备), 而不是空串
+        b = _base_body()
+        b["tts"]["aplay_device"] = None
+        cfg, err = cw.validate_and_build(b)
+        self.assertIsNone(err)
+        self.assertIsNone(cfg["tts"]["aplay_device"])
+
+    def test_aplay_device_whitespace_only_is_none(self):
+        b = _base_body()
+        b["tts"]["aplay_device"] = "   "
+        cfg, _ = cw.validate_and_build(b)
+        self.assertIsNone(cfg["tts"]["aplay_device"])
+
     # ---- ocr.pattern 保护 ----
 
     def test_ocr_pattern_missing_in_current(self):
@@ -449,6 +477,71 @@ class TestValidateAndBuild(unittest.TestCase):
             schedule={"enabled": "on", "work_start": "08:00", "work_end": "08:00"})
         self.assertIsNone(cfg)
         self.assertIn("不能相同", err)
+
+
+# ---------------------------------------------------------------- 试听参数合并
+
+class TestTtsPreviewOverrides(unittest.TestCase):
+    """apply_tts_preview_overrides —— 「测试播报」的试听参数合并（原 do_POST 内联逻辑）。
+
+    语义: 只覆盖列出的无副作用字段, 其余以磁盘配置为准; 参数非法整体忽略。
+    """
+
+    def _cfg(self):
+        return {"tts": {"repeat": 1, "rate": 135, "spell_number": False,
+                        "speak_window_letter": False, "gap_sec": 0.35,
+                        "aplay_device": None}}
+
+    def test_override_fields_applied(self):
+        cfg = cw.apply_tts_preview_overrides(self._cfg(), {
+            "repeat": "3", "rate": "160", "spell_number": True,
+            "speak_window_letter": True, "piper_length_scale": "1.25"})
+        t = cfg["tts"]
+        self.assertEqual(t["repeat"], 3)
+        self.assertEqual(t["rate"], 160)
+        self.assertTrue(t["spell_number"])
+        self.assertTrue(t["speak_window_letter"])
+        self.assertEqual(t["piper_length_scale"], 1.25)
+        self.assertEqual(t["gap_sec"], 0.35, "未覆盖字段必须原样保留")
+
+    def test_aplay_device_override_applied(self):
+        """★回归(2026-10-22): 页面填的播放设备必须传给试听进程。
+
+        旧实现 override 列表漏了 aplay_device —— 换了设备想先试听,
+        声音还是从磁盘配置的旧设备出, 页面上的"试听"形同虚设。
+        """
+        cfg = cw.apply_tts_preview_overrides(
+            self._cfg(), {"aplay_device": "plughw:1,0"})
+        self.assertEqual(cfg["tts"]["aplay_device"], "plughw:1,0")
+
+    def test_aplay_device_empty_override_falls_back_to_none(self):
+        # 页面清空后送 null -> 以页面为准回落默认设备, 不残留旧值
+        cfg = self._cfg()
+        cfg["tts"]["aplay_device"] = "plughw:1,0"
+        cfg = cw.apply_tts_preview_overrides(cfg, {"aplay_device": None})
+        self.assertIsNone(cfg["tts"]["aplay_device"])
+
+    def test_absent_keys_keep_disk_config(self):
+        # 只送部分字段时, 其余(含 aplay_device)沿用磁盘配置
+        cfg = self._cfg()
+        cfg["tts"]["aplay_device"] = "plughw:2,0"
+        cfg = cw.apply_tts_preview_overrides(cfg, {"repeat": "2"})
+        self.assertEqual(cfg["tts"]["repeat"], 2)
+        self.assertEqual(cfg["tts"]["aplay_device"], "plughw:2,0")
+
+    def test_invalid_values_ignored_whole(self):
+        # 非法参数 -> 整体退回磁盘配置, 不半改不改
+        cfg = self._cfg()
+        cfg["tts"]["aplay_device"] = "plughw:2,0"
+        cfg = cw.apply_tts_preview_overrides(cfg, {"repeat": "abc",
+                                                   "aplay_device": "x"})
+        self.assertEqual(cfg["tts"]["repeat"], 1)
+        self.assertEqual(cfg["tts"]["aplay_device"], "plughw:2,0")
+
+    def test_piper_length_scale_out_of_range_rejected(self):
+        # 越界语速不算"非法整体忽略"项, 但也不允许生效: 保持磁盘值
+        cfg = cw.apply_tts_preview_overrides(self._cfg(), {"piper_length_scale": "9"})
+        self.assertNotIn("piper_length_scale", cfg["tts"])
 
 
 if __name__ == "__main__":

@@ -430,6 +430,9 @@ def validate_and_build(body):
             "spell_number": bool(tt.get("spell_number", False)),
             "speak_window_letter": bool(tt.get("speak_window_letter", False)),
         })
+        # 播放设备(2026-10-22): 页面上送就落盘, 留空回落 None(默认设备)。
+        # 漏合并的话页面上改了设备也存不进去 —— 保存"成功"但配置纹丝不动。
+        t["aplay_device"] = str(tt.get("aplay_device") or "").strip() or None
         if tt.get("piper_length_scale") is not None:
             try:
                 ls = float(tt["piper_length_scale"])
@@ -1258,6 +1261,37 @@ def piper_via_server(url, text, wav, timeout=60):
     return True
 
 
+def apply_tts_preview_overrides(cfg, ov):
+    """「测试播报」的试听参数合并（纯逻辑，独立成函数供单测）。
+
+    页面允许带上当前填写的试听参数（未保存也能先听）: 只覆盖 tts 里这几个
+    无副作用的字段, 其余仍以磁盘配置为准; 本函数不写盘, 试听完页面保存与否
+    都不受影响。试听参数非法就整体忽略, 退回磁盘配置。
+    """
+    try:
+        t = dict(cfg.get("tts") or {})
+        if ov.get("repeat") is not None:
+            t["repeat"] = max(1, min(5, int(ov["repeat"])))
+        if ov.get("rate") is not None:
+            t["rate"] = int(ov["rate"])
+        if ov.get("spell_number") is not None:
+            t["spell_number"] = bool(ov["spell_number"])
+        if ov.get("speak_window_letter") is not None:
+            t["speak_window_letter"] = bool(ov["speak_window_letter"])
+        if ov.get("piper_length_scale") is not None:
+            _ls = float(ov["piper_length_scale"])
+            if 0.5 <= _ls <= 3.0:
+                t["piper_length_scale"] = round(_ls, 2)
+        # 播放设备(2026-10-22): 页面送了该字段就以其为准(空串/None 回落默认设备)。
+        # 不带上的话试听永远走磁盘配置的设备, "换个设备试听"在页面上就是假的。
+        if "aplay_device" in ov:
+            t["aplay_device"] = str(ov.get("aplay_device") or "").strip() or None
+        cfg["tts"] = t
+    except (TypeError, ValueError):
+        pass  # 试听参数非法就忽略, 退回磁盘配置
+    return cfg
+
+
 def test_tts(cfg, number="GA200", window="08"):
     """按当前配置合成并播放（不等识别触发，直接验证声音链路）。
     引擎优先级与主程序一致: 常驻服务 > piper CLI > espeak-ng。
@@ -1578,26 +1612,9 @@ class Handler(BaseHTTPRequestHandler):
                 body = {}
             cfg = load_cfg()
             # 「测试播报」允许带上页面当前填写的试听参数（未保存也能先听）:
-            # 只覆盖 tts 里这几个无副作用的字段, 其余仍以磁盘配置为准;
-            # 本函数不写盘, 试听完页面保存与否都不受影响。
-            try:
-                ov = body.get("tts") or {}
-                t = dict(cfg.get("tts") or {})
-                if ov.get("repeat") is not None:
-                    t["repeat"] = max(1, min(5, int(ov["repeat"])))
-                if ov.get("rate") is not None:
-                    t["rate"] = int(ov["rate"])
-                if ov.get("spell_number") is not None:
-                    t["spell_number"] = bool(ov["spell_number"])
-                if ov.get("speak_window_letter") is not None:
-                    t["speak_window_letter"] = bool(ov["speak_window_letter"])
-                if ov.get("piper_length_scale") is not None:
-                    _ls = float(ov["piper_length_scale"])
-                    if 0.5 <= _ls <= 3.0:
-                        t["piper_length_scale"] = round(_ls, 2)
-                cfg["tts"] = t
-            except (TypeError, ValueError):
-                pass  # 试听参数非法就忽略, 退回磁盘配置
+            # 只覆盖无副作用字段、不写盘, 试听完页面保存与否都不受影响 —— 详见
+            # apply_tts_preview_overrides（独立成函数是为了能进单测）。
+            apply_tts_preview_overrides(cfg, body.get("tts") or {})
             ok, m, text = test_tts(cfg, body.get("number") or "GA200",
                                    body.get("window") or "08")
             self._json({"ok": ok, "msg": m, "text": text, "audio": audio_status()})

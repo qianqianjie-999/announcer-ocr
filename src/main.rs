@@ -247,6 +247,8 @@ struct Loop {
     last_save: f64,
     n_saved: u32,
     last_maint: f64,
+    /// 上次维护时所在的本地日期(YYYY-MM-DD)。跨日时重置闸门基线, 见 maintenance。
+    maint_day: String,
     /// 上次"成功入队播报"的时刻(启动时即置为当前, 避免刚起就误报) —— 健康心跳用。
     last_announce: f64,
     /// 上次打"健康告警"的时刻。用于把告警限流成"每阈值周期最多一条", 防止刷屏。
@@ -312,6 +314,34 @@ fn seed_last_numbers(log_file: &str) -> HashMap<String, u32> {
         }
     }
     out
+}
+
+/// 维护节拍用的"本地日"标识: Unix 秒 -> 本地日期(YYYY-MM-DD)。
+/// 取法与 dedupe.rs 的 DailyMidnight 一致(chrono::Local); 时区取不到返回 None,
+/// 调用方跳过本次跨日判断 —— 宁可晚重置, 不可误重置。
+fn local_day_of(now: f64) -> Option<String> {
+    use chrono::{Local, TimeZone};
+    Local
+        .timestamp_opt(now as i64, 0)
+        .single()
+        .map(|dt| dt.date_naive().format("%Y-%m-%d").to_string())
+}
+
+/// 跨日检测(纯逻辑, 供单测): 发现日期变了就更新 `last_day` 并返回 true。
+/// 取不到日期(None)不动状态; 首次观测(last_day 为空, 启动时取日失败)只记录
+/// 不当跨日 —— 免得把刚 seed 出来的基线误清。
+fn gate_day_rollover(last_day: &mut String, today: Option<String>) -> bool {
+    match today {
+        Some(d) if last_day.is_empty() => {
+            *last_day = d;
+            false
+        }
+        Some(d) if d != *last_day => {
+            *last_day = d;
+            true
+        }
+        _ => false,
+    }
 }
 
 impl Loop {
@@ -399,6 +429,7 @@ impl Loop {
             last_health_warn: now,
 
             last_num: seed_last_numbers(&cfg.log_file),
+            maint_day: local_day_of(now).unwrap_or_default(),
             max_jump: det.max_jump,
             gate_log_at: 0.0,
 
@@ -1068,14 +1099,21 @@ impl Loop {
     }
 
     /// 维护节拍: ① 清掉过期的"已播报"记录(旧实现从不清理 -> 跨天后同一号码永久哑掉);
-    /// ② 日志写满阈值就归档(旧实现只管写, 写满 SD 卡只能等部署层第二天来收)。
-    /// 清理/轮转都打日志: 旧实现的"静默软故障"正是因为它悄悄什么都不做 ——
+    /// ② 日志写满阈值就归档(旧实现只管写, 写满 SD 卡只能等部署层第二天来收);
+    /// ③ 跨日重置闸门基线 —— 去重表每日零点清零(dedupe.rs DailyMidnight), last_num
+    ///    却只在启动时 seed, 7×24 连跑时昨天的基线会把今天从头递增的低号码整段
+    ///    静默吞掉(gate 只放行 (基线, 基线+硬上限]), 与去重表当年如出一辙。
+    /// 清理/轮转/重置都打日志: 旧实现的"静默软故障"正是因为它悄悄什么都不做 ——
     /// 让隐式维护显形, 现场看一眼 journal 就知道治理在不在工作。
     fn maintenance(&mut self, now: f64) {
         if now - self.last_maint < self.maint_every {
             return;
         }
         self.last_maint = now;
+        if gate_day_rollover(&mut self.maint_day, local_day_of(now)) && !self.last_num.is_empty() {
+            println!("[闸门] 跨日重置号码基线 {:?} (去重表已按日清零, 基线跟随)", self.last_num);
+            self.last_num.clear();
+        }
         let n_ann = self.announced.prune(now);
         let n_raw = self.cand_raw.prune(now);
         if n_ann > 0 || n_raw > 0 {
@@ -1232,8 +1270,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        drop_shadow_empty, effective_ttl, jump_extra_confirm, number_votes, resolve_row_pitch,
-        settle_ready, SETTLE_MAX_WAIT_SECS,
+        drop_shadow_empty, effective_ttl, gate_day_rollover, jump_extra_confirm, number_votes,
+        resolve_row_pitch, settle_ready, SETTLE_MAX_WAIT_SECS,
     };
     use std::collections::{HashMap, HashSet};
 
@@ -1446,5 +1484,37 @@ mod tests {
         .collect();
         let out = drop_shadow_empty(s);
         assert_eq!(out.len(), 2, "没有带窗口版本时, 空窗口候选应原样保留");
+    }
+
+    // ———— 闸门跨日重置: 7×24 连跑时, 次日从头递增的低号码不能被昨天的高基线吞掉 ————
+
+    #[test]
+    fn day_rollover_fires_once_per_day_change() {
+        let mut day = String::from("2026-10-22");
+        // 同日反复维护: 不重置
+        assert!(!gate_day_rollover(&mut day, Some("2026-10-22".into())));
+        assert!(!gate_day_rollover(&mut day, Some("2026-10-22".into())));
+        // 跨到次日: 重置一次, 且只重置一次
+        assert!(gate_day_rollover(&mut day, Some("2026-10-23".into())));
+        assert!(!gate_day_rollover(&mut day, Some("2026-10-23".into())));
+        assert_eq!(day, "2026-10-23");
+    }
+
+    #[test]
+    fn day_rollover_ignores_missing_local_date() {
+        // 取不到本地日(时钟/时区异常): 不重置, 也不丢掉已知的"上次维护日"
+        let mut day = String::from("2026-10-22");
+        assert!(!gate_day_rollover(&mut day, None));
+        assert_eq!(day, "2026-10-22");
+    }
+
+    #[test]
+    fn day_rollover_first_observation_is_not_a_reset() {
+        // 启动时取日失败(maint_day 为空): 第一次读到日期只记录、不当跨日,
+        // 免得把刚 seed 出来的基线误清; 之后正常跨日仍要重置。
+        let mut day = String::new();
+        assert!(!gate_day_rollover(&mut day, Some("2026-10-23".into())));
+        assert_eq!(day, "2026-10-23");
+        assert!(gate_day_rollover(&mut day, Some("2026-10-24".into())));
     }
 }

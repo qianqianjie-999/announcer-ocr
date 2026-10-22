@@ -22,7 +22,7 @@ STATE=/var/lib/announce-rs
 SIL=/opt/announce-rs/silence.wav
 DEV=${AUDIO_DEV:-plughw:0,0}
 DRY=${AUDIO_DRY:-0}          # 演练模式: 只测不救, 不重启服务
-PCM=${AUDIO_PCM:-/proc/asound/card0/pcm0p/sub0/status}
+PCM=${AUDIO_PCM:-}          # 占用检测用的 status 文件; 缺省按 AUDIO_DEV 推导卡号(见 aplay_test), 不再写死 card0
 REBOOT_GAP=${AUDIO_REBOOT_GAP:-1800}   # 两次整机重启最小间隔
 REBOOT_MAX=${AUDIO_REBOOT_MAX:-3}      # 连续整机重启上限(超了只告警)
 mkdir -p "$STATE"
@@ -47,7 +47,9 @@ fi
 
 aplay_test() {
     # 设备被播报占用时不要抢: 直接视为"健康"(有占用说明链路在用)
-    if [ -r "$PCM" ] && ! grep -q closed "$PCM" 2>/dev/null; then
+    # 占用状态文件跟随 AUDIO_DEV 推导的卡号(写死 card0 时, 换 USB 声卡后读错卡)
+    local pcm="${PCM:-/proc/asound/card$(audio_card_num)/pcm0p/sub0/status}"
+    if [ -r "$pcm" ] && ! grep -q closed "$pcm" 2>/dev/null; then
         say "SKIP(设备占用中, 视为在用)"
         return 0
     fi
@@ -55,10 +57,11 @@ aplay_test() {
 }
 
 reset_mixer() {
+    local card=$(audio_card_num)
     alsactl restore -f /var/lib/alsa/asound.state 2>>"$LOG" || true
-    amixer -c 0 sset 'Auto-Mute Mode' Disabled >/dev/null 2>&1 || true
-    amixer -c 0 sset Master 100% unmute    >/dev/null 2>&1 || true
-    amixer -c 0 sset Headphone unmute      >/dev/null 2>&1 || true
+    amixer -c "$card" sset 'Auto-Mute Mode' Disabled >/dev/null 2>&1 || true
+    amixer -c "$card" sset Master 100% unmute    >/dev/null 2>&1 || true
+    amixer -c "$card" sset Headphone unmute      >/dev/null 2>&1 || true
 }
 
 # ---- USB 声卡支持: 定位 / 热复位 / autosuspend 体检 ----
@@ -105,9 +108,11 @@ usb_reset() {
     p=$(usb_syspath "$card") || { say "USB-RESET 跳过: card$card 不是 USB 设备(板载 HDA)"; return 1; }
     bus=$(basename $(dirname $p))/$(basename $p)   # 形如 usb1/1-2
     say "USB-RESET 复位 $bus (card$card)"
-    echo -n "$(basename $p)" > /sys/bus/usb/drivers/usb/unbind 2>>"$LOG"
+    echo -n "$(basename $p)" > /sys/bus/usb/drivers/usb/unbind 2>>"$LOG" \
+        || { say "ERROR unbind 失败(权限/设备已消失), 升级下一级恢复"; return 1; }
     sleep 2
-    echo -n "$(basename $p)" > /sys/bus/usb/drivers/usb/bind 2>>"$LOG"
+    echo -n "$(basename $p)" > /sys/bus/usb/drivers/usb/bind 2>>"$LOG" \
+        || { say "ERROR bind 失败(复位不完整), 升级下一级恢复"; return 1; }
     sleep 3
     # 重新枚举后卡号可能漂移 -> 若原 DEV 不可用且存在新卡, 记一条提示由人工改 AUDIO_DEV
     aplay -l 2>/dev/null | grep -q '^card' || say "CRITICAL 复位后 aplay -l 无设备, 检查 USB 连接"
@@ -173,8 +178,12 @@ recover() {
     echo "$now" > "$STATE/audio_last_reboot"
     echo $(( rb + 1 )) > "$STATE/audio_reboot_total"
     say "ESCALATE 连续 $n 轮无声 -> 60 秒后整机重启 (第 $(( rb + 1 ))/$REBOOT_MAX 次, 等同插拔 3.5mm 且更彻底)"
-    systemd-run --on-active=60 --unit=audio-reboot /sbin/reboot >/dev/null 2>&1 \
-        || ( sleep 60 && /sbin/reboot ) >/dev/null 2>&1 &
+    if systemd-run --on-active=60 --unit=audio-reboot /sbin/reboot >/dev/null 2>&1; then
+        return 1
+    fi
+    # systemd-run 排程失败(罕见)就放弃自动重启, 绝不退回 (sleep 60 && reboot) & 裸子 shell:
+    # 那种重启 healthy() 取消不了 —— "不可取消的重启"比"暂不重启"更危险, 打 ERROR 留给人工。
+    say "ERROR systemd-run 排程整机重启失败, 已放弃本轮自动重启(可取消的方案才安全), 请人工介入"
     return 1
 }
 
