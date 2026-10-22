@@ -27,6 +27,7 @@ fn trate() -> i32 { 135 }
 fn ttemplate() -> String { "请{number}到{window}号窗口办理".into() }
 fn tgap() -> f64 { 0.35 }
 fn dhealth() -> f64 { 60.0 }
+fn dstale() -> f64 { 60.0 }
 fn logmb() -> f64 { 8.0 }
 fn logkeep() -> u32 { 6 }
 fn logarch() -> String { "logs_archive".into() }
@@ -159,6 +160,12 @@ pub struct Config {
     #[serde(default = "logarch")] pub log_archive_dir: String,
     #[serde(default = "cw")] pub capture_width: u32,
     #[serde(default = "chh")] pub capture_height: u32,
+    /// 无帧看门狗阈值(秒): 连续这么久没读到新帧就 kill 掉 ffmpeg 触发重拉。
+    /// 针对的是 **RTSP 半开** —— TCP 未断、ffmpeg 进程健在、但不再吐帧, 此时
+    /// `read_exact` 会永远阻塞(既不 Ok 也不 Err), 现有的"管道断开才重拉"逻辑
+    /// 永远等不到触发条件: 现象就是进程活着、日志无错、但一声不播。
+    /// 60 = 默认(摄像头 15fps 时正常帧间隔约 0.07s, 留足余量); **0 = 关闭**。
+    #[serde(default = "dstale")] pub frame_stale_sec: f64,
     #[serde(default)] pub detect: Detect,
     #[serde(default)] pub ocr: OcrCfg,
     #[serde(default)] pub tts: Tts,

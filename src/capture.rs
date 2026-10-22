@@ -35,15 +35,30 @@ impl Source {
             Source::Pipe(g) => g.latest(),
         }
     }
+
+    /// 距最近一帧过了多少秒; simulate 模式恒为 None(每次 read 都现读文件)。
+    /// 用途: [监测] 行打印 —— 帧龄异常增长就是"流僵死但进程还在"的直接证据。
+    pub fn frame_age_sec(&self) -> Option<f64> {
+        match self {
+            Source::Simulate { .. } => None,
+            Source::Pipe(g) => Some(g.frame_age_sec()),
+        }
+    }
 }
 
 pub struct PipeGrabber {
     latest: Arc<Mutex<Option<Arc<Frame>>>>,
     stop: Arc<std::sync::atomic::AtomicBool>,
     child: Arc<Mutex<Option<Child>>>,
+    /// 最近一次成功读到整帧的时刻(UNIX 毫秒)。看门狗据此判定"还在出帧吗"。
+    /// 取 SystemTime 而非 Instant: Instant 塞不进 AtomicU64, 而这里只需粗粒度(秒级)
+    /// 比较; 校时回拨最坏是少杀一次, 前跳最坏是多重拉一次, 都无害。
+    last_frame_ms: Arc<std::sync::atomic::AtomicU64>,
     /// 抓帧线程句柄。Drop 需要**等它收完尸**再返回 —— 见 Drop 里的注释:
     /// 只把 stop 置位就返回, 主进程可能先退出, 那条线程手上的 ffmpeg 就变孤儿了。
     handle: Option<thread::JoinHandle<()>>,
+    /// 无帧看门狗线程句柄(仅 stale_secs > 0 时存在)。同样要等它退出。
+    wd_handle: Option<thread::JoinHandle<()>>,
 }
 
 impl PipeGrabber {
@@ -55,7 +70,21 @@ impl PipeGrabber {
     ///   主循环从此只刷 "[错误] 取帧失败" 直到人工重启服务。
     ///   现改为: 管道断开/子进程退出 => kill+wait 收尸(否则变 defunct 僵尸) =>
     ///   3s 后重新拉起 ffmpeg, 直到 stop(Drop) 为止。无人值守现场的自愈能力。
-    pub fn start(mut args: Vec<String>, w: usize, h: usize) -> std::io::Result<PipeGrabber> {
+    ///
+    /// ★★`stale_secs`: 无帧看门狗阈值(秒), 0 = 关闭(默认 60)。
+    ///   为什么必须加这层(2026-10-22 补全最后一块拼图): 上面的自动重启只在
+    ///   `read_exact` **返回 Err** 时才触发。而 RTSP 半开 —— TCP 没断、ffmpeg 进程在
+    ///   ps 里好端端活着、CPU 也在跑, 就是不再吐帧 —— 时, `read_exact` 会永远阻塞,
+    ///   既不 Ok 也不 Err, 于是永远不重拉: 主循环一直拿最后一帧(或坏帧), 帧差恒为 0,
+    ///   **静默不播**, 而 systemctl / journal / ps 全显示"正常"。这是"机器正常却不播报"
+    ///   的唯一硬风险。看门狗的做法是直接 kill 掉 ffmpeg: 管道写端随之关闭,
+    ///   `read_exact` 立刻返回 UnexpectedEof, 剩下的交给上面那套既有重拉逻辑。
+    pub fn start(
+        mut args: Vec<String>,
+        w: usize,
+        h: usize,
+        stale_secs: f64,
+    ) -> std::io::Result<PipeGrabber> {
         args.push("-f".into());
         args.push("rawvideo".into());
         args.push("-pix_fmt".into());
@@ -67,11 +96,14 @@ impl PipeGrabber {
         let latest = Arc::new(Mutex::new(None::<Arc<Frame>>));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let child_slot: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(Some(first)));
+        // 起跑就打上时间戳: 首帧迟迟不来(流根本没建立)同样算"无帧", 交给看门狗重拉。
+        let last_frame_ms = Arc::new(std::sync::atomic::AtomicU64::new(now_ms()));
 
         let handle = {
             let latest = latest.clone();
             let stop = stop.clone();
             let child_slot = child_slot.clone();
+            let last_frame_ms = last_frame_ms.clone();
             thread::spawn(move || {
                 use std::sync::atomic::Ordering::Relaxed;
                 loop {
@@ -137,6 +169,7 @@ impl PipeGrabber {
                                 to_rgb(&mut rgb);
                                 let f = Arc::new(Frame { w, h, rgb });
                                 *util::lock(&latest) = Some(f.clone());
+                                last_frame_ms.store(now_ms(), Relaxed);
                                 n_frames += 1;
                                 // 日志降噪: 原 60 帧一条会一天刷 4 万行(约7MB), 挤掉
                                 // 有用日志还耗 SD 写寿命。改为每 10 分钟一条。
@@ -175,12 +208,88 @@ impl PipeGrabber {
                 }
             })
         };
-        Ok(PipeGrabber { latest, stop, child: child_slot, handle: Some(handle) })
+        // 无帧看门狗: 唯一能救"RTSP 半开"的一层。它不重试、不接管重拉 ——
+        // 只负责在超时后 kill 掉 ffmpeg, 让阻塞中的 read_exact 收到 EOF,
+        // 交给上面那条线程既有的"3s 后重新拉起"路径处理, 逻辑不重复。
+        let wd_handle = if stale_secs > 0.0 {
+            let stop = stop.clone();
+            let child_slot = child_slot.clone();
+            let last_frame_ms = last_frame_ms.clone();
+            Some(thread::spawn(move || {
+                use std::sync::atomic::Ordering::Relaxed;
+                // 每 0.5s 醒一次: 既能及时响应 stop, 也够粗(一次比较, 开销可忽略)。
+                loop {
+                    for _ in 0..10 {
+                        if stop.load(Relaxed) {
+                            return;
+                        }
+                        thread::sleep(Duration::from_millis(500));
+                    }
+                    if stop.load(Relaxed) {
+                        return;
+                    }
+                    let now = now_ms();
+                    let age = match stale_age_sec(last_frame_ms.load(Relaxed), now, stale_secs) {
+                        Some(a) => a,
+                        None => continue,
+                    };
+                    println!(
+                        "[抓帧] 警告: 已 {:.0}s 没有新帧(疑似 RTSP 半开/流僵死), kill ffmpeg 触发重拉",
+                        age
+                    );
+                    // kill + wait: 管道写端关闭 => 抓帧线程的 read_exact 返回 UnexpectedEof。
+                    if let Some(mut c) = util::lock(&child_slot).take() {
+                        let _ = c.kill();
+                        let _ = c.wait();
+                    }
+                    // 重置时间戳: 重拉也需要时间, 别在下一帧到来前每 5s 刷一条警告。
+                    last_frame_ms.store(now, Relaxed);
+                }
+            }))
+        } else {
+            println!("[抓帧] 无帧看门狗已关闭(frame_stale_sec=0)");
+            None
+        };
+
+        Ok(PipeGrabber {
+            latest,
+            stop,
+            child: child_slot,
+            last_frame_ms,
+            handle: Some(handle),
+            wd_handle,
+        })
     }
 
     pub fn latest(&self) -> Option<Arc<Frame>> {
         util::lock(&self.latest).clone()
     }
+
+    /// 距最近一帧过了多少秒。主循环/诊断用它判断"画面是活的还是冻住的"。
+    pub fn frame_age_sec(&self) -> f64 {
+        use std::sync::atomic::Ordering::Relaxed;
+        now_ms().saturating_sub(self.last_frame_ms.load(Relaxed)) as f64 / 1000.0
+    }
+}
+
+/// 当前时刻(UNIX 毫秒)。看门狗与抓帧线程共用同一时基。
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 无帧看门狗的判定核心(纯函数, 便于单测): 返回 Some(帧龄秒) 表示该 kill 重拉了。
+/// - `stale_secs <= 0` => 恒 None(功能关闭);
+/// - 帧龄 < 阈值 => None;
+/// - **时钟回拨/异常时 saturating 到 0** => None, 宁可漏杀也不误杀(重拉有 3s 空窗)。
+fn stale_age_sec(last_ms: u64, now_ms: u64, stale_secs: f64) -> Option<f64> {
+    if stale_secs <= 0.0 {
+        return None;
+    }
+    let age = now_ms.saturating_sub(last_ms) as f64 / 1000.0;
+    (age >= stale_secs).then_some(age)
 }
 
 fn spawn_ffmpeg(args: &[String]) -> std::io::Result<Child> {
@@ -216,7 +325,8 @@ impl Drop for PipeGrabber {
         use std::sync::atomic::Ordering::Relaxed;
         self.stop.store(true, Relaxed);
         self.reap_child();
-        if let Some(h) = self.handle.take() {
+        // 两条线程都等: 看门狗最多再睡 0.5s 就退出, 与抓帧线程共用同一个 2s 预算。
+        for h in [self.handle.take(), self.wd_handle.take()].into_iter().flatten() {
             let deadline = std::time::Instant::now() + Duration::from_secs(2);
             while !h.is_finished() && std::time::Instant::now() < deadline {
                 self.reap_child(); // 线程可能刚把子进程放回槽里, 补刀
@@ -435,7 +545,7 @@ pub fn open(kind: &crate::cfg::SourceKind, cfg: &crate::cfg::Config) -> Result<S
                 "-vf".into(), format!("scale={}:{}", w, h),
             ]);
             extend_hwaccel(&mut args);
-            let g = PipeGrabber::start(args, w, h)
+            let g = PipeGrabber::start(args, w, h, cfg.frame_stale_sec)
                 .map_err(|e| format!("ffmpeg 启动失败(需安装 ffmpeg): {}", e))?;
             report_ready("网络流", wait_first_frame(&g, FIRST_FRAME_TIMEOUT));
             Ok(Source::Pipe(g))
@@ -451,7 +561,7 @@ pub fn open(kind: &crate::cfg::SourceKind, cfg: &crate::cfg::Config) -> Result<S
                 "-vf".into(), format!("scale={}:{}", w, h),
             ];
             extend_hwaccel(&mut args);
-            let g = PipeGrabber::start(args, w, h)
+            let g = PipeGrabber::start(args, w, h, cfg.frame_stale_sec)
                 .map_err(|e| format!("ffmpeg 启动失败(设备 {}): {}", dev, e))?;
             report_ready(&format!("设备 {}", dev), wait_first_frame(&g, FIRST_FRAME_TIMEOUT));
             Ok(Source::Pipe(g))
@@ -465,7 +575,7 @@ fn extend_hwaccel(_args: &mut Vec<String>) {}
 
 #[cfg(test)]
 mod tests {
-    use super::{crop_rgb, downscale, poll_until, Frame};
+    use super::{crop_rgb, downscale, poll_until, stale_age_sec, Frame};
     use std::time::Duration;
 
     /// 构造 w×h 的帧, 每个像素填 (x, y, 常量) —— 便于断言"裁对了位置"。
@@ -554,5 +664,48 @@ mod tests {
         assert!(!poll_until(Duration::from_millis(150), || false));
         assert!(t0.elapsed() >= Duration::from_millis(150), "应至少等满超时时长");
         assert!(t0.elapsed() < Duration::from_secs(3), "不应明显超过超时时长");
+    }
+
+    // ———— 无帧看门狗 stale_age_sec: RTSP 半开是"进程活着却不播"的唯一硬风险 ————
+
+    /// 正常出帧(15fps 约 0.07s 一帧)绝不触发重拉, 否则就是每 60s 白白断一次流。
+    #[test]
+    fn stale_not_triggered_on_healthy_stream() {
+        let now = 1_700_000_000_000;
+        assert_eq!(stale_age_sec(now - 70, now, 60.0), None, "0.07s 前的帧算新鲜");
+        assert_eq!(stale_age_sec(now - 1_000, now, 60.0), None, "1s 前的帧算新鲜");
+        assert_eq!(
+            stale_age_sec(now - 59_000, now, 60.0),
+            None,
+            "差一点就到阈值也不该触发"
+        );
+    }
+
+    /// 现场场景: 半开后 120s 无帧 —— 必须触发, 且带回帧龄便于日志定位。
+    #[test]
+    fn stale_triggers_when_stream_frozen() {
+        let now = 1_700_000_000_000;
+        let age = stale_age_sec(now - 120_000, now, 60.0);
+        assert!(age.is_some(), "僵死 120s 必须触发重拉");
+        assert!((age.unwrap() - 120.0).abs() < 0.5, "返回的帧龄应约为 120s");
+    }
+
+    /// 阈值 0 = 功能关闭(向后兼容老配置, 且给现场留手動关掉的口子)。
+    #[test]
+    fn stale_disabled_when_zero() {
+        let now = 1_700_000_000_000;
+        assert_eq!(stale_age_sec(now - 999_999, now, 0.0), None);
+        assert_eq!(stale_age_sec(now - 999_999, now, -1.0), None);
+    }
+
+    /// 时钟回拨(校时/ntp 跳变)时 saturating 到 0, 宁可漏杀也不能误杀。
+    #[test]
+    fn stale_survives_clock_going_backwards() {
+        let now = 1_700_000_000_000;
+        assert_eq!(
+            stale_age_sec(now + 500_000, now, 60.0),
+            None,
+            "now 早于 last 时帧龄按 0 算, 不触发"
+        );
     }
 }

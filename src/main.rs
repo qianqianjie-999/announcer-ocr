@@ -550,9 +550,15 @@ impl Loop {
         } else {
             " OCR=0次".to_string()
         };
+        // 帧龄只在偏大时才打: 正常几秒内一直刷没意义, 但超过 5s 就是"流僵死"的先兆
+        // (画面静止时帧差恒为 0, 光看帧差分不出"没人叫号"和"流死了", 帧龄能)。
+        let age_info = match self.src.frame_age_sec() {
+            Some(a) if a > 5.0 => format!(" 帧龄={:.0}s", a),
+            _ => String::new(),
+        };
         println!(
-            "[监测] 近{:.0}s 最大帧差={:.4} 阈值={:.4} 帧数={} {}{}",
-            span, self.diag_max, self.det.changed_ratio, self.diag_frames, tag, ocr_info
+            "[监测] 近{:.0}s 最大帧差={:.4} 阈值={:.4} 帧数={} {}{}{}",
+            span, self.diag_max, self.det.changed_ratio, self.diag_frames, tag, ocr_info, age_info
         );
         self.diag_last = now;
         self.diag_max = 0.0;
