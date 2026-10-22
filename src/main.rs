@@ -91,6 +91,21 @@ fn effective_ttl(ttl: f64, iter_secs: f64, fb_prev: f64, fb_next: f64) -> f64 {
     ttl.max(3.0 * iter_secs).max(1.5 * fb_prev).max(1.5 * fb_next)
 }
 
+/// 行距(像素)的解析: 绝对像素优先, 其次按"相对行高"折算, 都没有则 0(退化为单行)。
+///
+/// 抽成自由函数便于单测。换码流/换分辨率时 `row_pitch` 的绝对像素必须重新标定
+/// (2026-10-22 现场就是没标定, 第 2/3 行切到空隙); 用 `row_pitch_ratio` 表达
+/// "行距 = 行高 × 比值"可以让它自动跟随分辨率, 免掉每次换算。
+fn resolve_row_pitch(row_pitch: u32, ratio: f64, roi_h: usize) -> usize {
+    if row_pitch > 0 {
+        return row_pitch as usize;
+    }
+    if ratio > 0.0 && roi_h > 0 {
+        return (roi_h as f64 * ratio).round().max(1.0) as usize;
+    }
+    0
+}
+
 /// 绑定本机回环端口作为单实例锁。端口被占 -> 已有实例在跑。
 /// 与 Python 版一致: 不设 SO_REUSEADDR(std 默认就不设), 进程死操作系统自动释放。
 fn acquire_lock(port: u16) -> Result<TcpListener, String> {
@@ -315,9 +330,21 @@ impl Loop {
 
         let det = cfg.detect.clone();
         let fb_sec = det.fallback_ocr_sec;
-        // 多行列表: row_pitch 是相邻两行文字框的纵向间距(像素), 0 表示不分行。
+        // 多行列表: 行距既可用绝对像素(row_pitch), 也可用相对行高(row_pitch_ratio)。
         // 行距为 0 时强制退化为单行, 免得"rows=3 但步长 0"把同一行读三遍。
-        let pitch = det.row_pitch as usize;
+        let pitch = resolve_row_pitch(det.row_pitch, det.row_pitch_ratio, roi.3);
+        if det.row_pitch > 0 && roi.3 > 0 {
+            // ★标定护栏: 换码流后最容易踩的坑就是沿用旧分辨率下行距的"按比例换算值"。
+            //   真实行距几乎等于行高(实测 69 vs 70), 超过 1.6 倍几乎一定是没重新标定。
+            let ratio = det.row_pitch as f64 / roi.3 as f64;
+            if ratio > 1.6 {
+                println!(
+                    "[警告] row_pitch={} 是行高 {} 的 {:.1} 倍, 疑似未按当前分辨率重新标定\
+                     (真实行距通常≈行高, 建议改用 row_pitch_ratio=1.0)",
+                    det.row_pitch, roi.3, ratio
+                );
+            }
+        }
         let rows = if pitch == 0 { 1 } else { det.rows.max(1) as usize };
         // 检测框向下扩到覆盖 rows 行; 识别仍按 pitch 逐行裁。
         let det_roi = (roi.0, roi.1, roi.2, roi.3 + (rows - 1) * pitch);
@@ -1199,8 +1226,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        drop_shadow_empty, effective_ttl, jump_extra_confirm, number_votes, settle_ready,
-        SETTLE_MAX_WAIT_SECS,
+        drop_shadow_empty, effective_ttl, jump_extra_confirm, number_votes, resolve_row_pitch,
+        settle_ready, SETTLE_MAX_WAIT_SECS,
     };
     use std::collections::{HashMap, HashSet};
 
@@ -1249,6 +1276,35 @@ mod tests {
     fn ttl_normal_case_stays_tight() {
         // 正常情况下不该被过度放大: 帧间隔 3s、OCR 0.5s -> 取 1.5×3=4.5
         assert_eq!(effective_ttl(4.0, 0.5, 3.0, 3.0), 4.5);
+    }
+
+    // ———— 行距解析: 绝对像素 vs 相对行高(2026-10-22 换主码流标定事故) ————
+
+    #[test]
+    fn pitch_absolute_wins() {
+        // 给了绝对像素就以它为准(兼容现有部署)
+        assert_eq!(resolve_row_pitch(70, 1.0, 69), 70);
+    }
+
+    #[test]
+    fn pitch_ratio_follows_resolution() {
+        // 相对行高 1.0: 主码流行高 69 -> 69; 换回辅码流行高 37 -> 37, 自动跟随
+        assert_eq!(resolve_row_pitch(0, 1.0, 69), 69);
+        assert_eq!(resolve_row_pitch(0, 1.0, 37), 37);
+        // 略大于 1: 行间有空隙的屏
+        assert_eq!(resolve_row_pitch(0, 1.05, 69), 72);
+    }
+
+    #[test]
+    fn pitch_zero_degrades_to_single_row() {
+        // 两者都没给 -> 0 = 不分行(保持旧语义, 不能静默变成多行)
+        assert_eq!(resolve_row_pitch(0, 0.0, 69), 0);
+    }
+
+    #[test]
+    fn pitch_ratio_never_zero_when_asked() {
+        // 行高极小也不该算出 0(0 会被当成"不分行")
+        assert_eq!(resolve_row_pitch(0, 1.0, 1), 1);
     }
 
     // ———— 稳帧判定 settle_ready: 现场调优新增逻辑的回归(此前零覆盖) ————
