@@ -35,6 +35,10 @@ RESTART_CMD = ["sudo", "-n", "/usr/bin/systemctl", "restart", "announce-rs"]
 # 保存配置后优先走它（未启用调度时它会退化为 restart，等价旧行为）。
 SCHED_CMD = ["sudo", "-n", "/usr/local/sbin/announce-schedule-apply"]
 NET_SCRIPT = "/usr/local/sbin/announce-net-apply.sh"
+# 手工校时: 配置台以 debian13 跑, 改系统时间要 root。现场无 sudo, 用 su 就得在
+# 这里明文存 root 密码(不可接受) —— 改为"请求文件", 由 root 的 announce-time.timer
+# 每 5 秒取走执行, 结果写回 result 供页面显示。见 announce-time-apply.sh。
+TIME_DIR = "/var/lib/announce-rs/time"
 
 NET_DEFAULT_IP = "192.168.31.1"  # 出厂默认(直连调试场景; 有路由器的现场勿用, 多为网关地址)
 
@@ -385,6 +389,25 @@ def validate_and_build(body):
         except (TypeError, ValueError):
             sv = float(cur_det.get("settle_sec") or 0.5)
         d["settle_sec"] = min(3.0, max(0.1, sv))
+        # 号码闸门(2026-10-21): 新号相对上次播报号的最大跳幅。
+        # 现场编号严格 +1 递增, 2 足以吸收"漏叫一个号"; 填 0 关闭闸门。
+        try:
+            mj = int(det.get("max_jump"))
+        except (TypeError, ValueError):
+            mj = int(cur_det.get("max_jump") or 2)
+        d["max_jump"] = min(20, max(0, mj))
+        # 多行列表(2026-10-21): rows=识别行数, row_pitch=相邻行纵向间距(像素)。
+        # 只改行数不改行距没有意义(会把同一行读 N 遍), 所以行距为 0 时行数强制回 1。
+        try:
+            rw_n = int(det.get("rows"))
+        except (TypeError, ValueError):
+            rw_n = int(cur_det.get("rows") or 1)
+        try:
+            rw_p = int(det.get("row_pitch"))
+        except (TypeError, ValueError):
+            rw_p = int(cur_det.get("row_pitch") or 0)
+        d["row_pitch"] = min(400, max(0, rw_p))
+        d["rows"] = 1 if d["row_pitch"] == 0 else min(5, max(1, rw_n))
         d.setdefault("min_interval_sec", 0.5)
         if not (0 < d["changed_ratio"] < 1):
             return None, "changed_ratio 必须在 (0,1)"
@@ -489,6 +512,17 @@ table.log td,table.log th{border:1px solid #e2e2e2;padding:2px 6px}
 </style></head><body>
 <h1>叫号播报 · 配置台 <span id=st class=small></span></h1>
 
+<fieldset><legend>服务器时间</legend>
+<div class=row>服务器时间 <b id=srvtime style="font-size:17px;font-variant-numeric:tabular-nums">--</b>
+ <span class=small id=srvinfo></span>
+ <button class="gray" type=button onclick=loadTime() style="margin-left:6px;padding:2px 10px;font-size:12px">↻</button></div>
+<div class=row>手工校时 <input id=setdt type=text placeholder="2026-10-22 12:30:00" style="width:175px">
+ <button type=button onclick=setTime()>写入</button>
+ <button class=gray type=button onclick=useBrowserTime()>用本机时间校准</button>
+ <span class=small id=timeres></span></div>
+<div class=small>本机无外网，不会自动对时。时间偏差会影响播报日志时间与"每日零点清去重表"，建议在无人办事时段校时（改完立即写 RTC，重启不回退）。</div>
+</fieldset>
+
 <fieldset><legend>摄像头</legend>
 <div class=row>源类型:
 <select id=src_type onchange="srcUI()">
@@ -535,6 +569,9 @@ fps <input id=fps type=number value=3 step=0.5>
 <label>观察期 active_sec <input id=d_act type=number step=0.5 min=0.5></label>
 <label>兜底OCR间隔 fallback_ocr_sec <input id=d_fb type=number step=0.5 min=0.5></label>
 <label>稳帧再认 settle_sec <input id=d_settle type=number step=0.1 min=0.1></label>
+<label>跳号上限 max_jump <input id=d_jump type=number step=1 min=0 max=20>（0=关闭；2 表示只放行 +1/+2）</label>
+<label>列表行数 rows <input id=d_rows type=number step=1 min=1 max=5>（1=只认框内这一行）</label>
+<label>行距 row_pitch <input id=d_pitch type=number step=1 min=0 max=400>（像素，相邻两行间距；0=不分行）</label>
 </fieldset>
 
 <fieldset><legend>播报</legend>
@@ -542,6 +579,8 @@ fps <input id=fps type=number value=3 step=0.5>
 <label>次数 repeat <input id=t_rep type=number min=1 max=5></label>
 <label>语速（piper，1.0=常速，越大越慢）<input id=t_len type=number step=0.05 min=0.6 max=2.0></label>
 <label>espeak 语速 rate <input id=t_rate type=number min=80 max=250>（仅 espeak 引擎生效）</label>
+<label>播放设备 ALSA <input id=t_dev type=text placeholder="留空=系统默认" style="width:150px">
+<span class=small>（换 USB 声卡时填 <code>plughw:CARD=Device,DEV=0</code> 或 <code>plughw:1,0</code>）</span></label>
 <label><input id=t_spell type=checkbox> 号码逐字念（GA204→G A 二零四）</label>
 <label><input id=t_wl type=checkbox> 念窗口字母（C04→西 零 四；<b>默认不勾=不念字母</b>，只念"零 四"）</label>
 <div class=row><button class=gray type=button onclick=testTts()>🔊 测试播报</button>
@@ -607,6 +646,40 @@ DNS <input id=n_dns type=text size=24>（可留空）</div>
 
 <script>
 const $=id=>document.getElementById(id);
+
+// ---- 服务器时间面板 ----
+// 显示用"服务器 epoch + 本地单调时钟"推算(不每秒打请求); 时区偏移用服务器给的,
+// 这样即使浏览器时区不是 +8 也不会显示错。
+let srvEp=0,srvAt=0,srvOff=28800,pendingId='';
+function fmtT(ep,off){const d=new Date((ep+off)*1000),p=n=>String(n).padStart(2,'0');
+ return d.getUTCFullYear()+'-'+p(d.getUTCMonth()+1)+'-'+p(d.getUTCDate())+' '
+  +p(d.getUTCHours())+':'+p(d.getUTCMinutes())+':'+p(d.getUTCSeconds());}
+function tickSrv(){if(!srvEp)return;
+ $('srvtime').textContent=fmtT(srvEp+(performance.now()-srvAt)/1000,srvOff);}
+setInterval(tickSrv,500);
+function loadTime(){fetch('/api/time').then(r=>r.json()).then(d=>{
+ srvEp=d.epoch;srvAt=performance.now();srvOff=d.offset||0;tickSrv();
+ let s='时区 '+(d.tz||'?')+' · '+(d.synced?'NTP 已同步':(d.ntp?'NTP 开启未同步':'NTP 未启用'));
+ if(d.uptime)s+=' · 已运行 '+d.uptime;
+ if(d.rtc_drift!=null&&Math.abs(d.rtc_drift)>2)s+=' · RTC 偏差 '+d.rtc_drift+'s';
+ $('srvinfo').textContent=s;
+ if(d.last)$('timeres').textContent=d.last.replace(/\s(\d{10,}-\d+)\|/,' ');
+ if(pendingId&&d.last&&d.last.indexOf(pendingId)>=0)pendingId='';
+}).catch(()=>{});}
+function setTime(){
+ const v=($('setdt').value||'').trim();
+ if(!/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(v)){$('timeres').textContent='格式要 2026-10-22 12:30:00';return;}
+ $('timeres').textContent='提交中…';
+ fetch('/api/time',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({datetime:v})})
+  .then(r=>r.json()).then(d=>{
+   if(!d.ok){$('timeres').textContent=d.msg||'失败';return;}
+   pendingId=d.id||'';$('timeres').textContent='已提交，等待生效…';
+   let n=0;const t=setInterval(()=>{n++;loadTime();
+    if(!pendingId||n>10){clearInterval(t);
+     if(pendingId){$('timeres').textContent='未见结果，请点 ↻ 刷新';pendingId='';}}},1000);
+  }).catch(()=>{$('timeres').textContent='请求失败';});
+}
+function useBrowserTime(){$('setdt').value=fmtT(Date.now()/1000,srvOff);setTime();}
 const pv=$('pv'),ctx=pv.getContext('2d');
 let img=null,dragging=false,ds=null;
 
@@ -649,10 +722,14 @@ function fillForm(c){
  $('d_stable').value=c.detect.stable_frames;$('d_ttl').value=c.detect.confirm_ttl_sec;
  $('d_act').value=c.detect.active_sec;$('d_fb').value=c.detect.fallback_ocr_sec;
  $('d_settle').value=(c.detect.settle_sec!=null?c.detect.settle_sec:0.5);
+ $('d_jump').value=(c.detect.max_jump!=null?c.detect.max_jump:2);
+ $('d_rows').value=(c.detect.rows!=null?c.detect.rows:1);
+ $('d_pitch').value=(c.detect.row_pitch!=null?c.detect.row_pitch:0);
  $('t_en').checked=c.tts.enabled;$('t_rep').value=c.tts.repeat;$('t_rate').value=c.tts.rate;
  $('t_len').value=(c.tts.piper_length_scale!=null?c.tts.piper_length_scale:1.25);
  $('t_wl').checked=c.tts.speak_window_letter||false;
  $('t_spell').checked=c.tts.spell_number||false;
+ $('t_dev').value=c.tts.aplay_device||'';
  const sc=c.schedule||{};
  $('s_en').checked=!!sc.enabled;
  $('s_start').value=sc.work_start||'08:00';
@@ -685,10 +762,12 @@ function collect(){
   detect:{diff_threshold:+$('d_diff').value,changed_ratio:+$('d_ratio').value,
    stable_frames:+$('d_stable').value,confirm_ttl_sec:+$('d_ttl').value,
    active_sec:+$('d_act').value,fallback_ocr_sec:+$('d_fb').value,
-   settle_sec:+$('d_settle').value},
+   settle_sec:+$('d_settle').value,max_jump:+$('d_jump').value,
+   rows:+$('d_rows').value,row_pitch:+$('d_pitch').value},
   tts:{enabled:$('t_en').checked,repeat:+$('t_rep').value,rate:+$('t_rate').value,
    piper_length_scale:+$('t_len').value,speak_window_letter:$('t_wl').checked,
-   spell_number:$('t_spell').checked},
+   spell_number:$('t_spell').checked,
+   aplay_device:$('t_dev').value.trim()||null},
   ocr:{lang:$('o_lang').value,psm:+$('o_psm').value},
   schedule:{enabled:$('s_en').checked,work_start:$('s_start').value,work_end:$('s_end').value}};
 }
@@ -886,6 +965,8 @@ function testTts(){
  const len=parseFloat($('t_len').value);    if(len>=0.5&&len<=3.0) tts.piper_length_scale=len;
  tts.speak_window_letter=!!$('t_wl').checked;
  tts.spell_number=!!$('t_spell').checked;
+ // 试听也走页面填的播放设备: 换 USB 声卡后要先在这里听出声再保存
+ tts.aplay_device=$('t_dev').value.trim()||null;
  msg('正在合成并播放测试播报…（约 2~15 秒）');
  fetch('/api/test_tts',{method:'POST',headers:{'Content-Type':'application/json'},
   body:JSON.stringify({tts:tts})})
@@ -903,13 +984,17 @@ function showAudio(a){
  if(!a)return;
  const f=k=>{const v=a[k];if(!v)return '';return k+' '+v.pct+'%'+(v.muted?'(静音!)':'');};
  const s=[f('Master'),f('PCM')].filter(Boolean).join(' · ');
- $('audioinfo').textContent='· 声卡 '+s;
+ // 把系统识别到的卡号列出来: 换 USB 声卡后一眼看出它是 card 几、有没有被认成 USB
+ const cs=(a.cards||[]).map(c=>'card'+c.num+(c.usb?'(USB)':'')).join(' ');
+ $('audioinfo').textContent='· 当前卡'+a.card+(cs?' ['+cs+']':'')+' '+s;
  $('audioinfo').style.color=(a.Master&&a.Master.muted)?'#c00':'';
 }
 function loadAudio(){fetch('/api/audio').then(r=>r.json()).then(showAudio).catch(()=>{});}
 
 fetch('/api/config').then(r=>r.json()).then(fillForm).catch(e=>msg('读配置失败: '+e));
-scanUsb();loadAudio();
+scanUsb();loadAudio();loadTime();
+// 服务器时间每 30 秒与后端对齐一次(平时靠本地单调时钟推算, 不打请求)
+setInterval(loadTime,30000);
 refresh();loadNet();
 // ★默认不进实时预览: 小主机只有 4 核赛扬, 持续刷帧会和 OCR/TTS 抢 CPU(现场反馈"开着就卡")。
 //   这里只在打开页面时抓**一张静帧**(开销 = 一次缩图编码), 好让画面不为空、能直接拖 ROI;
@@ -990,12 +1075,131 @@ def spell_digits(s):
     return " ".join(_CN_DIGIT[c] for c in s if c.isdigit())
 
 
+def time_status():
+    """服务器时间 / 时区 / NTP 状态 / 开机时长 / 最近一次校时结果。
+
+    现场机器无外网, systemd-timesyncd inactive —— 时间只能手工校, 所以面板要
+    把"当前时间 + 是否在自动同步 + 上次校时结果"一次显示全, 避免用户重复点。
+    """
+    st = {"epoch": int(time.time()), "now": "", "tz": "", "offset": 0,
+          "ntp": False, "synced": False, "uptime": "", "rtc": "", "last": "",
+          "last_id": ""}
+    try:
+        st["now"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        st["offset"] = int(-time.timezone if not time.daylight or
+                           not time.localtime().tm_isdst else -time.altzone)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        st["tz"] = _run_quiet(["timedatectl", "show", "-p", "Timezone", "--value"]) or \
+            _run_quiet(["cat", "/etc/timezone"])
+        st["ntp"] = _run_quiet(["timedatectl", "show", "-p", "NTP", "--value"]) == "yes"
+        st["synced"] = _run_quiet(
+            ["timedatectl", "show", "-p", "NTPSynchronized", "--value"]) == "yes"
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        with open("/proc/uptime") as f:
+            up = float(f.read().split()[0])
+        d, rem = divmod(int(up), 86400)
+        h, rem = divmod(rem, 3600)
+        st["uptime"] = ("%d 天 " % d if d else "") + "%d 小时 %d 分" % (h, rem // 60)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        # RTC 走 UTC: since_epoch 就是 epoch, 用来对照"重启后会不会回退"
+        with open("/sys/class/rtc/rtc0/since_epoch") as f:
+            rtc = int(f.read().strip())
+        st["rtc"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(rtc))
+        st["rtc_drift"] = rtc - st["epoch"]
+    except Exception:  # noqa: BLE001
+        pass
+    for p, key in ((os.path.join(TIME_DIR, "result"), "last"),
+                   (os.path.join(TIME_DIR, "last_req_id"), "last_id")):
+        try:
+            with open(p, encoding="utf-8", errors="replace") as f:
+                st[key] = f.read().strip()[:200]
+        except Exception:  # noqa: BLE001
+            pass
+    return st
+
+
+def time_submit(body):
+    """把校时请求交给 root 定时器执行。返回 (ok, msg, request_id)。
+
+    只做格式校验(与 apply 脚本同口径), 真正的 date -s 由 root 侧执行;
+    页面拿到 request_id 后轮询 /api/time 的 last 字段认领结果。
+    """
+    dt = str(body.get("datetime") or "").strip()
+    if not re.match(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$", dt):
+        return False, "时间格式必须是 YYYY-MM-DD HH:MM:SS", ""
+    rid = "%d-%d" % (int(time.time() * 1000), threading.get_ident() % 1000)
+    try:
+        os.makedirs(TIME_DIR, exist_ok=True)
+        tmp = os.path.join(TIME_DIR, "request.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write("%s|%s\n" % (rid, dt))
+        os.replace(tmp, os.path.join(TIME_DIR, "request"))
+    except Exception as e:  # noqa: BLE001
+        return False, "写请求失败: %s" % e, ""
+    return True, "已提交，最多 5 秒生效", rid
+
+
+# ALSA 卡列表文件路径（常量提出来，便于本机单测时替换）
+CARDS_FILE = "/proc/asound/cards"
+
+
+def alsa_card():
+    """当前声卡卡号 —— 不能写死 0。
+
+    换 USB 声卡后卡号会变（板载若在就是 1），写死 -c 0 会导致「音量修复」
+    去修板载卡、状态也读错卡。优先按配置的 aplay_device 解析：
+      plughw:1,0            -> "1"
+      plughw:CARD=Device,DEV=0 -> 查 /proc/asound/cards 拿到该名字的卡号
+    解析不出再退回 0。
+    """
+    dev = ""
+    try:
+        dev = (load_cfg() or {}).get("tts", {}).get("aplay_device") or ""
+    except Exception:
+        pass
+    m = re.search(r"(?:plughw|hw):(\d+)", dev)
+    if m:
+        return m.group(1)
+    m = re.search(r"CARD=([^,]+)", dev)
+    if m:
+        try:
+            for ln in open(CARDS_FILE, encoding="utf-8", errors="replace"):
+                if ("[" + m.group(1)) in ln and ln[:3].strip().isdigit():
+                    return ln.split()[0]
+        except OSError:
+            pass
+    return "0"
+
+
+def alsa_cards():
+    """/proc/asound/cards 摘要：让页面上能一眼看到系统把哪张卡识别成几号、是不是 USB。"""
+    out = []
+    try:
+        for ln in open(CARDS_FILE, encoding="utf-8", errors="replace"):
+            if not ln[:3].strip().isdigit():
+                continue
+            num = ln.split()[0]
+            body = ln.split(":", 1)[1] if ":" in ln else ln
+            out.append({"num": num, "name": body.strip()[:40],
+                        "usb": "USB-Audio" in body or "USB" in body})
+    except OSError:
+        pass
+    return out
+
+
 def audio_status():
     """Master/PCM 音量与静音状态（现场"没声音"九成是这里被静音/归零）。"""
-    st = {}
+    card = alsa_card()
+    st = {"card": card, "cards": alsa_cards()}
     for name in ("Master", "PCM"):
         try:
-            p = subprocess.run(["amixer", "-c", "0", "sget", name],
+            p = subprocess.run(["amixer", "-c", card, "sget", name],
                                capture_output=True, timeout=5)
             txt = p.stdout.decode("utf-8", "replace")
             pcts = re.findall(r"\[(\d+)%\]", txt)
@@ -1009,10 +1213,11 @@ def audio_status():
 
 def audio_fix():
     """一键把 Master/PCM 拉满并解除静音（debian 在 audio 组即可，无需 root）。"""
+    card = alsa_card()
     logs, ok = [], True
     for name in ("Master", "PCM"):
         try:
-            p = subprocess.run(["amixer", "-c", "0", "sset", name, "100%", "unmute"],
+            p = subprocess.run(["amixer", "-c", card, "sset", name, "100%", "unmute"],
                                capture_output=True, timeout=10)
             ok = ok and p.returncode == 0
             logs.append("%s rc=%d" % (name, p.returncode))
@@ -1273,6 +1478,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"devices": list_usb_cams()})
             elif u.path == "/api/audio":
                 self._json(audio_status())
+            elif u.path == "/api/time":
+                self._json(time_status())
             elif u.path == "/api/network":
                 self._json(net_status())
             elif u.path == "/api/logs":
@@ -1398,6 +1605,16 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/audio_fix":
             ok, m = audio_fix()
             self._json({"ok": ok, "msg": m, "audio": audio_status()})
+            return
+        if u.path == "/api/time":
+            try:
+                n = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(n).decode("utf-8")) if n else {}
+            except Exception:  # noqa: BLE001
+                body = {}
+            ok, m, rid = time_submit(body if isinstance(body, dict) else {})
+            self._json({"ok": ok, "msg": m, "id": rid, "time": time_status()},
+                       200 if ok else 400)
             return
         if u.path != "/api/save":
             self._json({"error": "not found"}, 404)
