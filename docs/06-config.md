@@ -1,6 +1,7 @@
 # 06 · 配置参考（cfg.rs）
 
-全字段均有默认值，最小配置只需 `camera_source`。schema 与 Python 版完全一致。
+全字段均有默认值。**启动硬性必配：`camera_source`、`roi`、`ocr.pattern`**——缺 pattern
+启动即 `exit(1)`，缺 roi 直接退出；不存在"默认 pattern"。schema 与 Python 版完全一致。
 
 ## 顶层
 
@@ -54,7 +55,7 @@
 | `dpi` | 150 | |
 | `pattern` | 双正则 | 单条字符串或数组；号码+窗口提取的核心，改前先跑 `cargo test` |
 
-默认 pattern：
+推荐 pattern（**非默认**——pattern 无默认值，必须显式配置，缺了启动即 exit(1)）：
 
 ```json
 ["([A-Z]{1,2}\\d{3,6})",

@@ -20,6 +20,10 @@ num = win = None
 for pat in ocr.get("pattern", []):
     m = re.search(pat, raw)
     if m:
+        # ★2026-10-23 低危修复: 单组 pattern(只抓号码)group(2) 会 IndexError,
+        #   跳过不符合"号码+窗口"两组的规则而不是崩掉
+        if len(m.groups()) < 2:
+            continue
         num, win = m.group(1), m.group(2)
         break
 print("解析: number=%r window=%r" % (num, win))

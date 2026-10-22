@@ -16,7 +16,7 @@
 | 配置编辑 | 摄像头源(USB/RTSP 含 IP+密码)/分辨率/检测参数/播报参数 |
 | **ROI 拖框** | 预览图上鼠标拖矩形，坐标按「配置的采集分辨率」自动换算（`capW()`），标定 ROI 不用手工算坐标 |
 | 抓帧预览 | `/api/snapshot`：ffmpeg 对 USB/RTSP 抓一帧 JPEG（超时 15s），失败给中文错误（IP/密码/网络可达） |
-| 一键保存 | 校验 → **原子写** config.json(tmp+rename) → `sudo systemctl restart announce-rs` |
+| 一键保存 | 校验 → **原子写** config.json(tmp+rename) → `sudo announce-schedule-apply`（按作息决定 restart/stop；sudoers 窄授权另含 restart 与 net-apply，共 3 条） |
 | 服务状态 | systemd ActiveState/PID/内存 + 实时播报日志 |
 | OCR 自测 | `/api/test_ocr`：当前配置跑一轮识别，直接看解析结果 |
 | TTS 自测 | `/api/test_tts`：合成"GA200→08号窗口"试听，piper 走常驻服务优先 |
@@ -29,18 +29,21 @@
 
 ```
 GET  /                     配置页 HTML
-GET  /api/config           读配置
+GET  /api/config           读配置(含 rev 指纹, 供保存乐观锁)
 GET  /api/status           服务状态+播报日志
 GET  /api/devices          USB 摄像头列表
 GET  /api/audio            音频设备状态
 GET  /api/network          网络状态
 GET  /api/logs             日志状态
 GET  /api/snapshot?...     抓帧预览(JPEG)
+GET  /api/time             当前系统时间
+POST /api/save             保存配置(带 __rev 乐观锁, 冲突回 409)
 POST /api/network[/confirm] 网络配置应用(带确认)
 POST /api/logs             日志操作
 POST /api/test_ocr         OCR 自测
 POST /api/test_tts         TTS 试听
 POST /api/audio_fix        音频修复
+POST /api/time             手工校时(写请求, announce-time.timer 每 5s 消费)
 ```
 
 ## 安全设计

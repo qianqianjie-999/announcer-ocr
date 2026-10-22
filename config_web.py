@@ -7,8 +7,9 @@
   * 配置页: 摄像头源(USB/RTSP 含 IP+密码)/分辨率/ROI 拖框/检测参数/播报参数
   * 抓帧预览: ffmpeg 从 RTSP 或 USB 设备抓一帧 JPEG(超时 15s)
   * ROI 拖框: 预览图上鼠标拖矩形, 坐标按抓帧分辨率换算
-  * 保存: 校验 -> 原子写 config.json -> sudo systemctl restart announce-rs
-    (sudoers 窄授权: /etc/sudoers.d/announce-web 仅放行 restart announce-rs)
+  * 保存: 校验 -> 原子写 config.json -> sudo announce-schedule-apply
+    (sudoers 窄授权 3 条: /etc/sudoers.d/announce-web 放行 restart /
+    net-apply / schedule-apply, 见 deploy/sudoers.announce-web)
 端口 8080, 仅限内网使用, 无认证(调试场景)。
 """
 import errno

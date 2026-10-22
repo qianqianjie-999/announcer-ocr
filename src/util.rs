@@ -79,7 +79,14 @@ pub fn run_timeout(cmd: &mut Command, timeout: Duration) -> Result<Output, Strin
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
-            Err(e) => return Err(e.to_string()),
+            // ★2026-10-23 低危修复: try_wait 出错(罕见)也要收尸 —— 同函数另两条
+            //   错误路径都 kill+wait, 这条直接返回会把子进程留成孤儿
+            //   (与 ocr.rs 已修的同款模式)。
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(e.to_string());
+            }
         }
     }
 }

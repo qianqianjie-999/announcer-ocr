@@ -29,7 +29,9 @@ for ls in ("1.25", "1.45", "1.60"):
                         "--length-scale", ls],
                        input=TXT.encode(), capture_output=True, timeout=180, env=env)
     if p.returncode != 0:
-        print("  1.45 -> 合成失败:", p.stderr.decode()[:120]); continue
+        # ★2026-10-23 低危修复: 失败归因要带当前档位 —— 旧版硬编码 "1.45",
+        #   任一档失败都被归到 1.45, 语速诊断结论指错档位
+        print("  %s -> 合成失败:" % ls, p.stderr.decode()[:120]); continue
     w = wave.open(out); dur = w.getnframes() / float(w.getframerate()); w.close()
     print("  length-scale=%s -> 时长 %.2f 秒" % (ls, dur))
     os.remove(out)

@@ -5,11 +5,18 @@ use chrono::Local;
 use std::io::Write;
 
 /// Python csv.writer 最小引号转义: 含逗号/引号/换行才加引号, 引号翻倍。
+/// ★2026-10-23 低危修复: 前导 = + - @ 加 ' 前缀防 Excel 公式注入 —— raw 字段
+///   来自 OCR 屏幕内容原样落 CSV, Excel 打开时 "=cmd" 类单元格会被当公式执行。
 fn csv_escape(s: &str) -> String {
+    let s = if s.starts_with('=') || s.starts_with('+') || s.starts_with('-') || s.starts_with('@') {
+        format!("'{}", s)
+    } else {
+        s.to_string()
+    };
     if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
         format!("\"{}\"", s.replace('"', "\"\""))
     } else {
-        s.to_string()
+        s
     }
 }
 

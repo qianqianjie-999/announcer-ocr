@@ -59,9 +59,13 @@ cargo test --release
 ```json
 {
   "camera_source": "/dev/video0",
-  "roi": [640, 330, 880, 520]
+  "roi": [640, 330, 880, 520],
+  "ocr": { "pattern": ["^([A-Z])(\\d{3})$"] }
 }
 ```
+
+> ★ 2026-10-23 更正：`ocr.pattern` 与 `roi` 都是启动硬性必配——缺 pattern 启动即
+> `exit(1)`（src/ocr.rs），缺 roi 直接退出（src/main.rs），不存在所谓"默认 pattern"。
 
 > ROI 强烈建议按现场标定收紧到叫号屏区域：背景杂物会严重污染识别（实测教训）。
 
@@ -129,7 +133,12 @@ Rust 版当前在用：
 | `announce-rs.service` | 主服务：`Restart=always`、`RestartSec=5`、`CPUQuota=300%`、`MemoryMax=300M` |
 | `announce-web.service` | Web 配置调试台（8080，**仅供内网调试**，故未加鉴权） |
 | `announce-piper.service` | 常驻 piper TTS 服务（避免每句重载模型） |
-| `announce-worktime-{start,stop}.{service,timer}` | 工作时段自动启停：每日 08:00 起、18:00 停 |
+| `announce-worktime-{start,stop}.{service,timer}` | 工作时段自动启停：每日 08:00 起、18:00 停（ExecStart 指向 `announce-worktime-act.sh`，幂等护栏：深夜补跑 start 不会拉起服务） |
+| `announce-worktime-act.sh` | worktime 幂等执行体（读 config.json 的 schedule 决定执行/跳过） |
+| `announce-time.{service,timer}` + `announce-time-apply.sh` | Web 台手工校时：timer 每 5s 消费校时请求 |
+| `sudoers.announce-web` | Web 台 sudo 窄授权片段（restart / net-apply / schedule-apply 三条） |
+| `announce-resmon.sh` | 资源巡检（CPU/内存/磁盘，写 CSV） |
+| `audio_health.sh` | 播报音频链路自检/自愈（声卡复位→USB 热复位→重启升级链） |
 | `announce-cleanup.{service,timer}` + `announce-cleanup.sh` | 每日 03:30 清理：CSV 轮转、存证按天保留、journald 限额 |
 | `tts_server.py`、`install_piper_zh.sh` | piper 服务端与中文模型安装 |
 | `install_cleanup.sh`、`inst_ocr.sh` | 清理与 OCR 环境安装脚本 |
