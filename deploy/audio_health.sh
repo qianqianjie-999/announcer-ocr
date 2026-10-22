@@ -47,9 +47,14 @@ fi
 
 aplay_test() {
     # 设备被播报占用时不要抢: 直接视为"健康"(有占用说明链路在用)
-    # 占用状态文件跟随 AUDIO_DEV 推导的卡号(写死 card0 时, 换 USB 声卡后读错卡)
-    local pcm="${PCM:-/proc/asound/card$(audio_card_num)/pcm0p/sub0/status}"
-    if [ -r "$pcm" ] && ! grep -q closed "$pcm" 2>/dev/null; then
+    # 占用状态文件跟随 AUDIO_DEV 推导的卡号(写死 card0 时, 换 USB 声卡后读错卡)。
+    # 卡号推导失败(查不到卡/default)就跳过占用守卫直接试放——aplay 自身的失败
+    # 会触发升级链, 不静默放行。
+    local pcm=""
+    if [ -n "${PCM:-}" ]; then pcm="$PCM"
+    elif card=$(audio_card_num); then pcm="/proc/asound/card$card/pcm0p/sub0/status"
+    fi
+    if [ -n "$pcm" ] && [ -r "$pcm" ] && ! grep -q closed "$pcm" 2>/dev/null; then
         say "SKIP(设备占用中, 视为在用)"
         return 0
     fi
@@ -57,11 +62,14 @@ aplay_test() {
 }
 
 reset_mixer() {
-    local card=$(audio_card_num)
     alsactl restore -f /var/lib/alsa/asound.state 2>>"$LOG" || true
-    amixer -c "$card" sset 'Auto-Mute Mode' Disabled >/dev/null 2>&1 || true
-    amixer -c "$card" sset Master 100% unmute    >/dev/null 2>&1 || true
-    amixer -c "$card" sset Headphone unmute      >/dev/null 2>&1 || true
+    if card=$(audio_card_num); then
+        amixer -c "$card" sset 'Auto-Mute Mode' Disabled >/dev/null 2>&1 || true
+        amixer -c "$card" sset Master 100% unmute    >/dev/null 2>&1 || true
+        amixer -c "$card" sset Headphone unmute      >/dev/null 2>&1 || true
+    else
+        say "WARN 无法从 AUDIO_DEV($DEV) 推导卡号, 跳过 amixer 恢复(alsactl 已做全卡恢复)"
+    fi
 }
 
 # ---- USB 声卡支持: 定位 / 热复位 / autosuspend 体检 ----
@@ -96,15 +104,19 @@ audio_card_num() {
             name=$(echo "$DEV" | sed -n 's/.*CARD=\([^,]*\).*/\1/p')
             line=$(grep -i -m1 "\[${name}" "$CARDS_FILE" 2>/dev/null)
             if [ -n "$line" ]; then echo "$line" | awk '{print $1}'; return 0; fi
-            echo 0 ;;
+            return 1 ;;   # 查不到卡: 明确失败(回退 card0 会读错卡, 正是 2026-10-22 修的 bug 的残留路径)
         *)
-            echo "$DEV" | grep -oE '[0-9]+' | head -1 ;;
+            local n
+            n=$(echo "$DEV" | grep -oE '[0-9]+' | head -1)
+            [ -n "$n" ] && { echo "$n"; return 0; }
+            return 1 ;;   # default/无数字写法: 推导不出卡号, 由调用方决定降级
     esac
 }
 
 # 热复位 USB 声卡:  equivalent 于"拔掉再插上", 但 2 秒完成、无人到场、可无限次。
 usb_reset() {
-    local card=$(audio_card_num) p bus
+    local card p bus
+    card=$(audio_card_num) || { say "ERROR AUDIO_DEV($DEV) 推导不出卡号, 无法定位 USB 节点"; return 1; }
     p=$(usb_syspath "$card") || { say "USB-RESET 跳过: card$card 不是 USB 设备(板载 HDA)"; return 1; }
     bus=$(basename $(dirname $p))/$(basename $p)   # 形如 usb1/1-2
     say "USB-RESET 复位 $bus (card$card)"
@@ -223,11 +235,11 @@ fi
 # USB 声卡: autosuspend 开着 = 换个花样掉线, 每次自检顺手纠正
 usb_autosuspend_check
 # 板载 HDA 仍在用且已确认过是故障源 -> 提醒可以换 USB
-if ! usb_syspath "$(audio_card_num)" >/dev/null 2>&1; then
+if ! card=$(audio_card_num) || ! usb_syspath "$card" >/dev/null 2>&1; then
     H=$(date '+%m%d')
     if [ "$(cat "$STATE/hda_warn_day" 2>/dev/null)" != "$H" ]; then
         echo "$H" > "$STATE/hda_warn_day"
-        say "INFO 当前用板载 HDA(card$(audio_card_num)), codec 死锁只能靠整机重启复位; 换 USB 声卡可 2s 热复位"
+        say "INFO 当前声卡不可 USB 热复位(card=${card:-未知}), codec 死锁只能靠整机重启复位; 换 USB 声卡可 2s 热复位"
     fi
 fi
 

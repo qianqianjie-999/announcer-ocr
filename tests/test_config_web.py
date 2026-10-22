@@ -521,6 +521,13 @@ class TestTtsPreviewOverrides(unittest.TestCase):
         cfg = cw.apply_tts_preview_overrides(cfg, {"aplay_device": None})
         self.assertIsNone(cfg["tts"]["aplay_device"])
 
+    def test_non_dict_override_ignored(self):
+        # ★回归(2026-10-22): 页面送数组/字符串等畸形数据 -> 整体忽略, 不抛 500。
+        # 旧实现 ov.get 直接 AttributeError, 不在 except (TypeError, ValueError) 内。
+        for bad in ([1, 2], "str", 42, None):
+            cfg = cw.apply_tts_preview_overrides(self._cfg(), bad)
+            self.assertEqual(cfg["tts"]["repeat"], self._cfg()["tts"]["repeat"], bad)
+
     def test_absent_keys_keep_disk_config(self):
         # 只送部分字段时, 其余(含 aplay_device)沿用磁盘配置
         cfg = self._cfg()

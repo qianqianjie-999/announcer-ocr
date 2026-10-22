@@ -1268,6 +1268,8 @@ def apply_tts_preview_overrides(cfg, ov):
     无副作用的字段, 其余仍以磁盘配置为准; 本函数不写盘, 试听完页面保存与否
     都不受影响。试听参数非法就整体忽略, 退回磁盘配置。
     """
+    if not isinstance(ov, dict):
+        return cfg  # 页面送来数组/字符串等畸形数据: 整体忽略, 不抛 500
     try:
         t = dict(cfg.get("tts") or {})
         if ov.get("repeat") is not None:
