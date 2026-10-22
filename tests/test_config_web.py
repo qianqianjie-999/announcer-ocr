@@ -664,5 +664,106 @@ class TestTtsPreviewOverrides(unittest.TestCase):
         self.assertNotIn("piper_length_scale", cfg["tts"])
 
 
+# ---------------------------------------------------------------- Origin 校验
+
+class TestSameOrigin(unittest.TestCase):
+    """_same_origin —— do_POST 入口的 CSRF 防御（2026-10-22 第四轮）。
+
+    服务无认证, POST 全是改配置/断网/重启级副作用。恶意网页诱导访客浏览器
+    跨站 POST 时浏览器必带攻击者站点的 Origin(老浏览器带 Referer), 与 Host
+    头比对即识破 —— 攻击者无法伪造受害者浏览器发出的这些头。
+    """
+
+    def test_same_origin_origin_passes(self):
+        self.assertTrue(cw._same_origin(
+            "http://192.168.1.5:8080", None, "192.168.1.5:8080"))
+
+    def test_cross_site_origin_rejected(self):
+        self.assertFalse(cw._same_origin(
+            "http://evil.example.com", None, "192.168.1.5:8080"))
+
+    def test_origin_null_rejected(self):
+        # 沙箱 iframe / 跨源跳转的特征, 明确拒绝
+        self.assertFalse(cw._same_origin("null", None, "192.168.1.5:8080"))
+        self.assertFalse(cw._same_origin("NULL", None, "192.168.1.5:8080"))
+
+    def test_host_case_insensitive(self):
+        # host 大小写不敏感(域名场景), 端口必须一致
+        self.assertTrue(cw._same_origin(
+            "http://Board.LOCAL:8080", None, "board.local:8080"))
+        self.assertFalse(cw._same_origin(
+            "http://board.local:8081", None, "board.local:8080"))
+
+    def test_no_origin_same_site_referer_passes(self):
+        # 老浏览器不带 Origin 只带 Referer, 同源 Referer 放行
+        self.assertTrue(cw._same_origin(
+            None, "http://192.168.1.5:8080/index.html", "192.168.1.5:8080"))
+
+    def test_no_origin_cross_site_referer_rejected(self):
+        self.assertFalse(cw._same_origin(
+            None, "http://evil.example.com/page", "192.168.1.5:8080"))
+
+    def test_no_origin_no_referer_passes(self):
+        # 非浏览器客户端(curl/现场脚本)不在 CSRF 威胁模型内, 放行
+        self.assertTrue(cw._same_origin(None, None, "192.168.1.5:8080"))
+
+    def test_no_host_passes(self):
+        # 无 Host 头 = 原始 HTTP 客户端, 同上放行
+        self.assertTrue(cw._same_origin(None, None, ""))
+        # 但跨站 Origin 即便无 Host 也不该放(防御优先)
+        self.assertFalse(cw._same_origin("http://evil.example.com", None, ""))
+
+    def test_origin_with_path_still_matches_netloc(self):
+        # Origin 只含 scheme+netloc, 但带路径也不影响 netloc 比对
+        self.assertTrue(cw._same_origin(
+            "http://192.168.1.5:8080/", None, "192.168.1.5:8080"))
+
+
+# ---------------------------------------------------------------- 配置指纹(乐观锁)
+
+class TestConfigRev(unittest.TestCase):
+    """config_rev —— 并发保存乐观锁的内容指纹（2026-10-22 第四轮）。
+
+    两个浏览器窗口同时编辑时, 后保存者用旧快照整份覆盖会静默丢掉先保存者的
+    改动。指纹必须只随"内容"变: touch 改 mtime 不能造成假冲突。
+    """
+
+    def setUp(self):
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        self.cfg_path = os.path.join(tmpdir.name, "config.json")
+        with open(self.cfg_path, "w", encoding="utf-8") as f:
+            json.dump({"fps": 5.0}, f)
+
+    def test_rev_is_16hex_and_stable(self):
+        r1 = cw.config_rev(self.cfg_path)
+        self.assertRegex(r1, r"^[0-9a-f]{16}$")
+        self.assertEqual(r1, cw.config_rev(self.cfg_path),
+                         "内容没变指纹必须稳定")
+
+    def test_rev_changes_with_content(self):
+        r1 = cw.config_rev(self.cfg_path)
+        with open(self.cfg_path, "a", encoding="utf-8") as f:
+            f.write("\n")
+        self.assertNotEqual(r1, cw.config_rev(self.cfg_path))
+
+    def test_missing_file_returns_empty(self):
+        self.assertEqual(cw.config_rev(os.path.join(self.cfg_path, "nope")), "")
+
+    def test_uses_global_config_when_no_arg(self):
+        # 无参时读全局 CONFIG(与 /api/config、/api/save 同源, 打桩验证接线)
+        with open(self.cfg_path, "w", encoding="utf-8") as f:
+            json.dump({"fps": 9.0}, f)
+        p = mock.patch.object(cw, "CONFIG", self.cfg_path)
+        p.start()
+        self.addCleanup(p.stop)
+        r_noarg = cw.config_rev()
+        r_explicit = cw.config_rev(self.cfg_path)
+        self.assertEqual(r_noarg, r_explicit)
+        self.assertNotEqual(r_noarg, "", "无参版必须真读到内容而非空串")
+        with open(self.cfg_path, "r", encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"fps": 9.0})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -14,6 +14,7 @@
 import errno
 import fcntl
 import glob
+import hashlib
 import json
 import math
 import os
@@ -71,6 +72,18 @@ def save_cfg(cfg):
                 pass
             raise
         os.replace(tmp, CONFIG)  # 原子替换, 主服务/配置器永不读到半截文件
+
+
+def config_rev(path=None):
+    """配置内容指纹(sha256 前 16 hex), 乐观锁用: 内容没变 rev 就不变。
+    不用 mtime 是因为 touch/复制也会动 mtime 却没改内容, 会造成假冲突。
+    """
+    p = path or CONFIG
+    try:
+        with open(p, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()[:16]
+    except OSError:
+        return ""
 
 
 # ---------------------------------------------------------------- ffmpeg snapshot
@@ -892,10 +905,13 @@ function setRoi(a,b){
 function save(){
  if(!confirm('保存配置并重启 announce-rs？'))return;
  msg('保存中…');
+ // ★乐观锁: 带上页面加载/上次保存时的配置指纹, 期间被别的窗口改过就 409 拒保存,
+ //   防止"旧快照整份覆盖他人新改动"。409 时按提示刷新重载即可。
+ const body=collect(); body.__rev=cfgRev;
  fetch('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},
-  body:JSON.stringify(collect())})
- .then(r=>r.text().then(t=>({ok:r.ok,t})))
- .then(({ok,t})=>{msg(t);if(ok)refresh();})
+  body:JSON.stringify(body)})
+ .then(r=>r.json().then(d=>({ok:r.ok,d})))
+ .then(({ok,d})=>{if(d.rev)cfgRev=d.rev;msg(d.error||d.msg||JSON.stringify(d));if(ok)refresh();})
  .catch(e=>msg('保存失败: '+e));
 }
 
@@ -1023,7 +1039,9 @@ function showAudio(a){
 }
 function loadAudio(){fetch('/api/audio').then(r=>r.json()).then(showAudio).catch(()=>{});}
 
-fetch('/api/config').then(r=>r.json()).then(fillForm).catch(e=>msg('读配置失败: '+e));
+let cfgRev=null; // 配置内容指纹(乐观锁), 与 /api/config 的 rev、/api/save 的 __rev 对应
+fetch('/api/config').then(r=>r.json()).then(d=>{cfgRev=d.rev||null;fillForm(d);})
+ .catch(e=>msg('读配置失败: '+e));
 scanUsb();loadAudio();loadTime();
 // 服务器时间每 30 秒与后端对齐一次(平时靠本地单调时钟推算, 不打请求)
 setInterval(loadTime,30000);
@@ -1512,6 +1530,34 @@ def test_ocr(cfg):
 
 # ---------------------------------------------------------------- handler
 
+def _same_origin(origin, referer, host):
+    """CSRF 纵深防御(2026-10-22 第四轮): 判断浏览器请求是否同源。
+
+    恶意网页诱导访客浏览器向本服务发 POST 时, 浏览器会带上指向攻击者站点的
+    Origin(现代浏览器, 跨站 POST 必带)或 Referer(老浏览器) —— 与 Host 头比对
+    即可识破, 攻击者无法伪造受害者浏览器发出的这两个头。
+    无 Origin 也无 Referer = 非浏览器客户端(curl/现场排查脚本), 不在 CSRF
+    威胁模型内, 放行 —— 兼容 tools/ 里直接 POST 的脚本。
+    Origin 为 "null" 是沙箱 iframe/跨源跳转的特征, 明确拒绝。
+    """
+    cand = origin or ""
+    if not cand:
+        cand = referer or ""
+    if not cand:
+        return True  # 无 Origin 无 Referer = 非浏览器客户端, 放行
+    if not host:
+        # 有浏览器特征(Origin/Referer)却连 Host 都没有: 真实浏览器必带 Host,
+        # 这种组合不是正常访问, 防御优先直接拒。
+        return False
+    if cand.strip().lower() == "null":
+        return False
+    try:
+        netloc = urllib.parse.urlparse(cand).netloc.lower()
+    except ValueError:
+        return False
+    return bool(netloc) and netloc == host.strip().lower()
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # 静默默认访问日志, journal 只记关键事件
         pass
@@ -1535,7 +1581,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(body)
             elif u.path == "/api/config":
-                self._json(load_cfg())
+                # rev 随配置下发(乐观锁): 保存时必须原样带回, 被 409 挡住就刷新重载。
+                # fillForm 按字段名取值, 多出的 rev 键无副作用。
+                self._json(dict(load_cfg(), rev=config_rev()))
             elif u.path == "/api/status":
                 st, tail = status_and_log()
                 self._json(dict(st, log=tail))
@@ -1601,6 +1649,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         u = urllib.parse.urlparse(self.path)
+        # ★CSRF 防御(2026-10-22): 本服务无认证, 所有 POST 都是"改配置/断网/重启"
+        #   级别的副作用操作, 必须先过同源校验(独立成 _same_origin 是为了能进单测)。
+        if not _same_origin(self.headers.get("Origin"),
+                            self.headers.get("Referer"),
+                            self.headers.get("Host") or ""):
+            self._json({"error": "拒绝跨站请求: Origin 与本服务不符(若从书签/外站跳转而来请直接访问本页)"}, 403)
+            return
         if u.path == "/api/network/confirm":
             try:
                 p = subprocess.run(["sudo", "-n", NET_SCRIPT, "confirm"],
@@ -1673,6 +1728,18 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:  # noqa: BLE001
             self._json({"error": "请求体非法: %s" % e}, 400)
             return
+        # ★乐观锁(2026-10-22): 两个浏览器窗口同时编辑时, 后保存者会用自己页面
+        #   加载时的旧快照整份覆盖, 先保存者的改动被静默丢掉。页面带上加载时的
+        #   内容指纹 __rev, 与当前不一致就拒绝 —— 提示刷新重载, 不做自动合并
+        #   (配置字段间有关联, 盲合并同样危险)。不带 __rev 的调用(脚本工具)不拦,
+        #   保持兼容。
+        got_rev = None
+        if isinstance(body, dict):
+            got_rev = body.pop("__rev", None)
+            if got_rev and got_rev != config_rev():
+                self._json({"error": "配置已被其他窗口修改，为避免覆盖他人改动已拒绝保存；"
+                            "请刷新页面重新加载后再编辑"}, 409)
+                return
         cfg, err = validate_and_build(body)
         if cfg is None:
             self._json({"error": err}, 400)
@@ -1701,7 +1768,8 @@ class Handler(BaseHTTPRequestHandler):
                 note = "（工作时间调度未生效: %s）" % (
                     p.stderr.decode("utf-8", "replace").strip() or ("code %s" % p.returncode))
             self._json({"ok": True, "msg": "配置已保存并重启%s。camera_source=%r roi=%s"
-                        % (note, cfg["camera_source"], cfg["roi"])})
+                        % (note, cfg["camera_source"], cfg["roi"]),
+                        "rev": config_rev()})
             return
         if sched.get("enabled"):
             sinfo = "工作时间 %s ~ %s（非工作时间自动停机）" % (
@@ -1709,7 +1777,8 @@ class Handler(BaseHTTPRequestHandler):
         else:
             sinfo = "未启用工作时间调度（全天运行）"
         self._json({"ok": True, "msg": "已保存并生效。%s；camera_source=%r roi=%s"
-                    % (sinfo, cfg["camera_source"], cfg["roi"])})
+                    % (sinfo, cfg["camera_source"], cfg["roi"]),
+                    "rev": config_rev()})
 
 
 def main():
