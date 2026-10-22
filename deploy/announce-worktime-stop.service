@@ -1,6 +1,8 @@
 [Unit]
 # 非工作时间(每日18:00~次日08:00)停播报相关服务 —— 由 announce-worktime-stop.timer 触发
+# ★2026-10-22 中危修复: 执行体改为幂等脚本 —— 补跑的 stop 在白天会被跳过,
+#   防止"深夜开机先 stop 后 start"之外的"白天补跑 stop 误停服务"。
 Description=Stop announce-rs and announce-web (non-work hours)
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/systemctl stop announce-rs.service announce-web.service announce-piper.service
+ExecStart=/usr/local/sbin/announce-worktime-act.sh stop

@@ -194,12 +194,15 @@ impl PipeGrabber {
                         }
                     }
                     // 收尸: kill + wait, 不留 defunct 僵尸(实测僵尸会一直挂在 ps 里)
-                    {
-                        let mut g = util::lock(&child_slot);
-                        if let Some(mut c) = g.take() {
-                            let _ = c.kill();
-                            let _ = c.wait();
-                        }
+                    // ★2026-10-22 中危修复: take 出来后立刻放锁再收尸 —— ffmpeg 收
+                    //   SIGKILL 后可能进 D 状态(v4l2 读卡在僵死的 USB 摄像头上),
+                    //   wait 会久等; 持锁 wait 会把看门狗与 Drop 的收尸全部堵死,
+                    //   "RTSP 半开"唯一的救命层失效。slot 已 take 空, 不放回,
+                    //   下面的重拉路径自会重建。与看门狗/reap_child 同一模式。
+                    let victim = util::lock(&child_slot).take();
+                    if let Some(mut c) = victim {
+                        let _ = c.kill();
+                        let _ = c.wait();
                     }
                     if stop.load(Relaxed) {
                         break;

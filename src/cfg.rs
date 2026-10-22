@@ -169,7 +169,28 @@ pub struct Config {
     #[serde(default)] pub detect: Detect,
     #[serde(default)] pub ocr: OcrCfg,
     #[serde(default)] pub tts: Tts,
+    /// 作息闸(2026-10-22 中危修复): config.json 里一直有 schedule 键(Web 台
+    /// 保存的工作时段), 但 Rust 侧从未读取 —— 服务开机自启(WantedBy=
+    /// multi-user.target)后夜里重启主机就会整夜播报。现在主程序自己把关:
+    /// enabled 且当前不在 work_start~work_end 内就不播报(OCR 链照常, 恢复
+    /// 后自动续播)。与 systemd worktime timer 互为兜底: timer 漏停(如补跑
+    /// 竞态)时程序侧仍静音; 配置 enabled=false 时闸不生效, 行为同旧版。
+    #[serde(default)] pub schedule: Schedule,
 }
+
+#[derive(Clone, Debug, Deserialize, Default, PartialEq)]
+pub struct Schedule {
+    #[serde(default)]
+    pub enabled: bool,
+    /// 工作开始 "HH:MM"。与 end 相等视为全天(闸不生效)。
+    #[serde(default = "work_start_d")]
+    pub work_start: String,
+    /// 工作结束 "HH:MM"。start > end 表示跨零点(如 22:00~06:00 夜班)。
+    #[serde(default = "work_end_d")]
+    pub work_end: String,
+}
+fn work_start_d() -> String { "08:00".into() }
+fn work_end_d() -> String { "18:00".into() }
 
 impl Config {
     pub fn load(path: &str) -> Result<Config, String> {

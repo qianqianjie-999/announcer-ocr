@@ -1,6 +1,10 @@
 [Unit]
 # 工作时间(每日08:00)拉起播报服务 —— 由 announce-worktime-start.timer 触发
+# ★2026-10-22 中危修复: 执行体改为幂等脚本 —— 双 timer 都 Persistent=true,
+#   停机跨过 08:00 与 18:00 后开机两个错失事件都会补跑且顺序不定, 深夜开机
+#   可能被"补跑的 start"整夜拉起。脚本按当前时间+config 的 schedule 自证
+#   合法性, 非工作时段的补跑 start 直接跳过。
 Description=Start announce-rs and announce-web (work hours)
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/systemctl start announce-piper.service announce-rs.service announce-web.service
+ExecStart=/usr/local/sbin/announce-worktime-act.sh start

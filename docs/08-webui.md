@@ -47,8 +47,11 @@ POST /api/audio_fix        音频修复
 
 | 措施 | 原因 |
 |---|---|
-| sudoers 窄授权 | `/etc/sudoers.d/announce-web` **只放行** `systemctl restart announce-rs` 一条命令，Web 进程即使被攻破也做不了别的 |
+| sudoers 窄授权 | `/etc/sudoers.d/announce-web` 只放行 3 条命令：`systemctl restart announce-rs`、`announce-schedule-apply`（排班应用）、`announce-net-apply.sh`（网络配置，脚本内自带 `valid_host` 严格参数校验）。完整片段见 `deploy/sudoers.announce-web`（2026-10-23 修复：net-apply 一直未授权导致网络页必失败）。Web 进程即使被攻破也只能执行这三个白名单动作 |
 | `validate_rtsp` 纵深防御 | 非法 RTSP 源在入口和 ffmpeg 调用前各拦一道（防内网 SSRF 类探测） |
+| 请求体上限 | 全部 POST 端点经 `_read_body`：负/非法 Content-Length 400，超 64KB 413 并断开连接（防 `read(-1)` 挂线程与内存打爆） |
+| 同源校验 | POST 入口校验 Origin/Referer 与 Host 一致（防跨站页面触发改配置/断网） |
+| 乐观锁 | `/api/config` 下发内容指纹 `rev`，保存时校验，两窗口并发保存后者被 409 拦下 |
 | 配置原子写 | tmp + `os.replace`，主服务/配置器永不读到半截 config.json |
 | `CONFIG_LOCK` 串行化 | 多浏览器同时保存不互相踩 |
 | 无认证但限内网 | 调试台定位；`NET_DEFAULT_IP=192.168.31.1` 是直连调试出厂值，有路由器现场勿用（多为网关） |

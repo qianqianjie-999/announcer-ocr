@@ -32,27 +32,34 @@ CACHE = OrderedDict()
 CACHE_BYTES = 0
 CACHE_MAX_BYTES = 48 << 20          # 48MB; 单句 wav 约 120KB, 够存几百句
 STATS = {"hit": 0, "miss": 0, "synth_n": 0, "synth_sec_total": 0.0, "last_synth_sec": 0.0}
+# ★2026-10-22 中危修复: 缓存自用小锁 —— 旧版 cache_get/cache_put 在合成锁外跑,
+# ThreadingHTTPServer 并发下 "命中后 move_to_end" 会与另一线程的 LRU 逐出竞态,
+# key 恰被 popitem 挤出 => move_to_end 抛 KeyError => do_POST 500, 该句播报丢失。
+# 与合成锁(LOCK)只单向嵌套(合成锁内可拿缓存锁, 反之不行), 无死锁。
+CACHE_LOCK = threading.Lock()
 
 
 def cache_get(key):
-    val = CACHE.get(key)
-    if val is None:
-        return None
-    CACHE.move_to_end(key)          # LRU: 命中的挪到末尾
-    STATS["hit"] += 1
-    return val
+    with CACHE_LOCK:
+        val = CACHE.get(key)
+        if val is None:
+            return None
+        CACHE.move_to_end(key)          # LRU: 命中的挪到末尾
+        STATS["hit"] += 1
+        return val
 
 
 def cache_put(key, val):
     global CACHE_BYTES
-    old = CACHE.pop(key, None)
-    if old is not None:
-        CACHE_BYTES -= len(old)
-    CACHE[key] = val
-    CACHE_BYTES += len(val)
-    while CACHE_BYTES > CACHE_MAX_BYTES and len(CACHE) > 1:
-        _, evicted = CACHE.popitem(last=False)
-        CACHE_BYTES -= len(evicted)
+    with CACHE_LOCK:
+        old = CACHE.pop(key, None)
+        if old is not None:
+            CACHE_BYTES -= len(old)
+        CACHE[key] = val
+        CACHE_BYTES += len(val)
+        while CACHE_BYTES > CACHE_MAX_BYTES and len(CACHE) > 1:
+            _, evicted = CACHE.popitem(last=False)
+            CACHE_BYTES -= len(evicted)
 
 
 def synthesize(text):

@@ -253,6 +253,8 @@ struct Loop {
     last_announce: f64,
     /// 上次打"健康告警"的时刻。用于把告警限流成"每阈值周期最多一条", 防止刷屏。
     last_health_warn: f64,
+    /// 作息闸静音提示只打一次的标志(2026-10-22): 回到工作时段复位, 别每帧刷屏。
+    mute_warned: bool,
     /* —— 号码闸门(2026-10-21) ————————————————————————————————
      * 屏幕改三行列表后, 单数字误读会产出"看起来合理"的号(GA158→GA198、GA150→GA190),
      * 播报后还占住当日去重表, 真号反而不再响。现场编号严格 +1 递增, 用"跳幅上限"
@@ -344,6 +346,25 @@ fn gate_day_rollover(last_day: &mut String, today: Option<String>) -> bool {
     }
 }
 
+/// 作息闸判定(纯函数, 便于单测): 当前 "HH:MM" 是否落在 start~end 工作窗口内。
+/// start<=end 为普通窗口(含 start、不含 end); start>end 为跨零点窗口
+/// (如 22:00~06:00 夜班); start==end 视为全天。任一侧解析失败 => false
+/// —— 宁可静音由告警暴露, 不可带着坏配置整夜乱播。
+fn in_work_window(now: &str, start: &str, end: &str) -> bool {
+    use chrono::NaiveTime;
+    let (Some(n), Some(s), Some(e)) = (
+        NaiveTime::parse_from_str(now, "%H:%M").ok(),
+        NaiveTime::parse_from_str(start, "%H:%M").ok(),
+        NaiveTime::parse_from_str(end, "%H:%M").ok(),
+    ) else {
+        return false;
+    };
+    if s == e {
+        return true;
+    }
+    if s < e { n >= s && n < e } else { n >= s || n < e }
+}
+
 impl Loop {
     /// 启动期一次性构造: 解析 ROI、建 OCR / 播报器 / 取流通道, 初始化全部状态。
     fn build(cfg: Config) -> Result<Loop, String> {
@@ -430,6 +451,7 @@ impl Loop {
 
             last_num: seed_last_numbers(&cfg.log_file),
             maint_day: local_day_of(now).unwrap_or_default(),
+            mute_warned: false,
             max_jump: det.max_jump,
             gate_log_at: 0.0,
 
@@ -1047,6 +1069,33 @@ impl Loop {
     /// 按【号码】票决后播报: 票数达到 need_stable 且该号码未播报过才入队。
     /// 聚合口径见 number_votes() —— 同一号码的多个窗口候选并成一票, 只播一次。
     fn announce_winners(&mut self, raw: &str, now: f64, iter_secs: f64) {
+        // ★作息闸(2026-10-22 中危): schedule.enabled 且当前不在工作时段 -> 不播。
+        //   OCR 链照常跑(确认/日志/诊断不受影响), 回到时段自动续播 —— 这是
+        //   "夜里重启主机服务整夜播报"的程序侧防线, 与 systemd worktime timer
+        //   互为兜底。放在 announced.insert 之前: 静音期号码不占当日去重表,
+        //   恢复后屏幕上的现有号还能正常报出来。
+        if self.cfg.schedule.enabled {
+            let hm = chrono::Local::now().format("%H:%M").to_string();
+            let inside = in_work_window(
+                &hm,
+                &self.cfg.schedule.work_start,
+                &self.cfg.schedule.work_end,
+            );
+            if !inside {
+                if !self.mute_warned {
+                    self.mute_warned = true;
+                    println!(
+                        "[作息] 当前 {} 不在工作时段 {}~{}, 静音中(OCR 照常, 到点自动续播)",
+                        hm, self.cfg.schedule.work_start, self.cfg.schedule.work_end
+                    );
+                }
+                return;
+            }
+            if self.mute_warned {
+                self.mute_warned = false;
+                println!("[作息] 已进入工作时段, 恢复播报");
+            }
+        }
         let mut winners = number_votes(&self.confirm);
         winners.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
         for (number, window, votes, first, _last) in winners {
@@ -1286,8 +1335,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        drop_shadow_empty, effective_ttl, gate_day_rollover, jump_extra_confirm, number_votes,
-        resolve_row_pitch, settle_ready, SETTLE_MAX_WAIT_SECS,
+        drop_shadow_empty, effective_ttl, gate_day_rollover, in_work_window, jump_extra_confirm,
+        number_votes, resolve_row_pitch, settle_ready, SETTLE_MAX_WAIT_SECS,
     };
     use std::collections::{HashMap, HashSet};
 
@@ -1532,5 +1581,37 @@ mod tests {
         assert!(!gate_day_rollover(&mut day, Some("2026-10-23".into())));
         assert_eq!(day, "2026-10-23");
         assert!(gate_day_rollover(&mut day, Some("2026-10-24".into())));
+    }
+
+    #[test]
+    fn work_window_normal_span() {
+        // 普通窗口 08:00~18:00: 含 start、不含 end(18:00 整点交由 stop 侧处理)
+        assert!(in_work_window("08:00", "08:00", "18:00"));
+        assert!(in_work_window("12:00", "08:00", "18:00"));
+        assert!(in_work_window("17:59", "08:00", "18:00"));
+        assert!(!in_work_window("18:00", "08:00", "18:00"));
+        assert!(!in_work_window("23:30", "08:00", "18:00"));
+        assert!(!in_work_window("07:59", "08:00", "18:00"));
+    }
+
+    #[test]
+    fn work_window_overnight_span() {
+        // 跨零点窗口 22:00~06:00(夜班): 22:00 入, 06:00 出, 深夜在窗
+        assert!(in_work_window("22:00", "22:00", "06:00"));
+        assert!(in_work_window("23:59", "22:00", "06:00"));
+        assert!(in_work_window("00:00", "22:00", "06:00"));
+        assert!(in_work_window("05:59", "22:00", "06:00"));
+        assert!(!in_work_window("06:00", "22:00", "06:00"));
+        assert!(!in_work_window("12:00", "22:00", "06:00"));
+    }
+
+    #[test]
+    fn work_window_edge_cases() {
+        // start==end 视为全天; 解析失败宁可静音(false), 不可带着坏配置乱播
+        assert!(in_work_window("03:00", "08:00", "08:00"));
+        assert!(in_work_window("23:00", "08:00", "08:00"));
+        assert!(!in_work_window("12:00", "8点", "18:00"));
+        assert!(!in_work_window("12:00", "08:00", ""));
+        assert!(!in_work_window("", "08:00", "18:00"));
     }
 }

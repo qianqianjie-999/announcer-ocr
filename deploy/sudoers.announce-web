@@ -1,0 +1,18 @@
+# /etc/sudoers.d/announce-web —— 配置台(config_web.py)的窄授权清单
+# ★2026-10-22 中危修复: 网络页三端点(status/factory/apply/confirm)全走
+#   `sudo -n /usr/local/sbin/announce-net-apply.sh`, 但 sudoers 一直没授权
+#   它 => 页面点"应用/恢复出厂/确认"全部报 "a password is required"。
+#   net-apply 脚本自身有严格参数校验(valid_host 白名单), 授权其执行是安全的。
+#
+# 安装前提(二选一, 按现场实际):
+#   * 外部工装 deploy.sh 安装 announce-net-apply.sh / announce-schedule-apply
+#     到 /usr/local/sbin/;
+#   * 手工: sudo install -m 755 deploy/announce-net-apply.sh /usr/local/sbin/
+# 本文件安装(注意 440 权限, visudo 语法自检):
+#   sudo install -m 440 deploy/sudoers.announce-web /etc/sudoers.d/announce-web
+#   sudo visudo -c   # 必须显示 parsed OK
+#
+# 运行账号按现场调整(当前为 debian; 配置台服务以该账号运行)。
+debian ALL=(root) NOPASSWD: /usr/bin/systemctl restart announce-rs
+debian ALL=(root) NOPASSWD: /usr/local/sbin/announce-schedule-apply
+debian ALL=(root) NOPASSWD: /usr/local/sbin/announce-net-apply.sh
