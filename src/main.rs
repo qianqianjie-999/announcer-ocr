@@ -29,6 +29,7 @@ mod tts;
 mod util;
 
 use cfg::{Config, SourceKind};
+use chrono::Datelike;
 use dedupe::{AgedMap, Expiry};
 use image::GrayImage;
 use std::collections::{HashMap, HashSet};
@@ -351,6 +352,14 @@ fn seed_last_numbers(log_file: &str) -> (HashMap<String, u32>, Vec<String>) {
         announced.push(num);
     }
     (base, announced)
+}
+
+/// 系统时间是否"可信": 年份在 [2026, 2035] 内。
+/// RTC 纽扣电池没电/断电回退时时钟会跳到出厂值(常见 201x-01-01 或 2000-01-01),
+/// 作息闸按坏时间判窗必误判。年份下限取部署年份 2026, 上限留到 2035
+/// (2038 问题之前, chrono/时间戳均安全)。纯函数, 供单测。
+fn time_plausible_y(year: i32) -> bool {
+    (2026..=2035).contains(&year)
 }
 
 /// 维护节拍用的"本地日"标识: Unix 秒 -> 本地日期(YYYY-MM-DD)。
@@ -693,6 +702,21 @@ impl Loop {
     /// 日志/基线, 恢复后照常播。health_check 的"链路失效"告警也要做同样豁免。
     fn announcement_allowed(&mut self) -> bool {
         if !self.cfg.schedule.enabled {
+            return true;
+        }
+        // ★时间可信度守卫(2026-10-23): RTC 纽扣电池没电/断电回退会让时钟跳到
+        //   出厂值, 按坏时间判窗会把工作时间错判成休息时间 —— 该播的时候整场
+        //   静音、 systemd 侧还会把服务停掉。时间明显不对(年份不在可信区间)
+        //   时作息闸自动失效, 照常播报 —— 宁可错播, 不可错停。
+        let now_lc = chrono::Local::now();
+        if !time_plausible_y(now_lc.year()) {
+            if !self.mute_warned {
+                self.mute_warned = true;
+                println!(
+                    "[时间] 系统时间明显异常({}, 作息闸已自动失效, 照常播报; 请校时)",
+                    now_lc.format("%Y-%m-%d %H:%M:%S")
+                );
+            }
             return true;
         }
         let hm = chrono::Local::now().format("%H:%M").to_string();
@@ -1498,9 +1522,25 @@ mod tests {
     use super::{
         announce_sort_key, drop_shadow_empty, effective_ttl, gate_day_rollover, in_work_window,
         jump_extra_confirm, number_votes, resolve_row_pitch, seed_only_decide, settle_ready,
-        SETTLE_MAX_WAIT_SECS,
+        time_plausible_y, SETTLE_MAX_WAIT_SECS,
     };
     use std::collections::{HashMap, HashSet};
+
+    // ———— 时间可信度守卫: RTC 掉电时时钟跳出厂值, 作息闸必须自动失效 ————
+    #[test]
+    fn time_plausibility_bounds() {
+        // 可信: 部署年份起, 到 2035
+        assert!(time_plausible_y(2026));
+        assert!(time_plausible_y(2027));
+        assert!(time_plausible_y(2035));
+        // 明显不对: 出厂值/回退值(纽扣电池没电的典型形态)
+        assert!(!time_plausible_y(2019));
+        assert!(!time_plausible_y(2000));
+        assert!(!time_plausible_y(2015));
+        // 边界: 2025(部署前, 视为时钟回退) 与 2036(超界)
+        assert!(!time_plausible_y(2025));
+        assert!(!time_plausible_y(2036));
+    }
 
     // ———— 跳幅分档: 叫号员会过号, 卡 +2 会漏播; 分档后大跳只多等确认, 不丢号 ————
     #[test]
