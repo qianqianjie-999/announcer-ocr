@@ -1223,5 +1223,31 @@ class TestSnapshotNoDoubleUnquote(unittest.TestCase):
                          "parse_qs 之后不得再 unquote, 否则密码被改写")
 
 
+class TestNetApplyOsError(unittest.TestCase):
+    """★回归(2026-10-23 第九轮低危): net_apply 须拦 OSError。
+
+    subprocess.run 除超时外, 在 sudo 二进制缺失/PATH 异常时会抛
+    FileNotFoundError(OSError 子类)。旧版只 except TimeoutExpired, 异常逃逸到
+    /api/network POST 处理函数(该处无 try 兜底), 连接被硬断、客户端拿不到 JSON。
+    """
+
+    def test_oserror_returns_false_tuple(self):
+        body = {"factory": True}
+        with mock.patch.object(cw.subprocess, "run",
+                               side_effect=FileNotFoundError("sudo: not found")):
+            ok, msg = cw.net_apply(body)
+        self.assertFalse(ok)
+        self.assertIn("sudo", msg)
+
+    def test_timeout_still_handled(self):
+        body = {"factory": True}
+        with mock.patch.object(cw.subprocess, "run",
+                               side_effect=cw.subprocess.TimeoutExpired(
+                                   cmd=["sudo"], timeout=60)):
+            ok, msg = cw.net_apply(body)
+        self.assertFalse(ok)
+        self.assertIn("超时", msg)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

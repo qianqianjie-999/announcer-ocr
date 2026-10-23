@@ -342,10 +342,16 @@ def net_apply(body):
         if not (8 <= prefix <= 32):
             return False, "掩码前缀须在 8~32"
         args = ["sudo", "-n", NET_SCRIPT, "apply", ip, str(prefix), gw, dns]
+    # ★2026-10-23 低危修复(第九轮): 除超时外还须拦 OSError —— sudo 二进制缺失/
+    #   PATH 异常时 subprocess.run 抛 FileNotFoundError(OSError 子类), 若不拦
+    #   会逃逸到 /api/network POST 处理函数(该处无 try 兜底), 连接被硬断、客户
+    #   端拿不到 JSON。与第八轮 test_ocr/test_tts/audio_fix 的兜底同口径。
     try:
         p = subprocess.run(args, capture_output=True, timeout=60)
     except subprocess.TimeoutExpired:
         return False, "网络配置命令超时——若页面失联, 请改用新 IP 访问(90秒不确认会自动回滚)"
+    except OSError as e:
+        return False, "调用网络配置脚本失败: %s" % e
     out = (p.stdout + p.stderr).decode("utf-8", "replace").strip()
     if p.returncode != 0:
         return False, out or ("code %s" % p.returncode)
