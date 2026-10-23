@@ -37,6 +37,7 @@ LOG_CSV = os.path.join(HERE, "announce_log.csv")
 RESTART_CMD = ["sudo", "-n", "/usr/bin/systemctl", "restart", "announce-rs"]
 # 工作时间调度：root 辅助脚本，负责「写 systemd timer + 按当前时刻校正运行状态」。
 # 保存配置后优先走它（未启用调度时它会退化为 restart，等价旧行为）。
+MAINT_CMD = ["sudo", "-n", "/usr/local/sbin/announce-maint"]
 SCHED_CMD = ["sudo", "-n", "/usr/local/sbin/announce-schedule-apply"]
 NET_SCRIPT = "/usr/local/sbin/announce-net-apply.sh"
 # 手工校时: 配置台以 debian13 跑, 改系统时间要 root。现场无 sudo, 用 su 就得在
@@ -756,8 +757,46 @@ DNS <input id=n_dns type=text size=24>（可留空）</div>
 磁盘可用低于 500MB 时自动激进清理。归档历史<b>不会被自动删除</b>。</div>
 </fieldset>
 
+<fieldset><legend>运维操作（恢复版本 / 重启）</legend>
+<div class=row>
+<button type=button onclick=maintAct('restore_substream','恢复辅码流版本')>⏪ 恢复辅码流版本</button>
+<button type=button onclick=maintAct('restore_mainstream','恢复主码流版本')>⏩ 恢复主码流版本</button>
+<button class=gray type=button onclick=maintAct('restart_service','重启播报服务')>🔄 重启服务</button>
+<button class=gray type=button onclick=maintAct('reboot','重启服务器')>🔌 重启服务器</button>
+</div>
+<pre id=maintout style="display:none;margin:6px 0;padding:8px;background:#f6f6f2;
+ border:1px solid #ccc;border-radius:6px;font-size:12px;white-space:pre-wrap"></pre>
+<div class=small>恢复包在 /opt/announce-rs/backup/（2026-10-23 制作）：<b>辅码流版</b>=旧二进制+辅码流配置，
+紧急回退用（该版有跨日吞号问题：恢复后若不播报，再点一次「重启服务」即可）；
+<b>主码流版</b>=新二进制+备份时主码流配置（作息闸等以备份当时状态为准，需要时重新保存）。
+恢复前会自动把<b>当前</b>版本留底到 backup/pre-restore-时间戳/，恢复错了可手工翻回。
+配置台程序本身不随恢复回退。</div>
+</fieldset>
+
 <script>
 const $=id=>document.getElementById(id);
+
+// ---- 运维操作面板 ----
+const MAINT_TIPS={
+ restore_substream:'将以辅码流旧程序运行（紧急回退版）。该版有跨日吞号问题：恢复后若不播报，再点一次「重启服务」即可。',
+ restore_mainstream:'将恢复为备份时的主码流版本与配置（作息闸等以备份当时状态为准）。',
+ restart_service:'播报服务将重启，数秒内完成，画面会闪断一次。',
+ reboot:'整个主机将重启（约 1~2 分钟），期间配置台和播报都不可用！'};
+async function maintAct(act,label){
+  if(!confirm('确定执行【'+label+'】？\n'+(MAINT_TIPS[act]||'')))return;
+  if(act==='reboot'&&!confirm('再次确认：真的要重启整台服务器吗？\n播报会中断 1~2 分钟。'))return;
+  const box=$('maintout');
+  box.style.display='block';
+  box.textContent='⏳ 执行中…（恢复版本/重启服务器约需 20~40 秒，请勿关闭页面）';
+  try{
+    const r=await fetch('/api/maint',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({action:act})});
+    const d=await r.json();
+    box.textContent=(d.ok?'✅ 完成':'❌ 失败')+'\n'+(d.msg||'');
+    if(act==='restart_service'||act.startsWith('restore_'))setTimeout(refresh,6000);
+  }catch(e){box.textContent='❌ 请求失败: '+e+'\n（若刚点了重启服务器，连接断开属正常，等 1~2 分钟重新打开本页即可）';}
+}
 
 // ---- 服务器时间面板 ----
 // 显示用"服务器 epoch + 本地单调时钟"推算(不每秒打请求); 时区偏移用服务器给的,
@@ -1872,6 +1911,39 @@ class Handler(BaseHTTPRequestHandler):
             ok, m, rid = time_submit(body if isinstance(body, dict) else {})
             self._json({"ok": ok, "msg": m, "id": rid, "time": time_status()},
                        200 if ok else 400)
+            return
+        if u.path == "/api/maint":
+            # 运维操作: 重启服务/恢复备份版本/重启主机。执行体走 sudo 白名单
+            # 脚本 announce-maint(见 deploy/announce-maint), 这里只做转发。
+            raw, berr, bcode = self._read_body()
+            if berr:
+                self._json({"ok": False, "msg": berr}, bcode)
+                return
+            try:
+                body = json.loads(raw.decode("utf-8")) if raw else {}
+            except Exception:  # noqa: BLE001
+                body = {}
+            acts = {"restart_service": "restart-service",
+                    "restore_substream": "restore-substream",
+                    "restore_mainstream": "restore-mainstream",
+                    "reboot": "reboot"}
+            act = body.get("action", "") if isinstance(body, dict) else ""
+            if act not in acts:
+                self._json({"ok": False, "msg": "未知运维操作: %r" % act}, 400)
+                return
+            try:
+                p = subprocess.run(MAINT_CMD + [acts[act]], capture_output=True,
+                                   timeout=90 if act.startswith("restore") else 30,
+                                   text=True)
+            except subprocess.TimeoutExpired:
+                # 重启主机时连接被掐断属正常
+                self._json({"ok": act == "reboot",
+                            "msg": "命令超时返回（重启主机时属正常）"})
+                return
+            out = ((p.stdout or "") + (p.stderr or "")).strip()
+            self._json({"ok": p.returncode == 0, "code": p.returncode,
+                        "msg": out[-1500:] or ("完成" if p.returncode == 0 else "失败")},
+                       200 if p.returncode == 0 else 500)
             return
         if u.path != "/api/save":
             self._json({"error": "not found"}, 404)

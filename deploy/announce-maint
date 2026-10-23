@@ -1,0 +1,67 @@
+#!/bin/bash
+# announce-maint —— Web 配置台「运维操作」执行体（sudo 白名单内）
+#
+# 由 config_web.py 的 POST /api/maint 调用（sudoers 只放行本脚本, 见
+# deploy/sudoers.announce-maint）。四个子命令:
+#   restart-service      重启播报服务 announce-rs
+#   restore-substream    恢复「辅码流可用版」(紧急回退: 旧二进制+辅码流配置)
+#   restore-mainstream   恢复「主码流正常版」(新二进制+备份时主码流配置)
+#   reboot               延迟 5 秒重启主机(留出时间把 HTTP 响应送回浏览器)
+#
+# 安全设计:
+#   * 恢复前把当前二进制+配置再留底一层到 backup/pre-restore-<时间戳>/,
+#     万一恢复错了还能一键翻回来(手工 cp 即可);
+#   * 恢复包文件缺失/为空时直接拒绝, 不停服务;
+#   * 不恢复 config_web.py —— 配置台保留最新版, 避免把新功能/安全修复一并回退。
+set -u
+OPT=/opt/announce-rs
+BK=$OPT/backup
+SVC=announce-rs
+
+say() { printf '[maint] %s\n' "$*"; }
+die() { printf '[maint] 错误: %s\n' "$*" >&2; exit 1; }
+
+case "${1:-}" in
+  restart-service)
+    systemctl restart "$SVC"
+    sleep 2
+    say "announce-rs 状态: $(systemctl is-active "$SVC")"
+    ;;
+
+  restore-substream|restore-mainstream)
+    if [ "$1" = restore-substream ]; then
+      PKG=$BK/substream-ok-1023
+    else
+      PKG=$BK/mainstream-ok-1023
+    fi
+    [ -s "$PKG/announce-rs" ] || die "恢复包缺二进制或为空: $PKG/announce-rs"
+    [ -s "$PKG/config.json" ] || die "恢复包缺配置或为空: $PKG/config.json"
+
+    # 当前版本留底(可回退)
+    PRE="$BK/pre-restore-$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$PRE"
+    cp -a "$OPT/announce-rs" "$PRE/" 2>/dev/null
+    cp -a "$OPT/config.json" "$PRE/" 2>/dev/null
+
+    systemctl stop "$SVC"
+    cp "$PKG/announce-rs" "$OPT/announce-rs"
+    cp "$PKG/config.json" "$OPT/config.json"
+    chown debian13:debian13 "$OPT/announce-rs" "$OPT/config.json"
+    chmod 755 "$OPT/announce-rs"
+    chmod 644 "$OPT/config.json"
+    systemctl start "$SVC"
+    sleep 2
+    say "已执行 $1, 恢复前版本留底: $PRE"
+    say "announce-rs 状态: $(systemctl is-active "$SVC")"
+    ;;
+
+  reboot)
+    say "主机将在 5 秒后重启…"
+    (sleep 5 && /usr/sbin/reboot) &
+    say "重启已排定。"
+    ;;
+
+  *)
+    die "用法: announce-maint {restart-service|restore-substream|restore-mainstream|reboot}"
+    ;;
+esac
