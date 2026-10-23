@@ -58,6 +58,14 @@ const GATE_FORCE_SECS: f64 = 20.0;
 const JUMP_INSTANT: u32 = 3;
 const JUMP_HARD_MAX: u32 = 30;
 
+/// 漏号补播窗口(2026-10-23 现场 GA126 事故): 两个窗口连续叫号时, 新号把旧号
+/// 顶到第 2 行, 若 OCR 在旧号的第 1 行任期内没凑齐确认(滚屏动画 + 确认轮耗时),
+/// 该号就卡在第 2 行 —— 提前退出不再读第 2 行、单调闸门只放行 v>last,
+/// 双重压制导致"叫了号却没播"。本窗口放行 (last-BACKFILL_MAX, last] 且
+/// 【当日从未播过】的候选; 已播过的屏上残留由当日去重表(开机从日志 seed)
+/// 挡住。K=5 覆盖两窗口紧挨着连续叫号的场景。
+const BACKFILL_MAX: u32 = 5;
+
 /// 跳幅 -> 额外需要的确认量。0 表示"够票即播, 不额外等"。
 /// 抽成自由函数便于单测: 这是现场调参的核心决策, 不能让口径藏在方法里。
 fn jump_extra_confirm(delta: u32, max_jump: u32) -> u32 {
@@ -311,13 +319,14 @@ fn announce_sort_key(n: &str, w: &str) -> (String, u32, String) {
 /// 若闸门没有基线, 第一轮就会把屏上那个"已经播过的号"再播一遍 —— 这正是
 /// 2026-10-21 13:56 现场听到的重复播报。只认当天记录, 避免跨天编号重置后
 /// 拿昨天的号码当基线, 把早上的低号码全挡在门外。
-fn seed_last_numbers(log_file: &str) -> HashMap<String, u32> {
+fn seed_last_numbers(log_file: &str) -> (HashMap<String, u32>, Vec<String>) {
     use chrono::Local;
-    let mut out = HashMap::new();
+    let mut base = HashMap::new();
+    let mut announced: Vec<String> = Vec::new();
     let today = Local::now().format("%Y-%m-%d").to_string();
     let text = match std::fs::read_to_string(log_file) {
         Ok(t) => t,
-        Err(_) => return out, // 首次部署还没有日志, 属正常
+        Err(_) => return (HashMap::new(), announced), // 首次部署还没有日志, 属正常
     };
     for line in text.lines().rev().take(4000) {
         // ★2026-10-23 低危修复: 400 行容易被"最后一条 OK 之后出现 400+ 行 INVALID"
@@ -330,12 +339,18 @@ fn seed_last_numbers(log_file: &str) -> HashMap<String, u32> {
         if !cols[0].trim().trim_start_matches('\u{feff}').starts_with(&today) {
             continue;
         }
-        if let Some((pre, v)) = split_num(cols[1].trim()) {
+        let num = cols[1].trim().to_string();
+        if let Some((pre, v)) = split_num(&num) {
             // 倒序扫描: 只认每个前缀"最新"的那条
-            out.entry(pre).or_insert(v);
+            base.entry(pre).or_insert(v);
         }
+        // 当日全部已播号灌回去重表: 配合漏号补播窗口(BACKFILL_MAX),
+        // 重启后屏上残留的"今天已播过"的老号不会被补播窗口误放行;
+        // 而重启前就被漏掉、日志里没有的号(如 GA126)不在表里, 重启后
+        // 仍能被补播 —— 语义正确。
+        announced.push(num);
     }
-    out
+    (base, announced)
 }
 
 /// 维护节拍用的"本地日"标识: Unix 秒 -> 本地日期(YYYY-MM-DD)。
@@ -427,6 +442,8 @@ impl Loop {
         // 检测框向下扩到覆盖 rows 行; 识别仍按 pitch 逐行裁。
         let det_roi = (roi.0, roi.1, roi.2, roi.3 + (rows - 1) * pitch);
         let now = now_secs();
+        // 开机 seed: 基线(每前缀最新 OK 号) + 当日全部已播号(灌去重表)。
+        let (seed_baselines, seed_announced) = seed_last_numbers(&cfg.log_file);
         Ok(Loop {
             interval: 1.0 / cfg.fps.max(0.1),
             need_stable: det.stable_frames,
@@ -449,7 +466,15 @@ impl Loop {
             prev_gray: None,
             roi_warned: false,
             // 已播报去重表: 带时间维度, 见 dedupe.rs 与字段注释。
-            announced: AgedMap::new(Expiry::from_ttl_sec(cfg.announced_ttl_sec), 4096),
+            // 开机先把当日日志里的 OK 号灌进来(漏号补播窗口的前提:
+            // 屏上"今天已播过"的残留必须靠这张表压住)。
+            announced: {
+                let mut m = AgedMap::new(Expiry::from_ttl_sec(cfg.announced_ttl_sec), 4096);
+                for n in seed_announced {
+                    m.insert(n, (), now);
+                }
+                m
+            },
             confirm: HashMap::new(),
             last_ocr_time: 0.0,
             active_until: 0.0,
@@ -476,7 +501,7 @@ impl Loop {
             last_announce: now,
             last_health_warn: now,
 
-            last_num: seed_last_numbers(&cfg.log_file),
+            last_num: seed_baselines,
             maint_day: local_day_of(now).unwrap_or_default(),
             mute_warned: false,
             day_reseed: false,
@@ -871,14 +896,17 @@ impl Loop {
     ///   约 24px 高, 行间还有色带分隔, tesseract 在整块上的版面切分一乱, 号码就断。
     ///   所以检测框覆盖多行、识别仍按单行做, 两者互不影响。
     ///
-    /// 提前退出: 第一行就命中"该播的号"时不再往下读 —— 最新号在最上面是常态,
-    /// 此时 OCR 次数与单行方案完全一样; 只有"最新号落到第 2/3 行"才会多读一两行。
+    /// 提前退出: ★2026-10-23 现场 GA126 事故后改为"所见皆已播才停" ——
+    /// 原条件(第 1 行命中 gate_accepts 的"该播的号"就停)会在新号顶到第 1 行时
+    /// 跳过第 2/3 行, 被连续叫号顶下去的漏号从此永远读不到。改为: 目前读到的
+    /// 候选全部已播过(纯稳态老号屏)才停 —— 稳态仍只读 1 行不费 CPU;
+    /// 有新号时多读两行, 恰好是要抓漏号的时机。
     ///
-    /// ★2026-10-23 低危注释(第八轮): 无基线(刚部署/跨日重置)时 gate_accepts 对
-    ///   任何号码都放行 -> 第一行只要有候选就提前退出, gate_filter 的"无基线取
-    ///   最大"只能看到首行候选。可接受: 业务上最新号就在首行, 取首行最大即正确;
-    ///   2/3 行未被读到的旧号本就应被闸门压住。若现场版式反过来(最新在底部),
-    ///   应把 rows 配准让首行命中不了候选, 自然会读完全部行。
+    /// ★2026-10-23 低危注释(第八轮): 无基线(刚部署/跨日重置)时新号必有候选,
+    ///   会继续读完 2/3 行; gate_filter 的"无基线取最大"仍只播最大号。
+    ///   可接受: 业务上最新号在首行, 2/3 行的残留号走补播窗口另有闸口。
+    ///   若现场版式反过来(最新在底部), 应把 rows 配准让首行命中不了候选,
+    ///   自然会读完全部行。
     fn recognize_candidates(
         &self,
         frame: &Arc<capture::Frame>,
@@ -887,7 +915,7 @@ impl Loop {
         let mut cands: HashSet<(String, String)> = HashSet::new();
         let mut raws: Vec<String> = Vec::new();
         for i in 0..rows {
-            if i > 0 && cands.iter().any(|c| self.gate_accepts(&c.0)) {
+            if i > 0 && cands.iter().all(|c| self.announced.contains_key(&c.0)) {
                 break;
             }
             let y = self.roi.1 + i * self.pitch;
@@ -1034,7 +1062,10 @@ impl Loop {
         }
     }
 
-    /// 单个号码是否"够格播"(纯判定, 不改状态)。逐行识别时用它判断要不要继续往下读。
+    /// 单个号码是否"够格播"(纯判定, 不改状态)。
+    /// ★2026-10-23 起不再被提前退出使用(条件已反转为"所见皆已播"),
+    /// 保留作闸门语义的文档与未来调用点, 抑制 dead_code 告警。
+    #[allow(dead_code)]
     fn gate_accepts(&self, number: &str) -> bool {
         if self.max_jump == 0 {
             return true;
@@ -1114,6 +1145,12 @@ impl Loop {
                             any = true;
                         } else if *v > last {
                             blocked.push(format!("{}(+{})", n, *v - last));
+                        } else if *v + BACKFILL_MAX > last && !self.announced.contains_key(n) {
+                            // ★漏号补播(2026-10-23 现场 GA126 事故): 见 BACKFILL_MAX 注释。
+                            // 紧贴基线下方 + 当日从未播过才放行; 已播过的屏上残留
+                            // 被开机 seed 的当日去重表挡住, 不会重播。
+                            out.insert((n.clone(), w.clone()));
+                            any = true;
                         }
                     }
                     // 兜底: 长时间一句没播, 而又有"更大的号"被硬上限挡住
@@ -1145,7 +1182,17 @@ impl Loop {
     /// 记一次成功播报, 推进闸门基线。
     fn note_announced(&mut self, number: &str) {
         if let Some((pre, v)) = split_num(number) {
-            self.last_num.insert(pre, v);
+            // ★基线不回退: 补播漏号(GA126 在 GA127 之后才播)会把基线往回拉,
+            // 补播窗口 (last-5, last] 随之重新拉开, 可能引发连环补播。
+            // 基线始终取该前缀的历史最大; 补播号只进去重表防重播。
+            self.last_num
+                .entry(pre)
+                .and_modify(|e| {
+                    if v > *e {
+                        *e = v;
+                    }
+                })
+                .or_insert(v);
         }
     }
 

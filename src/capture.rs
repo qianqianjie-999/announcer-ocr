@@ -353,10 +353,13 @@ impl Drop for PipeGrabber {
     }
 }
 
+// 现场工具链是 Rust 1.85(离线无法升级), 而 as_chunks_mut 需 1.88+ 才稳定,
+// 故保留 chunks_exact_mut 写法。两者语义等价(都是按 3 字节切、丢弃尾部不足一组);
+// clippy 1.99 的 chunks_exact_to_as_chunks 建议在此显式豁免, 兼顾新旧工具链。
+#[allow(clippy::chunks_exact_to_as_chunks)]
 fn to_rgb(bgr: &mut [u8]) {
-    // clippy 1.99 起 chunks_exact_mut(常量) 会被 chunks_exact_to_as_chunks 拦下,
-    // 按建议改 as_chunks_mut::<3>: 每 3 字节一个 BGR 像素, 首尾交换成 RGB。
-    for px in bgr.as_chunks_mut::<3>().0 {
+    // 每 3 字节一个 BGR 像素, 首尾交换成 RGB。
+    for px in bgr.chunks_exact_mut(3) {
         px.swap(0, 2);
     }
 }
