@@ -1110,6 +1110,14 @@ fetch('/api/config').then(r=>r.json()).then(d=>{cfgRev=d.rev||null;fillForm(d);}
 scanUsb();loadAudio();loadTime();
 // 服务器时间每 30 秒与后端对齐一次(平时靠本地单调时钟推算, 不打请求)
 setInterval(loadTime,30000);
+// 播报日志尾部自动刷新(5s): 现场盯日志不用再手动点「刷新」。
+// 页面切到后台时跳过, 不空转; 回前台后下一轮自然恢复。
+setInterval(()=>{
+ if(document.hidden)return;
+ fetch('/api/status').then(r=>r.json()).then(d=>{
+  $('logbox').textContent=d.log||'(暂无日志)';
+ }).catch(()=>{});
+},5000);
 refresh();loadNet();
 // ★默认不进实时预览: 小主机只有 4 核赛扬, 持续刷帧会和 OCR/TTS 抢 CPU(现场反馈"开着就卡")。
 //   这里只在打开页面时抓**一张静帧**(开销 = 一次缩图编码), 好让画面不为空、能直接拖 ROI;
