@@ -262,6 +262,12 @@ struct Loop {
      */
     /// 每个前缀(GA/G…)上次已播报的号码数值。
     last_num: HashMap<String, u32>,
+    /// ★2026-10-23 中危修复(第八轮): 跨日重置已发生、正等待"首个候选"的标记。
+    /// 24h 连跑时零点维护节拍清空 last_num, 但屏上还停着昨天的尾号(如 GA352) ——
+    /// 旧版任由它走"无基线取最大"直接播报: 零点误播 + 基线被毒化成 352,
+    /// 次日 GA001 起全天被闸门(v>last 才放行)静默吞掉。标记生效期间首个无基线
+    /// 候选只进当日去重表(不播/不写OK日志/不动基线), 详见 seed_only_after_reset。
+    day_reseed: bool,
     /// 跳幅上限。0 = 关闭闸门。
     max_jump: u32,
     /// 闸门拦截日志节流时刻(被拦的号每 10s 最多打一行, 防刷屏)。
@@ -286,6 +292,17 @@ fn split_num(number: &str) -> Option<(String, u32)> {
         return None;
     }
     digits.parse::<u32>().ok().map(|v| (pre.to_string(), v))
+}
+
+/// 同批播报的排序键: (前缀, 数值, 窗口)。
+/// ★2026-10-23 低危修复(第八轮): 旧版按字符串排, "GA10" < "GA9"('1'<'9'),
+///   同批确认多个号时 GA10 抢在 GA9 前播 —— 与现场"小号先叫"的业务顺序相反。
+///   拆不出数字段的候选(理论上不会出现, pattern 已保证 \d)退回按原串排兜底。
+fn announce_sort_key(n: &str, w: &str) -> (String, u32, String) {
+    match split_num(n) {
+        Some((pre, v)) => (pre, v, w.to_string()),
+        None => (n.to_string(), 0, w.to_string()),
+    }
 }
 
 /// 启动时从播报日志(CSV)恢复"今天最后一次成功播报的号码"。
@@ -347,6 +364,13 @@ fn gate_day_rollover(last_day: &mut String, today: Option<String>) -> bool {
         }
         _ => false,
     }
+}
+
+/// 跨日重置标记下的候选判定(纯函数, 供单测): 该候选是否"只标记不播报"。
+/// 仅"标记生效 且 前缀尚无基线"时成立 —— 已有基线的候选(理论上刚清完不会有,
+/// 但首日真号先于残留号到达时可能已 note_announced)走正常播报, 不被误吞。
+fn seed_only_decide(day_reseed: bool, has_baseline: bool) -> bool {
+    day_reseed && !has_baseline
 }
 
 /// 作息闸判定(纯函数, 便于单测): 当前 "HH:MM" 是否落在 start~end 工作窗口内。
@@ -455,6 +479,7 @@ impl Loop {
             last_num: seed_last_numbers(&cfg.log_file),
             maint_day: local_day_of(now).unwrap_or_default(),
             mute_warned: false,
+            day_reseed: false,
             max_jump: det.max_jump,
             gate_log_at: 0.0,
 
@@ -706,10 +731,14 @@ impl Loop {
         if hit.is_empty() {
             return;
         }
-        // 元组含 f64(无 Ord), 按"号码+窗口"排序保证播报顺序稳定。
-        hit.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        // 元组含 f64(无 Ord), 走排序键: (前缀, 数值, 窗口) —— 数值序与业务编号
+        // 顺序一致(GA9 先于 GA10), 字符串序会把 GA10 排到 GA9 前(第八轮低危)。
+        hit.sort_by(|a, b| announce_sort_key(&a.0, &a.1).cmp(&announce_sort_key(&b.0, &b.1)));
         let t_ann = now_secs();
         for (number, window, _votes, first, _last) in hit {
+            if self.seed_only_after_reset(&number, t_ann) {
+                continue;
+            }
             let extra = self.jump_extra(&number); // 必须在 note_announced 之前算
             self.announced.insert(number.clone(), (), t_ann);
             self.note_announced(&number);
@@ -728,6 +757,9 @@ impl Loop {
                 extra
             );
         }
+        // 首批候选处理完即清跨日标记 —— 残留号已进当日去重表, 后续轮次由去重表
+        // 接管压制; 次日真号(如 GA001)走"无基线取最大"照常播报, 不再被本标记误吞。
+        self.day_reseed = false;
         // 已无待确认候选: 撤观察期。否则 active_until 还会让主循环
         // 再空跑一轮"确认 OCR"(2~5s CPU), 白占机器。
         self.active_until = 0.0;
@@ -841,6 +873,12 @@ impl Loop {
     ///
     /// 提前退出: 第一行就命中"该播的号"时不再往下读 —— 最新号在最上面是常态,
     /// 此时 OCR 次数与单行方案完全一样; 只有"最新号落到第 2/3 行"才会多读一两行。
+    ///
+    /// ★2026-10-23 低危注释(第八轮): 无基线(刚部署/跨日重置)时 gate_accepts 对
+    ///   任何号码都放行 -> 第一行只要有候选就提前退出, gate_filter 的"无基线取
+    ///   最大"只能看到首行候选。可接受: 业务上最新号就在首行, 取首行最大即正确;
+    ///   2/3 行未被读到的旧号本就应被闸门压住。若现场版式反过来(最新在底部),
+    ///   应把 rows 配准让首行命中不了候选, 自然会读完全部行。
     fn recognize_candidates(
         &self,
         frame: &Arc<capture::Frame>,
@@ -1111,6 +1149,35 @@ impl Loop {
         }
     }
 
+    /// ★2026-10-23 中危修复(第八轮): 跨日重置后的"首个无基线候选"只标记不播报。
+    ///
+    /// 场景: 24h 连跑, 零点 maintenance 清空 last_num, 屏上却停着昨日尾号 GA352。
+    /// 闸门"无基线取最大"会把它放行进播报 —— 零点误播, 且 note_announced 把基线
+    /// 毒化成 352, 次日 GA001 起全天被 (v>last 才放行) 静默吞掉(强放兜底也只放
+    /// v>last, 救不回小号)。
+    ///
+    /// 处理: 只进当日去重表(后续轮次被 announced.contains_key 压住), 不 speak、
+    /// 不写 OK 日志(写了会被 seed_last_numbers 当基线捡回去)、不动 last_num ——
+    /// 基线留给次日第一个真号(GA001 走"无基线取最大"正常播报并播种)。
+    /// 与 seed_last_numbers "只播种不播报"语义对齐: 播种的目的都是防误播,
+    /// 而非替号码"认领"播报资格。
+    ///
+    /// 返回 true 表示已按"只标记"处理, 调用方应跳过后续播报动作。
+    fn seed_only_after_reset(&mut self, number: &str, now: f64) -> bool {
+        let has_baseline = split_num(number)
+            .map(|(pre, _)| self.last_num.contains_key(&pre))
+            .unwrap_or(false);
+        if !seed_only_decide(self.day_reseed, has_baseline) {
+            return false;
+        }
+        self.announced.insert(number.to_string(), (), now);
+        println!(
+            "[闸门] 跨日重置: 候选 {} 只标记不播报(屏上昨日残留, 防零点误播与基线毒化)",
+            number
+        );
+        true
+    }
+
     /// 按【号码】票决后播报: 票数达到 need_stable 且该号码未播报过才入队。
     /// 聚合口径见 number_votes() —— 同一号码的多个窗口候选并成一票, 只播一次。
     fn announce_winners(&mut self, raw: &str, now: f64, iter_secs: f64) {
@@ -1123,11 +1190,15 @@ impl Loop {
             return;
         }
         let mut winners = number_votes(&self.confirm);
-        winners.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        // 同 fast_confirm: 数值序播报(GA9 先于 GA10), 不用字符串序(第八轮低危)。
+        winners.sort_by(|a, b| announce_sort_key(&a.0, &a.1).cmp(&announce_sort_key(&b.0, &b.1)));
         for (number, window, votes, first, _last) in winners {
             // 跳幅大 -> 多要几票(每票≈一轮 OCR), 防过渡帧/反光残影把大号送出去。
             let extra = self.jump_extra(&number);
             if votes < self.need_stable + extra || self.announced.contains_key(&number) {
+                continue;
+            }
+            if self.seed_only_after_reset(&number, now) {
                 continue;
             }
             self.announced.insert(number.clone(), (), now);
@@ -1144,6 +1215,8 @@ impl Loop {
                 iter_secs
             );
         }
+        // 同 fast_confirm: 首批处理完清跨日标记, 去重表接管残留号的后续压制。
+        self.day_reseed = false;
     }
 
     /// 记一轮 OCR 的耗时进诊断窗口(诊断心跳的 [监测] 行用)。
@@ -1216,6 +1289,9 @@ impl Loop {
         if gate_day_rollover(&mut self.maint_day, local_day_of(now)) && !self.last_num.is_empty() {
             println!("[闸门] 跨日重置号码基线 {:?} (去重表已按日清零, 基线跟随)", self.last_num);
             self.last_num.clear();
+            // ★2026-10-23 中危修复(第八轮): 置"等待首个候选"标记 —— 屏上若还停着
+            // 昨日尾号, 首个无基线候选只标记不播报(见 seed_only_after_reset)。
+            self.day_reseed = true;
         }
         let n_ann = self.announced.prune(now);
         let n_raw = self.cand_raw.prune(now);
@@ -1373,8 +1449,9 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        drop_shadow_empty, effective_ttl, gate_day_rollover, in_work_window, jump_extra_confirm,
-        number_votes, resolve_row_pitch, settle_ready, SETTLE_MAX_WAIT_SECS,
+        announce_sort_key, drop_shadow_empty, effective_ttl, gate_day_rollover, in_work_window,
+        jump_extra_confirm, number_votes, resolve_row_pitch, seed_only_decide, settle_ready,
+        SETTLE_MAX_WAIT_SECS,
     };
     use std::collections::{HashMap, HashSet};
 
@@ -1619,6 +1696,35 @@ mod tests {
         assert!(!gate_day_rollover(&mut day, Some("2026-10-23".into())));
         assert_eq!(day, "2026-10-23");
         assert!(gate_day_rollover(&mut day, Some("2026-10-24".into())));
+    }
+
+    // ———— 跨日重置后"首个无基线候选只标记不播报"(2026-10-23 第八轮中危) ————
+    #[test]
+    fn seed_only_only_when_marked_and_no_baseline() {
+        // 标记未置: 正常播报(不拦)
+        assert!(!seed_only_decide(false, false));
+        assert!(!seed_only_decide(false, true));
+        // 标记生效 + 无基线: 只标记不播报(屏上昨日残留号的处理)
+        assert!(seed_only_decide(true, false));
+        // 标记生效但前缀已有基线(首日真号已 note_announced): 不吞后续真号
+        assert!(!seed_only_decide(true, true));
+    }
+
+    // ———— 同批播报数值序(2026-10-23 第八轮低危): GA9 必须先于 GA10 ————
+    #[test]
+    fn announce_sort_key_numeric_not_lexical() {
+        let mut v = vec![
+            ("GA10".to_string(), "C01".to_string()),
+            ("GA9".to_string(), "C02".to_string()),
+            ("GA100".to_string(), "C01".to_string()),
+        ];
+        v.sort_by(|a, b| announce_sort_key(&a.0, &a.1).cmp(&announce_sort_key(&b.0, &b.1)));
+        let order: Vec<&str> = v.iter().map(|x| x.0.as_str()).collect();
+        assert_eq!(order, vec!["GA9", "GA10", "GA100"], "数值序: 小号先播");
+        // 同号不同窗口: 窗口号字符串序兜底(稳定即可)
+        assert!(announce_sort_key("GA9", "C01") < announce_sort_key("GA9", "C02"));
+        // 拆不出数字段的候选退回原串排序, 不 panic
+        let _ = announce_sort_key("NODIGIT", "C01");
     }
 
     #[test]

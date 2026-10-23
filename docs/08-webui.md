@@ -53,7 +53,7 @@ POST /api/time             手工校时(写请求, announce-time.timer 每 5s �
 | sudoers 窄授权 | `/etc/sudoers.d/announce-web` 只放行 3 条命令：`systemctl restart announce-rs`、`announce-schedule-apply`（排班应用）、`announce-net-apply.sh`（网络配置，脚本内自带 `valid_host` 严格参数校验）。完整片段见 `deploy/sudoers.announce-web`（2026-10-23 修复：net-apply 一直未授权导致网络页必失败）。Web 进程即使被攻破也只能执行这三个白名单动作 |
 | `validate_rtsp` 纵深防御 | 非法 RTSP 源在入口和 ffmpeg 调用前各拦一道（防内网 SSRF 类探测） |
 | 请求体上限 | 全部 POST 端点经 `_read_body`：负/非法 Content-Length 400，超 64KB 413 并断开连接（防 `read(-1)` 挂线程与内存打爆） |
-| 同源校验 | POST 入口校验 Origin/Referer 与 Host 一致（防跨站页面触发改配置/断网） |
+| 同源校验 | POST 入口校验 Origin/Referer 与 Host 一致（防跨站页面触发改配置/断网）。**残余风险（2026-10-23 第八轮声明，接受不修）**：同源模型防不住 DNS rebinding —— 攻击者控制域名先解析到攻击站发页面、再改解析到 192.168.x.x 靶机，浏览器同源判定通过。现场缓解靠部署形态（无认证调试台只接内网、不暴露公网、 attacker 需先能控制用户访问的域名/DNS）；若未来暴露到不可信网络，必须加认证而不是叠更多 header 校验 |
 | 乐观锁 | `/api/config` 下发内容指纹 `rev`，保存时校验，两窗口并发保存后者被 409 拦下 |
 | 配置原子写 | tmp + `os.replace`，主服务/配置器永不读到半截 config.json |
 | `CONFIG_LOCK` 串行化 | 多浏览器同时保存不互相踩 |

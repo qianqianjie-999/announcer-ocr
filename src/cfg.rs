@@ -212,6 +212,53 @@ impl Config {
                 self.capture_width, self.capture_height
             ));
         }
+        // ★2026-10-23 中危修复(第八轮): 全部 f64 字段拒非有限值(NaN/±inf)。
+        // 实测本版 serde_json 对 1e999 直接报 "number out of range"(JSON 层已挡),
+        // 本校验是第二道防线: ① 防未来 serde 行为变化/程序化构造 Config;
+        // ② fps<=0 这类"有限但致命"的值 JSON 层不挡。NaN/inf 与任何数比较恒
+        // false, 依赖这些字段的范围/超时判断会全部形同虚设(changed_ratio=NaN
+        // -> 帧差判定全灭, 服务一声不响)。宁可拒启, 不带病运行。
+        let checks: [(&str, f64); 16] = [
+            ("fps", self.fps),
+            ("frame_stale_sec", self.frame_stale_sec),
+            ("health_alert_min", self.health_alert_min),
+            ("diag_every_sec", self.diag_every_sec),
+            ("announced_ttl_sec", self.announced_ttl_sec),
+            ("log_max_mb", self.log_max_mb),
+            ("detect.diff_threshold", self.detect.diff_threshold),
+            ("detect.changed_ratio", self.detect.changed_ratio),
+            ("detect.confirm_ttl_sec", self.detect.confirm_ttl_sec),
+            ("detect.active_sec", self.detect.active_sec),
+            ("detect.min_interval_sec", self.detect.min_interval_sec),
+            ("detect.fallback_ocr_sec", self.detect.fallback_ocr_sec),
+            ("detect.static_fb_sec", self.detect.static_fb_sec),
+            ("detect.settle_sec", self.detect.settle_sec),
+            ("detect.row_pitch_ratio", self.detect.row_pitch_ratio),
+            ("tts.gap_sec", self.tts.gap_sec),
+        ];
+        for (name, v) in checks {
+            if !v.is_finite() {
+                return Err(format!(
+                    "{} 必须是有限数值(当前 {}): NaN/inf 会让依赖它的比较全部失效",
+                    name, v
+                ));
+            }
+        }
+        if let Some(ls) = self.tts.piper_length_scale {
+            if !ls.is_finite() {
+                return Err(format!(
+                    "tts.piper_length_scale 必须是有限数值(当前 {})",
+                    ls
+                ));
+            }
+        }
+        // fps ≤ 0: 主循环帧间隔 1/fps 非正 -> 忙等烧满一核, 与 0 尺寸同型故障。
+        if self.fps <= 0.0 {
+            return Err(format!(
+                "fps 必须为正数(当前 {}): 0/负值会让主循环忙等烧 CPU",
+                self.fps
+            ));
+        }
         Ok(())
     }
 
@@ -316,6 +363,102 @@ mod tests {
             Err(e) => panic!("默认配置不应被拒: {e}"),
         };
         assert!(cfg.capture_width > 0 && cfg.capture_height > 0);
+        std::fs::remove_file(&p).ok();
+    }
+
+    // ———— 非有限浮点拒绝(2026-10-23 第八轮中危) ————
+    // 实测本版 serde_json 对 1e999 直接报 "number out of range"(JSON 层已挡),
+    // 但 validate 是程序化构造/未来 serde 行为变化下的第二道防线, 仍按纯函数单测。
+
+    /// 默认配置上把某字段改成给定值后跑 validate, 返回 Err 文案。
+    fn validate_err_with(set: impl Fn(&mut Config)) -> String {
+        let mut cfg = Config::default();
+        // Default derive 不给 serde 默认值: 尺寸是 0, 会先触发尺寸校验, 补成合法值
+        cfg.capture_width = 1920;
+        cfg.capture_height = 1080;
+        set(&mut cfg);
+        match cfg.validate() {
+            Err(e) => e,
+            Ok(_) => panic!("配置应被 validate 拒绝"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_non_finite_fps() {
+        for bad in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            let err = validate_err_with(|c| c.fps = bad);
+            assert!(err.contains("fps") && err.contains("有限"), "错误应可读: {err}");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_non_positive_fps() {
+        for bad in [0.0, -2.5] {
+            let err = validate_err_with(|c| c.fps = bad);
+            assert!(err.contains("fps 必须为正数"), "错误应可读: {err}");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_non_finite_detect_fields() {
+        let cases: [(&str, fn(&mut Config, f64)); 9] = [
+            ("diff_threshold", |c, v| c.detect.diff_threshold = v),
+            ("changed_ratio", |c, v| c.detect.changed_ratio = v),
+            ("confirm_ttl_sec", |c, v| c.detect.confirm_ttl_sec = v),
+            ("active_sec", |c, v| c.detect.active_sec = v),
+            ("min_interval_sec", |c, v| c.detect.min_interval_sec = v),
+            ("fallback_ocr_sec", |c, v| c.detect.fallback_ocr_sec = v),
+            ("static_fb_sec", |c, v| c.detect.static_fb_sec = v),
+            ("settle_sec", |c, v| c.detect.settle_sec = v),
+            ("row_pitch_ratio", |c, v| c.detect.row_pitch_ratio = v),
+        ];
+        for (name, set) in cases {
+            let err = validate_err_with(|c| set(c, f64::NAN));
+            assert!(err.contains(name), "{name}: 错误信息应指名字段: {err}");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_non_finite_top_level_fields() {
+        let cases: [(&str, fn(&mut Config, f64)); 5] = [
+            ("frame_stale_sec", |c, v| c.frame_stale_sec = v),
+            ("health_alert_min", |c, v| c.health_alert_min = v),
+            ("diag_every_sec", |c, v| c.diag_every_sec = v),
+            ("announced_ttl_sec", |c, v| c.announced_ttl_sec = v),
+            ("log_max_mb", |c, v| c.log_max_mb = v),
+        ];
+        for (name, set) in cases {
+            let err = validate_err_with(|c| set(c, f64::INFINITY));
+            assert!(err.contains(name), "{name}: 错误信息应指名字段: {err}");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_non_finite_tts_fields() {
+        let err = validate_err_with(|c| c.tts.gap_sec = f64::INFINITY);
+        assert!(err.contains("gap_sec"), "错误应可读: {err}");
+        let err = validate_err_with(|c| c.tts.piper_length_scale = Some(f64::NAN));
+        assert!(err.contains("piper_length_scale"), "错误应可读: {err}");
+    }
+
+    #[test]
+    fn json_out_of_range_float_rejected_at_parse() {
+        // 实证(2026-10-23): serde_json 对 1e999 报 "number out of range",
+        // 非有限值在 JSON 解析层已被拦 —— validate 的 is_finite 是纵深防御。
+        let err = expect_load_err(r#"{"fps": 1e999}"#);
+        assert!(err.contains("配置解析失败"), "解析层应拒绝: {err}");
+    }
+
+    #[test]
+    fn load_accepts_normal_finite_values() {
+        // 防御不能误伤: 正常有限值(含 0 语义的 health_alert_min=0 关闭告警)照常通过
+        let p = write_tmp_cfg(
+            r#"{"fps": 5, "health_alert_min": 0, "detect": {"settle_sec": 0.5, "row_pitch_ratio": 1.0}, "tts": {"gap_sec": 0.35, "piper_length_scale": 1.2}}"#,
+        );
+        match Config::load(&p) {
+            Ok(_) => {}
+            Err(e) => panic!("正常有限值不应被拒: {e}"),
+        }
         std::fs::remove_file(&p).ok();
     }
 }

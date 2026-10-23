@@ -57,23 +57,44 @@ def load_cfg():
             return json.load(f)
 
 
-def save_cfg(cfg):
+def _save_cfg_locked(cfg):
+    """落盘本体, 调用方必须已持有 CONFIG_LOCK(save_cfg / save_cfg_if_rev 复用)。"""
     tmp = CONFIG + ".tmp"
-    with CONFIG_LOCK:
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            # ★allow_nan=False(2026-10-22 第三轮审查): nan/inf 一旦落盘成字面量
+            #   NaN/Infinity, 主服务 serde_json 拒读 config.json → announce-rs
+            #   启动即崩循环; Python json.load 又宽容读得回, 页面看不出异常。
+            #   写出前就抛错(原子写保证旧配置原样), 异常路径清掉半截 tmp。
+            json.dump(cfg, f, ensure_ascii=False, indent=2, allow_nan=False)
+    except ValueError:
         try:
-            with open(tmp, "w", encoding="utf-8") as f:
-                # ★allow_nan=False(2026-10-22 第三轮审查): nan/inf 一旦落盘成字面量
-                #   NaN/Infinity, 主服务 serde_json 拒读 config.json → announce-rs
-                #   启动即崩循环; Python json.load 又宽容读得回, 页面看不出异常。
-                #   写出前就抛错(原子写保证旧配置原样), 异常路径清掉半截 tmp。
-                json.dump(cfg, f, ensure_ascii=False, indent=2, allow_nan=False)
-        except ValueError:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
-        os.replace(tmp, CONFIG)  # 原子替换, 主服务/配置器永不读到半截文件
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    os.replace(tmp, CONFIG)  # 原子替换, 主服务/配置器永不读到半截文件
+
+
+def save_cfg(cfg):
+    with CONFIG_LOCK:
+        _save_cfg_locked(cfg)
+
+
+def save_cfg_if_rev(cfg, got_rev):
+    """乐观锁保存: rev 比对与落盘在同一把 CONFIG_LOCK 临界区内完成。
+
+    ★2026-10-23 低危修复(第八轮): 旧版 config_rev() 在锁外读指纹、save_cfg()
+    再单独拿锁 —— check-then-act 不原子, 两个窗口并发保存会都通过 rev 校验,
+    后写整份覆盖先写(乐观锁形同虚设)。现在比对+落盘同一临界区, 冲突必有一方 409。
+    返回 (ok, err): ok=False 即 rev 冲突, 调用方回 409。
+    """
+    with CONFIG_LOCK:
+        if got_rev and got_rev != config_rev():
+            return False, ("配置已被其他窗口修改，为避免覆盖他人改动已拒绝保存；"
+                           "请刷新页面重新加载后再编辑")
+        _save_cfg_locked(cfg)
+        return True, None
 
 
 def config_rev(path=None):
@@ -415,11 +436,19 @@ def validate_and_build(body):
 
         det = body["detect"]
         d = dict(cur_det)
+        # ★2026-10-23 高危修复(第八轮): stable_frames 加值域校验(与页面 min=1 max=5
+        # 同口径)。旧版 int() 直接落盘, 攻击者/误操作可 curl 送 0 或 10^9:
+        # Rust 侧虽是 u32 能解析, 但 0=关闭确认(每帧都当新号播)、超大=永不确认
+        # (永不播报), 保存即生效、Web 自动重启服务, 毒药配置立即致命。
+        # 越界拒绝保存(return 错误文案), 不静默钳 —— 静默钳会让用户以为填的值生效了。
+        sf = int(det["stable_frames"])
+        if not (1 <= sf <= 5):
+            return None, "stable_frames 需在 1~5 之间（与页面输入范围一致）"
         d.update({
             "diff_threshold": _finite(det["diff_threshold"], "diff_threshold"),
             "changed_ratio": _finite(det["changed_ratio"], "changed_ratio"),
             "fallback_ocr_sec": _finite(det["fallback_ocr_sec"], "fallback_ocr_sec"),
-            "stable_frames": int(det["stable_frames"]),
+            "stable_frames": sf,
             "confirm_ttl_sec": _finite(det["confirm_ttl_sec"], "confirm_ttl_sec"),
             "active_sec": _finite(det["active_sec"], "active_sec"),
         })
@@ -467,10 +496,20 @@ def validate_and_build(body):
 
         tt = body["tts"]
         t = dict(cur_tts)
+        # ★2026-10-23 高危修复(第八轮): repeat/rate 与页面 min/max 同口径校验。
+        # 旧版 repeat 只钳下限(max(1,..))、rate 完全不校验: repeat=10^9 会让一句
+        # 播报循环到天荒地老(aplay 占住声卡, 后续播报全部排队); rate 是 espeak
+        # 语速, 超界值直接让 espeak 报错退出、播报静默丢失。越界拒绝保存。
+        rep = int(tt["repeat"])
+        if not (1 <= rep <= 5):
+            return None, "repeat 需在 1~5 之间（与页面输入范围一致）"
+        rate = int(tt["rate"])
+        if not (80 <= rate <= 250):
+            return None, "rate 需在 80~250 之间（与页面输入范围一致）"
         t.update({
             "enabled": bool(tt["enabled"]),
-            "repeat": max(1, int(tt["repeat"])),
-            "rate": int(tt["rate"]),
+            "repeat": rep,
+            "rate": rate,
             "spell_number": bool(tt.get("spell_number", False)),
             "speak_window_letter": bool(tt.get("speak_window_letter", False)),
         })
@@ -493,16 +532,34 @@ def validate_and_build(body):
 
         oc = body["ocr"]
         o = dict(cur_ocr)
+        # ★2026-10-23 高危修复(第八轮): psm 与页面 min=3 max=13 同口径校验。
+        # tesseract 只认 0~13, 页面又进一步限到 3~13; 超界值会让 tesseract 每次
+        # 调用都报错退出 -> OCR 全灭、服务一声不响。越界拒绝保存。
+        psm = int(oc["psm"])
+        if not (3 <= psm <= 13):
+            return None, "psm 需在 3~13 之间（与页面输入范围一致）"
         o.update({
             "bin": "tesseract",
             "lang": str(oc.get("lang", cur_ocr.get("lang", "chi_sim"))),
-            "psm": int(oc["psm"]),
+            "psm": psm,
         })
         o.setdefault("dpi", 150)
         # pattern(正则模板)刻意不在页面上编辑(改错会漏播): 页面未上送时沿用现有配置
         pat = oc.get("pattern", cur_ocr.get("pattern"))
         if not isinstance(pat, list) or not pat:
             return None, "ocr.pattern 缺失：该字段页面不可编辑，请先在 config.json 中配置正则模板"
+        # ★2026-10-23 高危修复(第八轮): pattern 逐条校验 —— 旧版只查"非空 list",
+        # 攻击者 curl 送 [123] 或 ["("] 这类坏正则, Rust 侧 Regex::new 失败 ->
+        # Config::load Err -> systemd Restart=always 崩溃死循环(服务永远起不来)。
+        # 这里用 Python re 预编译把关(Pyre 与 Rust regex 语法对本场景的差异可忽略:
+        # 现场模板都是 \d/[]/() 基础语法)。
+        if not all(isinstance(p, str) for p in pat):
+            return None, "ocr.pattern 元素必须全部是字符串"
+        for p in pat:
+            try:
+                re.compile(p)
+            except re.error as e:
+                return None, "ocr.pattern 正则无法编译: %r (%s)" % (p, e)
         o["pattern"] = pat
 
         # 工作时间调度（页面可编辑）。存成 schedule 段；真正生效由
@@ -1628,7 +1685,10 @@ class Handler(BaseHTTPRequestHandler):
                 q = urllib.parse.parse_qs(u.query)
                 cfg = load_cfg()
                 src = (q.get("src") or [cfg["camera_source"]])[0]
-                src = urllib.parse.unquote(src)
+                # ★2026-10-23 中危修复(第八轮): 删掉旧版这里的 unquote —— parse_qs
+                # 已经做过一次百分号解码, 再解一次就是双重解码: RTSP 密码里的
+                # "p%41x"(原义字符) 经页面编码 -> "p%2541x", parse_qs 解回 "p%41x",
+                # 又一次 unquote 变成 "pAx", 密码被静默改写, 快照 401 还查不出原因。
                 src = norm_src(src)
                 # ★安全: src 直接进 ffmpeg 命令, 必须过白名单(见 validate_rtsp 注释)。
                 #   否则可构造伪协议读本机任意文件。
@@ -1814,18 +1874,22 @@ class Handler(BaseHTTPRequestHandler):
         #   内容指纹 __rev, 与当前不一致就拒绝 —— 提示刷新重载, 不做自动合并
         #   (配置字段间有关联, 盲合并同样危险)。不带 __rev 的调用(脚本工具)不拦,
         #   保持兼容。
-        got_rev = None
-        if isinstance(body, dict):
-            got_rev = body.pop("__rev", None)
-            if got_rev and got_rev != config_rev():
-                self._json({"error": "配置已被其他窗口修改，为避免覆盖他人改动已拒绝保存；"
-                            "请刷新页面重新加载后再编辑"}, 409)
-                return
+        # ★2026-10-23 低危修复(第八轮): rev 比对挪进 save_cfg_if_rev, 与落盘同一
+        #   CONFIG_LOCK 临界区(check-then-act 原子化); save 异常兜底 500,
+        #   不再让异常逃逸把连接硬断(与 do_GET 各分支同口径)。
+        got_rev = body.pop("__rev", None) if isinstance(body, dict) else None
         cfg, err = validate_and_build(body)
         if cfg is None:
             self._json({"error": err}, 400)
             return
-        save_cfg(cfg)
+        try:
+            ok, cerr = save_cfg_if_rev(cfg, got_rev)
+        except Exception as e:  # noqa: BLE001
+            self._json({"error": "保存失败: %s" % e}, 500)
+            return
+        if not ok:
+            self._json({"error": cerr}, 409)
+            return
         # 优先走工作时间调度脚本：它会「写 systemd timer + 按当前时刻校正运行状态」，
         # 未启用调度时退化为 restart，与旧行为等价。失败再退回直接重启，保证配置至少生效。
         sched = cfg.get("schedule") or {}

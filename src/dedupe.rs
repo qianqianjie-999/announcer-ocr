@@ -76,6 +76,12 @@ impl<K: Eq + Hash + Clone, V: Clone> AgedMap<K, V> {
         AgedMap { map: HashMap::new(), expiry, cap }
     }
 
+    /// ★时效语义(2026-10-23 第八轮注释): 本方法**不看 TTL** —— 只要键还在表里就
+    /// 返回 true, 哪怕时间戳已早于清理下界。过期判定只发生在 prune(now) 被调用时
+    /// (主循环 maintenance 周期触发)。所以 Rolling TTL 的实际去重窗口是
+    /// [ttl, ttl + prune 间隔], DailyMidnight 是 [零点, 零点 + prune 间隔] ——
+    /// 属刻意的"延迟清理"(去重宁可偏严不可漏播), 不是 bug; 调用方不要指望
+    /// contains_key 做实时过期判断。
     pub fn contains_key(&self, k: &K) -> bool {
         self.map.contains_key(k)
     }

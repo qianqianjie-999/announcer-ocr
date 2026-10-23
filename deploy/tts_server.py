@@ -132,6 +132,13 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 self._send("Content-Length 非法".encode("utf-8"), "text/plain", code=400)
                 return
+            # ★2026-10-23 中危修复(第八轮): 负 Content-Length —— int("-1") 合法,
+            # 旧版漏查直接 rfile.read(-1), read(负值)语义是"读到 EOF",
+            # keep-alive 下对端永不 EOF -> 该线程永久挂起; 多来几个线程池耗尽,
+            # 播报全部静默丢失。与 config_web.py 的负值处理同口径。
+            if n < 0:
+                self._send("Content-Length 非法".encode("utf-8"), "text/plain", code=400)
+                return
             if n > MAX_BODY_BYTES:
                 # body 没读就回 413: keep-alive 下连接不能复用, 必须断开重连
                 self.close_connection = True
@@ -140,8 +147,15 @@ class Handler(BaseHTTPRequestHandler):
             text = self.rfile.read(n).decode("utf-8").strip()
             # 清缓存要放在 text 判空之前: 该请求自身 body 就是空的
             if self.path.startswith("/cache/clear"):
-                with LOCK:
+                global CACHE_BYTES
+                # ★2026-10-23 中危修复(第八轮): 两处旧错 —— ① 用合成锁 LOCK 清缓存,
+                # 与 cache_get/cache_put 的 CACHE_LOCK 不是同一把, 并发下清到一半
+                # 另一线程 move_to_end 照样 KeyError; ② CACHE_BYTES 不清零,
+                # 清空后字节计数仍是旧值, 后续 cache_put 一上来就触发 LRU 逐出,
+                # 新合成的前几句被立刻挤掉(缓存形同虚设)。
+                with CACHE_LOCK:
                     CACHE.clear()
+                    CACHE_BYTES = 0
                 STATS["hit"] = STATS["miss"] = STATS["synth_n"] = 0
                 STATS["synth_sec_total"] = STATS["last_synth_sec"] = 0.0
                 self._send(b"cleared", "text/plain")

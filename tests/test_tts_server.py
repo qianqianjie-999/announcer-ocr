@@ -94,6 +94,47 @@ class TestTtsServerBodyLimit(unittest.TestCase):
             d = json.loads(r.read().decode())
         self.assertTrue(d["ok"])
 
+    def _raw(self, req: bytes) -> bytes:
+        import socket
+        host, port = self.srv.server_address
+        with socket.create_connection((host, port), timeout=5) as s:
+            s.sendall(req)
+            chunks = []
+            while True:
+                try:
+                    b = s.recv(65536)
+                except socket.timeout:
+                    break
+                if not b:
+                    break
+                chunks.append(b)
+        return b"".join(chunks)
+
+    def test_negative_content_length_400(self):
+        # ★回归(2026-10-23 第八轮中危): int("-1") 合法, 旧版漏查 -> read(-1)
+        # 语义是"读到 EOF", keep-alive 下线程永久挂起。必须 400 拒绝。
+        # (urllib 会用 data 长度覆盖 Content-Length, 只能 raw socket 构造)
+        req = (b"POST / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n"
+               b"Content-Length: -1\r\n\r\n")
+        resp = self._raw(req)
+        status = int(resp.split(b"\r\n", 1)[0].split()[1])
+        self.assertEqual(status, 400, resp[:60])
+
+    def test_cache_clear_resets_bytes_and_cache(self):
+        # ★回归(2026-10-23 第八轮中危): /cache/clear 必须清 CACHE_BYTES,
+        # 否则清空后第一次 cache_put 就触发 LRU 逐出, 新句被立刻挤掉。
+        self._post(b"GA888")          # 合成一句 -> CACHE_BYTES > 0
+        self.assertGreater(ts.CACHE_BYTES, 0)
+        self.assertGreater(len(ts.CACHE), 0)
+        # /cache/clear 是独立路径(空 body)
+        req = urllib.request.Request(self.base + "/cache/clear",
+                                     method="POST", data=b"")
+        with urllib.request.urlopen(req, timeout=10) as r:
+            self.assertEqual(r.status, 200)
+        self.assertEqual(len(ts.CACHE), 0)
+        self.assertEqual(ts.CACHE_BYTES, 0,
+                         "清缓存后字节计数必须归零, 否则新句会被立即逐出")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

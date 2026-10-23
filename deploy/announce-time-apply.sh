@@ -12,6 +12,10 @@ REQ="$DIR/request"
 RES="$DIR/result"
 MARK="$DIR/last_req_id"
 
+# ★2026-10-23 低危修复(第八轮): 脚本被信号打断(如 timer 停止恰好落在写 tmp 与
+#   mv 之间)会残留 $RES.tmp.$$ 半截文件。正常路径 mv 后本 rm 是 no-op, 代价为零。
+trap 'rm -f "$RES.tmp.$$"' EXIT
+
 [ -f "$REQ" ] || exit 0
 
 # 原子取走（mv 后立刻改名，避免两个 timer 实例重复执行）

@@ -13,8 +13,12 @@ MU=$(free -m | awk '/^Mem:/{print $3}')
 MA=$(free -m | awk '/^Mem:/{print $7}')
 FR=$(ps -eo rss,args | awk '/[f]fmpeg/{r+=$1} END{print r+0}')
 FC=$(ps -eo pcpu,args | awk '/[f]fmpeg/{c+=$1} END{print c+0}')
-RR=$(ps -eo rss,args | awk '/[a]nnounce-rs$/{r+=$1} END{print r+0}')
-RC=$(ps -eo pcpu,args | awk '/[a]nnounce-rs$/{c+=$1} END{print c+0}')
+# ★2026-10-23 低危修复(第八轮): 旧版正则 /[a]nnounce-rs$/ 要求进程名收尾 ——
+# 但 systemd 单元里 ExecStart 带参数(/usr/local/bin/announce-rs --config ...),
+# ps args 列尾是参数不是进程名, $ 锚点恒不命中, RR/RC 两列一直采 0。
+# 改成「进程名后跟空白或行尾」, 带参/不带参两种布局都能命中。
+RR=$(ps -eo rss,args | awk '/[a]nnounce-rs( |$)/{r+=$1} END{print r+0}')
+RC=$(ps -eo pcpu,args | awk '/[a]nnounce-rs( |$)/{c+=$1} END{print c+0}')
 L=$(cut -d' ' -f1 /proc/loadavg)
 T=$(cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null | sort -n | tail -1)
 if [ -n "${T:-}" ]; then T=$((T / 1000)); else T=""; fi

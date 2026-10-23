@@ -30,6 +30,18 @@ for c in "${ANNOUNCE_CONF:-}" \
          /root/anntest/config.json; do
     if [ -n "$c" ] && [ -r "$c" ]; then CONF="$c"; break; fi
 done
+
+# ★2026-10-23 中危修复(第八轮 M6): apply 模式下探测全落空必须报错退出 ——
+# 旧版 CONF 为空也照常往下走, python json.load 抛异常被 except 吞成 ENABLED=0,
+# 于是「路径全部不对」被静默当成「用户关了调度」: remove_units 删掉全部 timer
+# 再 restart 服务, Web 页还显示"工作时间已生效"。探测落空=部署异常, 与
+# 「用户在配置里显式 enabled=false」是两回事, 不能同路径处理。
+# --sync(开机校正)保留兜底: 那时配置可能尚未就位, 静默按全天运行是安全方向。
+if [ -z "$CONF" ] && [ "${1:-apply}" != "--sync" ]; then
+    echo "[schedule] 错误: 找不到可读的 config.json(已探测 ANNOUNCE_CONF /opt /home/debian/anntest /root/anntest)," >&2
+    echo "[schedule] 拒绝按 ENABLED=0 兜底继续 —— 请检查部署路径或用 ANNOUNCE_CONF 显式指定" >&2
+    exit 1
+fi
 UNIT_DIR=/etc/systemd/system
 SVC=announce-rs.service
 

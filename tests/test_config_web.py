@@ -76,7 +76,7 @@ def _base_body():
             "fallback_ocr_sec": "3", "stable_frames": "2",
             "confirm_ttl_sec": "4", "active_sec": "3",
         },
-        "tts": {"enabled": "on", "repeat": "1", "rate": "0"},
+        "tts": {"enabled": "on", "repeat": "1", "rate": "135"},
         "ocr": {"psm": "7"},
     }
 
@@ -389,11 +389,14 @@ class TestValidateAndBuild(unittest.TestCase):
         cfg, _ = cw.validate_and_build(b)
         self.assertEqual(cfg["detect"]["settle_sec"], 3.0)
 
-    def test_tts_repeat_floor(self):
-        b = _base_body()
-        b["tts"]["repeat"] = "0"
-        cfg, _ = cw.validate_and_build(b)
-        self.assertEqual(cfg["tts"]["repeat"], 1)
+    def test_tts_repeat_out_of_range_rejected(self):
+        # ★2026-10-23 第八轮高危: repeat 越界从"静默钳"改为"拒绝保存"
+        for bad in ("0", "6", "-1", "999999999"):
+            b = _base_body()
+            b["tts"]["repeat"] = bad
+            cfg, err = cw.validate_and_build(b)
+            self.assertIsNone(cfg, bad)
+            self.assertIn("repeat 需在 1~5", err, bad)
 
     def test_tts_enabled_true(self):
         cfg, _ = self._build()
@@ -490,6 +493,107 @@ class TestValidateAndBuild(unittest.TestCase):
             schedule={"enabled": "on", "work_start": "08:00", "work_end": "08:00"})
         self.assertIsNone(cfg)
         self.assertIn("不能相同", err)
+
+
+# ---------------------------------------------------------------- 整数值域（第八轮高危）
+
+class TestIntRangeGuard(unittest.TestCase):
+    """★回归(2026-10-23 第八轮高危): 整数字段与页面 min/max 同口径拒绝越界值。
+
+    旧版 stable_frames/psm 直接 int() 落盘、repeat 只钳下限、rate 不校验 ——
+    内网任意主机 curl 一个越界值, 保存即生效并自动重启服务:
+    stable_frames=0 每帧都播、psm=99 让 tesseract 全灭、repeat=10^9 占死声卡。
+    """
+
+    def setUp(self):
+        p = mock.patch.object(cw, "load_cfg", return_value=_base_cur())
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_stable_frames_out_of_range(self):
+        for bad in ("0", "6", "-1", "1000000000"):
+            b = _base_body()
+            b["detect"]["stable_frames"] = bad
+            cfg, err = cw.validate_and_build(b)
+            self.assertIsNone(cfg, bad)
+            self.assertIn("stable_frames 需在 1~5", err, bad)
+
+    def test_stable_frames_boundary_ok(self):
+        for good in ("1", "5"):
+            b = _base_body()
+            b["detect"]["stable_frames"] = good
+            cfg, err = cw.validate_and_build(b)
+            self.assertIsNone(err, good)
+            self.assertEqual(cfg["detect"]["stable_frames"], int(good))
+
+    def test_psm_out_of_range(self):
+        for bad in ("0", "2", "14", "99"):
+            b = _base_body()
+            b["ocr"]["psm"] = bad
+            cfg, err = cw.validate_and_build(b)
+            self.assertIsNone(cfg, bad)
+            self.assertIn("psm 需在 3~13", err, bad)
+
+    def test_psm_boundary_ok(self):
+        for good in ("3", "13"):
+            b = _base_body()
+            b["ocr"]["psm"] = good
+            cfg, err = cw.validate_and_build(b)
+            self.assertIsNone(err, good)
+            self.assertEqual(cfg["ocr"]["psm"], int(good))
+
+    def test_rate_out_of_range(self):
+        for bad in ("0", "79", "251", "-80"):
+            b = _base_body()
+            b["tts"]["rate"] = bad
+            cfg, err = cw.validate_and_build(b)
+            self.assertIsNone(cfg, bad)
+            self.assertIn("rate 需在 80~250", err, bad)
+
+    def test_rate_boundary_ok(self):
+        for good in ("80", "250"):
+            b = _base_body()
+            b["tts"]["rate"] = good
+            cfg, err = cw.validate_and_build(b)
+            self.assertIsNone(err, good)
+            self.assertEqual(cfg["tts"]["rate"], int(good))
+
+
+# ---------------------------------------------------------------- pattern 校验（第八轮高危）
+
+class TestOcrPatternGuard(unittest.TestCase):
+    """★回归(2026-10-23 第八轮高危): ocr.pattern 逐条校验字符串且可编译。
+
+    旧版只查"非空 list": curl 送 [123] 或 ["("] 落盘后, Rust 侧 Regex::new
+    失败 -> Config::load Err -> systemd 崩溃死循环, 服务永远起不来。
+    """
+
+    def setUp(self):
+        p = mock.patch.object(cw, "load_cfg", return_value=_base_cur())
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_non_string_element_rejected(self):
+        b = _base_body()
+        b["ocr"]["pattern"] = [123]
+        cfg, err = cw.validate_and_build(b)
+        self.assertIsNone(cfg)
+        self.assertIn("必须全部是字符串", err)
+
+    def test_uncompilable_regex_rejected(self):
+        for bad in ("(", "[a-z", "\\"):
+            b = _base_body()
+            b["ocr"]["pattern"] = [bad]
+            cfg, err = cw.validate_and_build(b)
+            self.assertIsNone(cfg, bad)
+            self.assertIn("正则无法编译", err, bad)
+
+    def test_valid_pattern_accepted(self):
+        b = _base_body()
+        b["ocr"]["pattern"] = [r"^([A-Z])(\d{3})$", r"([A-Z]{2})\s*0*(\d{1,6})"]
+        cfg, err = cw.validate_and_build(b)
+        self.assertIsNone(err)
+        self.assertEqual(len(cfg["ocr"]["pattern"]), 2)
 
 
 # ---------------------------------------------------------------- NaN/Inf 穿透防御
@@ -1005,6 +1109,118 @@ class TestOptimisticLock(unittest.TestCase):
         body = json.dumps(_base_body()).encode()
         resp = self._req("POST", "/api/save", body)
         self.assertEqual(self._status(resp), 200, resp[:80])
+
+
+class TestInvalidValueHttpWiring(unittest.TestCase):
+    """越界值经真实 HTTP POST 必须 400 且 config.json 一字节不动(第八轮高危)。
+
+    纯函数用例防的是 validate_and_build 逻辑; 本类防"接线断" ——
+    比如 do_POST 忘了把 err 转成 400, 或出错路径仍落盘。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        tmpdir = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(tmpdir.cleanup)
+        cls.cfg_path = os.path.join(tmpdir.name, "config.json")
+        with open(cls.cfg_path, "w", encoding="utf-8") as f:
+            json.dump(_base_cur(), f)
+        for attr, val in (("CONFIG", cls.cfg_path),
+                          ("RESTART_CMD", ["true"]),
+                          ("SCHED_CMD", ["false"])):
+            p = mock.patch.object(cw, attr, val)
+            p.start()
+            cls.addClassCleanup(p.stop)
+        import threading
+        from http.server import ThreadingHTTPServer
+        cls.srv = ThreadingHTTPServer(("127.0.0.1", 0), cw.Handler)
+        cls.addClassCleanup(cls.srv.shutdown)
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+        cls.port = cls.srv.server_address[1]
+
+    def _post_save(self, body: dict) -> bytes:
+        import socket
+        raw = json.dumps(body).encode()
+        req = (b"POST /api/save HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n"
+               b"Content-Type: application/json\r\nContent-Length: "
+               + str(len(raw)).encode() + b"\r\n\r\n" + raw)
+        with socket.create_connection(("127.0.0.1", self.port), timeout=5) as s:
+            s.sendall(req)
+            chunks = []
+            while True:
+                try:
+                    b = s.recv(65536)
+                except socket.timeout:
+                    break
+                if not b:
+                    break
+                chunks.append(b)
+        return b"".join(chunks)
+
+    def _status(self, resp: bytes) -> int:
+        return int(resp.split(b"\r\n", 1)[0].split()[1])
+
+    def _disk(self) -> bytes:
+        with open(self.cfg_path, "rb") as f:
+            return f.read()
+
+    def test_poison_values_400_and_disk_untouched(self):
+        before = self._disk()
+        for mutate in (
+            lambda b: b["detect"].update(stable_frames="0"),
+            lambda b: b["ocr"].update(psm="99"),
+            lambda b: b["tts"].update(repeat="1000000000"),
+            lambda b: b["tts"].update(rate="0"),
+            lambda b: b["ocr"].update(pattern=["("]),
+        ):
+            body = _base_body()
+            mutate(body)
+            resp = self._post_save(body)
+            self.assertEqual(self._status(resp), 400, resp[:100])
+            self.assertEqual(self._disk(), before,
+                             "拒绝保存时 config.json 必须一字节不动")
+
+
+class TestSnapshotNoDoubleUnquote(unittest.TestCase):
+    """★回归(2026-10-23 第八轮中危): /api/snapshot 的 src 不得二次 unquote。
+
+    parse_qs 已解码一次, 旧版又 unquote 一次: 密码 "p%41x" 被改写成 "pAx",
+    RTSP 认证失败且页面上毫无线索。这里 mock ffmpeg_snapshot 捕获实际 src。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        tmpdir = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(tmpdir.cleanup)
+        cls.cfg_path = os.path.join(tmpdir.name, "config.json")
+        with open(cls.cfg_path, "w", encoding="utf-8") as f:
+            json.dump(_base_cur(), f)
+        p = mock.patch.object(cw, "CONFIG", cls.cfg_path)
+        p.start()
+        cls.addClassCleanup(p.stop)
+        import threading
+        from http.server import ThreadingHTTPServer
+        cls.srv = ThreadingHTTPServer(("127.0.0.1", 0), cw.Handler)
+        cls.addClassCleanup(cls.srv.shutdown)
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+        cls.port = cls.srv.server_address[1]
+
+    def test_percent_in_password_preserved(self):
+        captured = {}
+
+        def fake_snap(src, w, h):
+            captured["src"] = src
+            return b"\xff\xd8jpeg", None
+
+        with mock.patch.object(cw, "ffmpeg_snapshot", side_effect=fake_snap):
+            import urllib.request
+            # 页面 encodeURIComponent("rtsp://u:p%41x@192.168.1.10/s") 的结果
+            url = ("http://127.0.0.1:%d/api/snapshot?w=1280&h=720&src="
+                   "rtsp%%3A%%2F%%2Fu%%3Ap%%2541x%%40192.168.1.10%%2Fs") % self.port
+            with urllib.request.urlopen(url, timeout=10) as r:
+                self.assertEqual(r.status, 200)
+        self.assertEqual(captured["src"], "rtsp://u:p%41x@192.168.1.10/s",
+                         "parse_qs 之后不得再 unquote, 否则密码被改写")
 
 
 if __name__ == "__main__":

@@ -109,7 +109,15 @@ pub(crate) fn http_post_wav(url: &str, text: &str) -> Result<Vec<u8>, String> {
     // ★2026-10-23 中危修复: 总时限 —— set_read_timeout(60s) 只覆盖单次 recv,
     //   僵死服务端每 60s 吐 1 字节就能让 read_to_end 永不返回, 播报线程被
     //   无限期拖住且没有看门狗覆盖(预热线程持续堆积)。90s 硬截止。
+    // ★2026-10-23 低危修复(第八轮): 两处实测修正 ——
+    //   ① 最差耗时不是 90s: deadline 只在一次 read 返回后才检查, 而单次 read
+    //     最多阻塞 60s(read_timeout), 临界时刻进入的 read 要再拖满一轮,
+    //     实际最差 ≈ 90+60 = 150s;
+    //   ② 响应体加上限: 异常服务端在时限内持续吐数据会让 buf 无界增长
+    //     (本地回环 90s 足够灌满内存), 16MB 截断 —— 正常单句 wav 约 120KB,
+    //     16MB 已宽裕百倍。
     let deadline = std::time::Instant::now() + Duration::from_secs(90);
+    const MAX_WAV_BYTES: usize = 16 << 20;
     let mut chunk = [0u8; 8192];
     loop {
         match s.read(&mut chunk) {
@@ -119,6 +127,9 @@ pub(crate) fn http_post_wav(url: &str, text: &str) -> Result<Vec<u8>, String> {
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut => {}
             Err(e) => return Err(format!("读取响应失败: {}", e)),
+        }
+        if buf.len() > MAX_WAV_BYTES {
+            return Err(format!("响应体超过 {}MB 上限(服务端异常)", MAX_WAV_BYTES >> 20));
         }
         if std::time::Instant::now() >= deadline {
             return Err("读取响应超总时限 90s(服务端疑似僵死)".to_string());

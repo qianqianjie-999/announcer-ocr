@@ -36,6 +36,11 @@ impl Ocr {
             return Err("config.ocr.pattern 未配置".into());
         }
         // 启动时清掉上次崩溃残留的 OCR 临时文件(实测 /tmp 下能攒一堆)
+        // ★2026-10-23 低危注释(第八轮): 本清理按固定前缀通配, 会把**并行运行的
+        //   第二个实例**(如现场手工起的自测进程)正在使用的临时文件一并删掉。
+        //   生产布局靠 lock_port 单例挡着, 正常不会双开; 真要并行自测请错开
+        //   启动时刻(自测实例先启动并完成 OCR, 再启主服务), 不为此引入
+        //   按 lock_port 区分文件名的复杂度 —— 临时文件重读一次即可恢复。
         let prefix = "announce_rs_ocr";
         if let Ok(rd) = std::fs::read_dir(std::env::temp_dir()) {
             for e in rd.flatten() {
@@ -352,6 +357,11 @@ fn promote_prefix_lookalikes(chars: &[char]) -> Vec<char> {
                 continue; // 前缀里必须至少有一个数字(纯字母前缀是正常识别, 不动)
             }
             // 后随 3~4 位数字, 再后一位是 到/至
+            // ★2026-10-23 低危注释(第八轮): 为什么只覆盖 3~4 位 —— 生产 pattern
+            //   是 \d{3,6}, 5/6 位号码走不到这里的还原, 属"可接受的漏播方向"
+            //   (不还原顶多该次候选被正则拒掉、少播一次; 乱还原会造出错号并
+            //   占住当日去重表, 把真号挡死 —— 两害相权取前者)。现场编号均为
+            //   3 位( GA001~GA999 ), 3~4 位已覆盖实需。
             let mut j = i + len;
             let mut n = 0;
             while j < chars.len() && chars[j].is_ascii_digit() {
