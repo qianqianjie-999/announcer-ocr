@@ -77,16 +77,20 @@ const BACKFILL_MAX: u32 = 5;
 /// 更糟的是旧逻辑里"小号"这条分支**根本没有出口**: 只能等 20s 静默兜底, 而兜底只放
 /// 行"更大的号", 于是当天剩余小号全程哑火。
 ///
-/// 为什么数"轮"而不是数秒: 每轮 OCR 的耗时受负载影响(1~5s 不等), 按秒计会让同一个
-/// K 在不同机器/时段表现不同, 也会被"一轮 OCR 就跨过阈值"绕过。按轮计 K 轮天然就是
-/// "同一号码被独立地看见 K 次", 且一轮里多个窗口并票(GA174 被误读成 C04/CC04)只算
-/// 一轮 —— 残影在单轮内多窗口同时命中骗不到票, 必须先被独立重读 K 次。
+/// 为什么按"秒"计而不是按"轮"计: 现场实测残影的寿命是**墙钟时间**(换号动画结束
+/// 就消失), 与 OCR 跑了几轮无关。按轮计遇到主码流下轮次变快(每轮 <0.5s)时,
+/// 残影在同样的 3s 寿命里能轻松攒到 5 轮 —— 阈值形同虚设。按秒计才是直接对着
+/// "残影能活多久"设闸。
 ///
-/// K=5(每轮约 1.3s, 合计约 6~7s)的理由 —— 防误读残影误重置:
-///   * 残影撑不过真号更替: 换号动画一结束残影就消失, 实测驻留 <5s, 很难攒到 5 轮;
-///   * 真回退/新一轮小号会**稳定存在**十几秒以上, 甚至一直挂在屏上, 5 轮轻松过;
-///   * 代价只是极端回退场景晚播约 6~7s, 收益是当天不再整段哑火。
-const SEQ_RESET_ROUNDS: u32 = 5;
+/// 计时基准: 取**当前静帧段起点 static_since**(屏上画面不再变化的那一刻)算起,
+/// 而不是"第一次看见该号"的墙钟时间 —— 屏在动(换号动画)时根本不计时,
+/// 画面一静就重新起算, 所以残影永远攒不满。
+///
+/// SEQ_RESET_SECS=8.0 的理由 —— 防误读残影误重置:
+///   * 残影撑不过真号更替: 换号动画一结束残影就消失, 实测驻留 <5s, 攒不到 8s;
+///   * 真回退/新一轮小号会**稳定存在**十几秒以上, 甚至一直挂在屏上, 8s 轻松过;
+///   * 代价只是极端回退场景晚播约 8s, 收益是当天不再整段哑火。
+const SEQ_RESET_SECS: f64 = 8.0;
 
 /// 序列重置判定(纯函数, 供单测): 该候选是否"远低于基线"。
 /// 条件: 有基线、候选数值 < 基线、且差值 > BACKFILL_MAX(补播窗口之外的号)。
@@ -94,15 +98,20 @@ fn seq_reset_eligible(has_baseline: bool, last: u32, v: u32) -> bool {
     has_baseline && v < last && last - v > BACKFILL_MAX
 }
 
-/// 序列重置票数推进(纯函数, 供单测): 返回 (新票数, 是否够 K 轮可重置)。
+/// 序列重置计时推进(纯函数, 供单测): 返回 (该号当前静帧段已持续秒数, 是否够钟可重置)。
 ///
-/// 票数只在该号"本轮又被看见"时 +1; 某轮没看见(候选消失)由调用方清零 ——
-/// 于是"连续 K 轮"是硬约束: 中间断一轮就从头数, 残影断续出现永远攒不够。
-/// 与确认票(confirm)分离的原因: confirm 只装"过了闸门的候选", 而本路径处理的
-/// 恰恰是**被闸门挡下**的小号, 拿不到票。所以另立一张小状态表。
-fn seq_reset_tick(rounds: u32) -> (u32, bool) {
-    let n = rounds.saturating_add(1);
-    (n, n >= SEQ_RESET_ROUNDS)
+/// 调用方在**每个静帧段内第一次看见该号**时传 since=now(起算); 之后每轮传上次
+/// 记下的 since。静帧段一变(屏又动了)调用方必须整表清空 —— 于是"同一静帧段内
+/// 连续稳定 8s"是硬约束: 残影跟着换号动画一起消失, 永远攒不满。
+/// since 为 None 表示"本静帧段刚加入", 本轮记 0s 不计入。
+fn seq_reset_tick(since: Option<f64>, now: f64) -> (f64, bool) {
+    match since {
+        None => (now, false),
+        Some(s) => {
+            let held = now - s;
+            (s, held >= SEQ_RESET_SECS)
+        }
+    }
 }
 
 /// 跳幅 -> 额外需要的确认量。0 表示"够票即播, 不额外等"。
@@ -319,13 +328,12 @@ struct Loop {
     max_jump: u32,
     /// 闸门拦截日志节流时刻(被拦的号每 10s 最多打一行, 防刷屏)。
     gate_log_at: f64,
-    /// ★序列重置(2026-10-26): 号码 -> 该号"远低于基线"且**连续被看见**的轮数。
-    /// 见 SEQ_RESET_ROUNDS / gate_filter。某轮没再看见就清零(连续性是硬约束);
-    /// 静帧段变化不必然清零 —— 残影断续出现同样攒不到 K 轮, 由"本轮未出现即归零"
-    /// 覆盖, 简化状态。触发后整体清空。
-    seq_rounds: HashMap<(String, String), u32>,
-    /// 上一次 compute_seq_reset 所见的"号码 -> 窗口"全集, 用来判断某号本轮是否还在。
-    seq_seen_prev: HashSet<(String, String)>,
+    /// ★序列重置(2026-10-26): 号码 -> 本静帧段内**首次看见它**的时刻。
+    /// 见 SEQ_RESET_SECS / gate_filter。与静帧段绑定: 屏一动(static_since 变)整表
+    /// 清空, 于是"同一静帧段内连续稳定 8s"是硬约束, 残影攒不满。触发后整体清空。
+    seq_since: HashMap<(String, String), f64>,
+    /// 本表所归属的静帧段起点, 用来发现"静帧段已经换了"。
+    seq_seg: f64,
     /* —— 多行列表(2026-10-21) ————————————————————————————————
      * 叫号屏改成三行列表后, 最新号不一定在第一行(现场见过落到第二行)。
      * 检测框要覆盖多行才看得见变化, 但识别仍按单行裁 —— 整块喂 tesseract 会掉精度。
@@ -591,8 +599,8 @@ impl Loop {
             },
             max_jump: det.max_jump,
             gate_log_at: 0.0,
-            seq_rounds: HashMap::new(),
-            seq_seen_prev: HashSet::new(),
+            seq_since: HashMap::new(),
+            seq_seg: 0.0,
 
             rows,
             pitch,
@@ -1268,29 +1276,31 @@ impl Loop {
                             // ★序列重置(2026-10-26 现场 GA174→GA193 事故): 远低于基线
                             // (差 > BACKFILL_MAX)的号 —— 旧逻辑一律当"老号"挡死, 于是
                             // 一旦基线被误读带偏, 当天剩余的真小号全哑 (175~178 就是这么
-                            // 丢的)。这里给一个出口: 该号**连续 K 轮**被独立看见, 判定为
-                            // 新一轮/回退, 重置基线并放行(播报该号, 它就是屏幕当前真实
-                            // 叫号)。票不进 confirm(见 seq_reset_tick 注释)。
-                            // 不误判残影的原因见 SEQ_RESET_ROUNDS 注释。
+                            // 丢的)。这里给一个出口: 该号在**同一静帧段内连续稳定
+                            // SEQ_RESET_SECS 秒**, 判定为新一轮/回退, 重置基线并放行
+                            // (播报该号, 它就是屏幕当前真实叫号)。
+                            // 不误判残影的原因见 SEQ_RESET_SECS 注释。
                             let key = (n.clone(), w.clone());
-                            let prev = self.seq_rounds.get(&key).copied().unwrap_or(0);
-                            let (rounds, fire) = seq_reset_tick(prev);
+                            let since = self.seq_since.get(&key).copied();
+                            let (start, fire) = seq_reset_tick(since, now);
                             if fire {
                                 self.last_num.insert(pre.clone(), *v);
-                                self.seq_rounds.clear();
-                                self.seq_seen_prev.clear();
+                                self.seq_since.clear();
                                 println!(
-                                    "[闸门] 序列重置: {} 连续 {} 轮稳定出现且远低于基线 {} \
+                                    "[闸门] 序列重置: {} 静帧内稳定 {:.0}s(阈值 {:.0}s)且远低于基线 {} \
                                      -> 判为新一轮, 基线重置为 {} 并放行",
-                                    n, rounds, last, v
+                                    n, now - start, SEQ_RESET_SECS, last, v
                                 );
                                 out.insert(key);
                                 any = true;
                             } else {
-                                self.seq_rounds.insert(key, rounds);
+                                self.seq_since.insert(key, start);
                                 blocked.push(format!(
-                                    "{}(<{}, 序列重置 {}/{})",
-                                    n, last, rounds, SEQ_RESET_ROUNDS
+                                    "{}(<{}, 序列重置 {:.0}/{:.0}s)",
+                                    n,
+                                    last,
+                                    now - start,
+                                    SEQ_RESET_SECS
                                 ));
                             }
                         }
@@ -1309,11 +1319,17 @@ impl Loop {
                 }
             }
         }
-        // 连续性约束: 上一轮还在数、这一轮却没再看见的号 -> 归零(残影断续出现攒不够)。
-        // 放在"放行判定"之后: 本轮真触发重置时表已被整体清空, 这里无可清。
-        self.seq_seen_prev = cand_all.clone();
-        let seen = self.seq_seen_prev.clone();
-        self.seq_rounds.retain(|k, _| seen.contains(k));
+        // 静帧段变更: 屏上的画面又动过(换号动画/刷新), 整表作废重新起算 ——
+        // 这是"残影攒不满"的核心保证: 残影活不过换号动画, 动画一结束段就换了。
+        // 放在放行判定之后: 本轮真触发重置时表已被整体清空, 这里不再有影响。
+        if (self.seq_seg - self.static_since).abs() > f64::EPSILON {
+            self.seq_seg = self.static_since;
+            self.seq_since.clear();
+        }
+        // 同一静帧段内也要"本轮没再看见就归零": 防止某号被读了两次、中间隔了几轮
+        // 没读到时把首尾时间差当成"连续稳定"。
+        let seen = cand_all;
+        self.seq_since.retain(|k, _| seen.contains(k));
         if !blocked.is_empty() && now - self.gate_log_at >= 10.0 {            self.gate_log_at = now;
             println!(
                 "[闸门] 拦截 {} (上限 +{}, 当前基线 {:?})",
@@ -1656,7 +1672,7 @@ mod tests {
         announce_sort_key, drop_shadow_empty, effective_ttl, gate_day_rollover, in_work_window,
         jump_extra_confirm, keep_day_reseed, number_votes, resolve_row_pitch, seed_only_decide,
         seq_reset_eligible, seq_reset_tick, settle_ready, time_plausible_y, JUMP_HARD_MAX,
-        SEQ_RESET_ROUNDS, SETTLE_MAX_WAIT_SECS,
+        SEQ_RESET_SECS, SETTLE_MAX_WAIT_SECS,
     };
     use std::collections::{HashMap, HashSet};
 
@@ -2043,52 +2059,61 @@ mod tests {
     fn boot_first_batch_marked_then_normal_after_clear() {
         // 首个候选(屏上昨日残留 GA219)到位: 标记生效 + 前缀无基线 -> 只标记
         assert!(seed_only_decide(true, false), "开机首批必须只标记不播");
-        // 同一轮处理完成后标记被清, 之后真号(GA002)无基线 -> 走正常播报
-        assert!(!seed_only_decide(!keep_day_reseed(true), false));
+        // 同一轮真处理过候选 -> 标记用完被清 -> 之后真号(GA002)无基线, 走正常播报
+        let marked_after_round = keep_day_reseed(true);
+        assert!(!marked_after_round, "处理过候选的轮次结束后标记应已被清");
+        assert!(!seed_only_decide(marked_after_round, false), "标记清掉后真号必须正常播");
         // 若那一轮其实读空(标记没被清), 后续残留号仍然只标记 —— 不毒化基线
-        assert!(seed_only_decide(keep_day_reseed(false), false));
+        let marked_after_empty = keep_day_reseed(false);
+        assert!(marked_after_empty, "读空的轮次结束后标记必须留着");
+        assert!(seed_only_decide(marked_after_empty, false), "读空后残留大号仍须只标记");
     }
 
-    // ———— 改动三: 序列重置(连续 K 轮稳定) ————
-    /// 模拟连续多轮都看见同一个号时的票数推进, 返回首次够 K 轮的轮次号(1-based)。
+    // ———— 改动三: 序列重置(静帧内连续稳定 N 秒) ————
+    /// 模拟"同一静帧段内每轮都看见同一个号", 返回首次够钟时的轮次号(1-based)。
     fn rounds_until_fire() -> u32 {
-        let mut rounds = 0u32;
-        for i in 1..=20u32 {
-            let (n, fire) = seq_reset_tick(rounds);
-            rounds = n;
+        // 现场主码流约 1.3s 一轮, 8s 阈值 -> 约 7 轮
+        let tick = 1.3f64;
+        let mut since: Option<f64> = None;
+        for i in 1..=60u32 {
+            let now = i as f64 * tick;
+            let (s, fire) = seq_reset_tick(since, now);
+            since = Some(s);
             if fire {
                 return i;
             }
         }
-        panic!("{} 轮内应触发序列重置", 20);
+        panic!("60 轮内应触发序列重置");
     }
 
     #[test]
-    fn seq_reset_fires_at_k_rounds_and_passes_number() {
-        // 基线 193(被 GA193 误读毒化), 真号 175 稳定出现 -> 第 K 轮重置并放行
-        assert_eq!(rounds_until_fire(), SEQ_RESET_ROUNDS, "必须恰好在第 K 轮触发");
-        assert_eq!(SEQ_RESET_ROUNDS, 5, "K=5 是现场约定(≈6~7s)");
+    fn seq_reset_fires_after_secs_within_one_static_segment() {
+        // 基线 193(被 GA193 误读毒化), 真号 175 稳定出现 -> 约 8s 后重置并放行
+        let at = rounds_until_fire();
+        assert!(
+            (6..=8).contains(&at),
+            "1.3s/轮下应在第 6~8 轮(≈8s)触发, 实际第 {} 轮",
+            at
+        );
         // 触发条件与"远低于基线"口径一致: 193 vs 175 差 18 够格
         assert!(seq_reset_eligible(true, 193, 175));
-        // 票数推进是单调的, 且触发后仍保持 >= K(调用方会清表, 不依赖此值)
-        let (n1, f1) = seq_reset_tick(0);
-        assert_eq!((n1, f1), (1, false), "第 1 轮只计数不放行");
-        let (n2, f2) = seq_reset_tick(SEQ_RESET_ROUNDS);
-        assert!(n2 > SEQ_RESET_ROUNDS && f2, "已够 K 轮后继续调用仍应判定为可重置");
     }
 
     #[test]
-    fn seq_reset_not_fired_below_k_rounds() {
-        // 候选小于基线但只出现 < K 轮: 一律不放行(残影通常撑不到 K 轮)
-        let mut rounds = 0u32;
-        for _ in 0..SEQ_RESET_ROUNDS - 1 {
-            let (n, fire) = seq_reset_tick(rounds);
-            assert!(!fire, "不满 {} 轮绝不能重置基线", SEQ_RESET_ROUNDS);
-            rounds = n;
-        }
-        assert_eq!(rounds, SEQ_RESET_ROUNDS - 1);
-        // 中间断一轮(调用方把票清零)后重新数, 依旧不会提前触发
-        let (n, fire) = seq_reset_tick(0);
-        assert_eq!((n, fire), (1, false), "断开后从头数, 第一轮不放行");
+    fn seq_reset_not_fired_before_secs() {
+        // 第一轮只起算, 不放行; 未满 SEQ_RESET_SECS 一律挡
+        let (s0, f0) = seq_reset_tick(None, 100.0);
+        assert_eq!(s0, 100.0, "首次看见只记起点(取当前墙钟)");
+        assert!(!f0, "起算当轮绝不放行");
+
+        let (_, f) = seq_reset_tick(Some(100.0), 100.0 + SEQ_RESET_SECS - 0.1);
+        assert!(!f, "差一点满 {}s 也不能放行 —— 残影就活在这个区间", SEQ_RESET_SECS);
+
+        let (_, f) = seq_reset_tick(Some(100.0), 100.0 + SEQ_RESET_SECS);
+        assert!(f, "刚好满 {}s 应当放行", SEQ_RESET_SECS);
+
+        // 静帧段换了(调用方清表)后重新起算, 依旧不会提前触发
+        let (s, fire) = seq_reset_tick(None, 200.0);
+        assert_eq!((s, fire), (200.0, false), "换段后从头计时");
     }
 }
