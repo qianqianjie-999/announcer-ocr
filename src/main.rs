@@ -67,6 +67,44 @@ const JUMP_HARD_MAX: u32 = 30;
 /// 挡住。K=5 覆盖两窗口紧挨着连续叫号的场景。
 const BACKFILL_MAX: u32 = 5;
 
+/// ★序列重置(2026-10-26 现场 GA174→GA193 事故): 候选【远小于基线】(差 > BACKFILL_MAX)
+/// 时, 若同一号**连续 K 轮稳定出现**, 判定为"新一轮序列开始"(回退/换队列/系统重置
+/// 编号), 重置基线为该号并正常播报它 —— 它就是屏幕当前真实叫号。
+///
+/// 事故复盘: 屏上第 2 行是换号动画的乱码残影, OCR 把它读成 GA193。174→193 只差 19,
+/// 落在 +10~+30 的"多确认"档 —— 而残影在屏上稳定驻留了好几秒, 多要的那几票照样
+/// 攒够, 于是误读被放行、基线毒化成 193, 之后真号 GA175~178 全被"号小了差>5"挡死。
+/// 更糟的是旧逻辑里"小号"这条分支**根本没有出口**: 只能等 20s 静默兜底, 而兜底只放
+/// 行"更大的号", 于是当天剩余小号全程哑火。
+///
+/// 为什么数"轮"而不是数秒: 每轮 OCR 的耗时受负载影响(1~5s 不等), 按秒计会让同一个
+/// K 在不同机器/时段表现不同, 也会被"一轮 OCR 就跨过阈值"绕过。按轮计 K 轮天然就是
+/// "同一号码被独立地看见 K 次", 且一轮里多个窗口并票(GA174 被误读成 C04/CC04)只算
+/// 一轮 —— 残影在单轮内多窗口同时命中骗不到票, 必须先被独立重读 K 次。
+///
+/// K=5(每轮约 1.3s, 合计约 6~7s)的理由 —— 防误读残影误重置:
+///   * 残影撑不过真号更替: 换号动画一结束残影就消失, 实测驻留 <5s, 很难攒到 5 轮;
+///   * 真回退/新一轮小号会**稳定存在**十几秒以上, 甚至一直挂在屏上, 5 轮轻松过;
+///   * 代价只是极端回退场景晚播约 6~7s, 收益是当天不再整段哑火。
+const SEQ_RESET_ROUNDS: u32 = 5;
+
+/// 序列重置判定(纯函数, 供单测): 该候选是否"远低于基线"。
+/// 条件: 有基线、候选数值 < 基线、且差值 > BACKFILL_MAX(补播窗口之外的号)。
+fn seq_reset_eligible(has_baseline: bool, last: u32, v: u32) -> bool {
+    has_baseline && v < last && last - v > BACKFILL_MAX
+}
+
+/// 序列重置票数推进(纯函数, 供单测): 返回 (新票数, 是否够 K 轮可重置)。
+///
+/// 票数只在该号"本轮又被看见"时 +1; 某轮没看见(候选消失)由调用方清零 ——
+/// 于是"连续 K 轮"是硬约束: 中间断一轮就从头数, 残影断续出现永远攒不够。
+/// 与确认票(confirm)分离的原因: confirm 只装"过了闸门的候选", 而本路径处理的
+/// 恰恰是**被闸门挡下**的小号, 拿不到票。所以另立一张小状态表。
+fn seq_reset_tick(rounds: u32) -> (u32, bool) {
+    let n = rounds.saturating_add(1);
+    (n, n >= SEQ_RESET_ROUNDS)
+}
+
 /// 跳幅 -> 额外需要的确认量。0 表示"够票即播, 不额外等"。
 /// 抽成自由函数便于单测: 这是现场调参的核心决策, 不能让口径藏在方法里。
 fn jump_extra_confirm(delta: u32, max_jump: u32) -> u32 {
@@ -281,6 +319,13 @@ struct Loop {
     max_jump: u32,
     /// 闸门拦截日志节流时刻(被拦的号每 10s 最多打一行, 防刷屏)。
     gate_log_at: f64,
+    /// ★序列重置(2026-10-26): 号码 -> 该号"远低于基线"且**连续被看见**的轮数。
+    /// 见 SEQ_RESET_ROUNDS / gate_filter。某轮没再看见就清零(连续性是硬约束);
+    /// 静帧段变化不必然清零 —— 残影断续出现同样攒不到 K 轮, 由"本轮未出现即归零"
+    /// 覆盖, 简化状态。触发后整体清空。
+    seq_rounds: HashMap<(String, String), u32>,
+    /// 上一次 compute_seq_reset 所见的"号码 -> 窗口"全集, 用来判断某号本轮是否还在。
+    seq_seen_prev: HashSet<(String, String)>,
     /* —— 多行列表(2026-10-21) ————————————————————————————————
      * 叫号屏改成三行列表后, 最新号不一定在第一行(现场见过落到第二行)。
      * 检测框要覆盖多行才看得见变化, 但识别仍按单行裁 —— 整块喂 tesseract 会掉精度。
@@ -397,6 +442,18 @@ fn seed_only_decide(day_reseed: bool, has_baseline: bool) -> bool {
     day_reseed && !has_baseline
 }
 
+/// ★2026-10-26(改动二): 本轮结束后是否要**保住** day_reseed 标记(不清)。
+///
+/// 语义: 标记的用途是"首个候选只标记不播" —— 它必须在**真的处理过一个候选**
+/// (标记或播报)之后才算用完。开机第一轮 OCR 常常读空(屏刚上电闪黑/未聚焦/
+/// 换号动画中), 若那一轮就无条件清标记, 下一轮屏上残留的大号(G A219 之流)
+/// 就会走"无基线取最大"被播出去并毒化基线, 整个补丁等于白打。
+///
+/// 所以判据是"本轮有没有候选被处理过"(handled), 而不是"本轮跑过没有"。
+fn keep_day_reseed(handled_any_candidate: bool) -> bool {
+    !handled_any_candidate
+}
+
 /// 作息闸判定(纯函数, 便于单测): 当前 "HH:MM" 是否落在 start~end 工作窗口内。
 /// start<=end 为普通窗口(含 start、不含 end); start>end 为跨零点窗口
 /// (如 22:00~06:00 夜班); start==end 视为全天。任一侧解析失败 => false
@@ -453,6 +510,9 @@ impl Loop {
         let now = now_secs();
         // 开机 seed: 基线(每前缀最新 OK 号) + 当日全部已播号(灌去重表)。
         let (seed_baselines, seed_announced) = seed_last_numbers(&cfg.log_file);
+        // ★2026-10-26: 当天一条 OK 记录都没有 => 基线为空 => 屏上残留的大号会被
+        //   "无基线取最大"当新号播掉并毒化基线。见下面 day_reseed 的赋值。
+        let seed_baselines_is_empty = seed_baselines.is_empty();
         Ok(Loop {
             interval: 1.0 / cfg.fps.max(0.1),
             need_stable: det.stable_frames,
@@ -513,9 +573,26 @@ impl Loop {
             last_num: seed_baselines,
             maint_day: local_day_of(now).unwrap_or_default(),
             mute_warned: false,
-            day_reseed: false,
+            // ★2026-10-26 高危修复: 每天 08:00 systemd 全新启动时, 当天往往还没有
+            //   任何 OK 记录 -> 基线为空 -> 闸门走"无基线取最大", 把屏上残留的
+            //   昨日尾号(如 GA219)当新号播掉并毒化基线; 之后当天 GA002 起的小号
+            //   全被"号小了差>5"挡死(2026-10-26 上午现场真实事故)。
+            //   代码里原本只有"零点跨日"路径置这个标记(maintenance), 每日重启这条
+            //   路径没接 —— 两条后果完全等价, 这里补上。
+            day_reseed: {
+                let empty = seed_baselines_is_empty;
+                if empty {
+                    println!(
+                        "[闸门] 启动时基线为空(当日尚无播报记录): 首批候选只标记不播, \
+                         防屏上残留大号(如昨日尾号)毒化基线 —— 详见 seed_only_after_reset"
+                    );
+                }
+                empty
+            },
             max_jump: det.max_jump,
             gate_log_at: 0.0,
+            seq_rounds: HashMap::new(),
+            seq_seen_prev: HashSet::new(),
 
             rows,
             pitch,
@@ -777,14 +854,21 @@ impl Loop {
                     && streak >= self.confirm_ticks + self.jump_extra(n)
             })
             .collect();
+        // ★2026-10-26(改动二): 本路径也要"真的处理过至少一个候选才清 day_reseed",
+        //   否则开机首轮 OCR 读空(屏刚上电闪黑/换号动画中)会把标记白白清掉, 下一轮
+        //   那个残留大号就趁虚而入毒化基线。这里 hit 为空 = 本轮没有候选可处理,
+        //   保住标记等下一轮(判据抽成纯函数, 见 keep_day_reseed)。
         if hit.is_empty() {
             return;
         }
+        // 真正进入处理流程的候选数(见下方 day_reseed 清理条件)。
+        let mut handled = false;
         // 元组含 f64(无 Ord), 走排序键: (前缀, 数值, 窗口) —— 数值序与业务编号
         // 顺序一致(GA9 先于 GA10), 字符串序会把 GA10 排到 GA9 前(第八轮低危)。
         hit.sort_by(|a, b| announce_sort_key(&a.0, &a.1).cmp(&announce_sort_key(&b.0, &b.1)));
         let t_ann = now_secs();
         for (number, window, _votes, first, _last) in hit {
+            handled = true;
             if self.seed_only_after_reset(&number, t_ann) {
                 continue;
             }
@@ -808,7 +892,10 @@ impl Loop {
         }
         // 首批候选处理完即清跨日标记 —— 残留号已进当日去重表, 后续轮次由去重表
         // 接管压制; 次日真号(如 GA001)走"无基线取最大"照常播报, 不再被本标记误吞。
-        self.day_reseed = false;
+        // ★2026-10-26(改动二): 只在"本轮真的处理过候选"时才清(判据见 keep_day_reseed)。
+        if !keep_day_reseed(handled) {
+            self.day_reseed = false;
+        }
         // 已无待确认候选: 撤观察期。否则 active_until 还会让主循环
         // 再空跑一轮"确认 OCR"(2~5s CPU), 白占机器。
         self.active_until = 0.0;
@@ -1135,6 +1222,8 @@ impl Loop {
         }
         let mut by_pre: HashMap<String, Vec<(String, String, u32)>> = HashMap::new();
         let mut out: HashSet<(String, String)> = HashSet::new();
+        // 本轮看见的全部候选(闸门过滤前), 供序列重置的"连续性"判定用。
+        let cand_all: HashSet<(String, String)> = cands.clone();
         for (n, w) in cands {
             match split_num(&n) {
                 Some((pre, v)) => by_pre.entry(pre).or_default().push((n, w, v)),
@@ -1175,6 +1264,35 @@ impl Loop {
                             // 被开机 seed 的当日去重表挡住, 不会重播。
                             out.insert((n.clone(), w.clone()));
                             any = true;
+                        } else if seq_reset_eligible(true, last, *v) {
+                            // ★序列重置(2026-10-26 现场 GA174→GA193 事故): 远低于基线
+                            // (差 > BACKFILL_MAX)的号 —— 旧逻辑一律当"老号"挡死, 于是
+                            // 一旦基线被误读带偏, 当天剩余的真小号全哑 (175~178 就是这么
+                            // 丢的)。这里给一个出口: 该号**连续 K 轮**被独立看见, 判定为
+                            // 新一轮/回退, 重置基线并放行(播报该号, 它就是屏幕当前真实
+                            // 叫号)。票不进 confirm(见 seq_reset_tick 注释)。
+                            // 不误判残影的原因见 SEQ_RESET_ROUNDS 注释。
+                            let key = (n.clone(), w.clone());
+                            let prev = self.seq_rounds.get(&key).copied().unwrap_or(0);
+                            let (rounds, fire) = seq_reset_tick(prev);
+                            if fire {
+                                self.last_num.insert(pre.clone(), *v);
+                                self.seq_rounds.clear();
+                                self.seq_seen_prev.clear();
+                                println!(
+                                    "[闸门] 序列重置: {} 连续 {} 轮稳定出现且远低于基线 {} \
+                                     -> 判为新一轮, 基线重置为 {} 并放行",
+                                    n, rounds, last, v
+                                );
+                                out.insert(key);
+                                any = true;
+                            } else {
+                                self.seq_rounds.insert(key, rounds);
+                                blocked.push(format!(
+                                    "{}(<{}, 序列重置 {}/{})",
+                                    n, last, rounds, SEQ_RESET_ROUNDS
+                                ));
+                            }
                         }
                     }
                     // 兜底: 长时间一句没播, 而又有"更大的号"被硬上限挡住
@@ -1191,8 +1309,12 @@ impl Loop {
                 }
             }
         }
-        if !blocked.is_empty() && now - self.gate_log_at >= 10.0 {
-            self.gate_log_at = now;
+        // 连续性约束: 上一轮还在数、这一轮却没再看见的号 -> 归零(残影断续出现攒不够)。
+        // 放在"放行判定"之后: 本轮真触发重置时表已被整体清空, 这里无可清。
+        self.seq_seen_prev = cand_all.clone();
+        let seen = self.seq_seen_prev.clone();
+        self.seq_rounds.retain(|k, _| seen.contains(k));
+        if !blocked.is_empty() && now - self.gate_log_at >= 10.0 {            self.gate_log_at = now;
             println!(
                 "[闸门] 拦截 {} (上限 +{}, 当前基线 {:?})",
                 blocked.join(", "),
@@ -1261,6 +1383,9 @@ impl Loop {
             return;
         }
         let mut winners = number_votes(&self.confirm);
+        // 本轮是否"真的处理过至少一个候选"(标记或播报)。见末尾 day_reseed 清理条件:
+        // 读空的一轮不算"首批已处理", 否则标记会被白白清掉。
+        let mut handled = false;
         // 同 fast_confirm: 数值序播报(GA9 先于 GA10), 不用字符串序(第八轮低危)。
         winners.sort_by(|a, b| announce_sort_key(&a.0, &a.1).cmp(&announce_sort_key(&b.0, &b.1)));
         for (number, window, votes, first, _last) in winners {
@@ -1269,6 +1394,8 @@ impl Loop {
             if votes < self.need_stable + extra || self.announced.contains_key(&number) {
                 continue;
             }
+            // 能走到这里说明该号够票且未播过 —— 本轮确实处理了它(下面是标记或播报)。
+            handled = true;
             if self.seed_only_after_reset(&number, now) {
                 continue;
             }
@@ -1287,7 +1414,13 @@ impl Loop {
             );
         }
         // 同 fast_confirm: 首批处理完清跨日标记, 去重表接管残留号的后续压制。
-        self.day_reseed = false;
+        // ★2026-10-26(改动二)修正: 只在"本轮真的处理过至少一个候选"时才清 ——
+        //   开机第一轮 OCR 常常读空(屏刚上电闪黑/未聚焦/换号动画中), 若照样清标记,
+        //   下一轮那个残留大号就会趁虚而入把基线毒化, 整个补丁等于白打。没处理候选
+        //   就保持标记, 等真正出现候选那一轮再判定"只标记 / 正常播"。
+        if !keep_day_reseed(handled) {
+            self.day_reseed = false;
+        }
     }
 
     /// 记一轮 OCR 的耗时进诊断窗口(诊断心跳的 [监测] 行用)。
@@ -1521,8 +1654,9 @@ fn main() {
 mod tests {
     use super::{
         announce_sort_key, drop_shadow_empty, effective_ttl, gate_day_rollover, in_work_window,
-        jump_extra_confirm, number_votes, resolve_row_pitch, seed_only_decide, settle_ready,
-        time_plausible_y, SETTLE_MAX_WAIT_SECS,
+        jump_extra_confirm, keep_day_reseed, number_votes, resolve_row_pitch, seed_only_decide,
+        seq_reset_eligible, seq_reset_tick, settle_ready, time_plausible_y, JUMP_HARD_MAX,
+        SEQ_RESET_ROUNDS, SETTLE_MAX_WAIT_SECS,
     };
     use std::collections::{HashMap, HashSet};
 
@@ -1844,5 +1978,117 @@ mod tests {
         assert!(!in_work_window("12:00", "8点", "18:00"));
         assert!(!in_work_window("12:00", "08:00", ""));
         assert!(!in_work_window("", "08:00", "18:00"));
+    }
+
+    // ———— 开机防毒化(2026-10-26 上午 GA219 事故) ————
+    // 每天 08:00 全新启动、当天无 OK 记录 -> 基线为空 -> "无基线取最大"会把屏上
+    // 残留大号播掉并毒化基线, 之后当天小号全被"号小了差>5"挡死。修法=此时置
+    // day_reseed, 让首批候选只标记不播(复用零点跨日的既有机制)。
+    #[test]
+    fn boot_without_baseline_suppresses_first_batch() {
+        // 无基线 + 标记生效: 首个大号(GA219)只标记不播 -> 基线不被毒化
+        assert!(
+            seed_only_decide(true, false),
+            "开机无基线时, 首个候选必须只标记不播, 否则基线被残留大号毒化"
+        );
+        // 已有基线(当天真号先到并播种): 正常播, 不被标记误吞
+        assert!(!seed_only_decide(true, true));
+        // 无标记(当天有记录的正常重启): 一切照旧
+        assert!(!seed_only_decide(false, false));
+        assert!(!seed_only_decide(false, true));
+    }
+
+    // ———— 序列重置(2026-10-26 下午 GA174→GA193 事故) ————
+    // 判定口径: "远低于基线"= 有基线、v<last、且差值 > 补播窗口 BACKFILL_MAX。
+    #[test]
+    fn seq_reset_only_for_far_below_baseline() {
+        // 基线 193(被误读毒化), 真号 175: 差 18 > 5 -> 够格做序列重置
+        assert!(seq_reset_eligible(true, 193, 175));
+        // 紧贴基线下方的号属于补播窗口, 走 BACKFILL_MAX 那条路, 不归序列重置管
+        assert!(!seq_reset_eligible(true, 175, 173));
+        assert!(!seq_reset_eligible(true, 175, 171)); // 差恰好 4, 仍在补播窗口(≤5)内
+        assert!(!seq_reset_eligible(true, 175, 170)); // 差恰好 5 = 补播窗口边界, 不算"远低"
+        assert!(seq_reset_eligible(true, 175, 169)); // 差 6 > 5 -> 够格
+        // 等于/大于基线: 不是"小号", 交给跳幅闸门
+        assert!(!seq_reset_eligible(true, 175, 175));
+        assert!(!seq_reset_eligible(true, 175, 176));
+        // 无基线: 由"无基线取最大"处理, 与序列重置无关
+        assert!(!seq_reset_eligible(false, 175, 100));
+    }
+
+    // 回归现场: 174 之后误读 193(差 19, 落在 +10~+30 多确认档, 残影稳定驻留骗过
+    // 多确认票) —— 说明"多要几票"挡不住稳定残影, 必须靠时间维度的序列重置兜底。
+    #[test]
+    fn seq_reset_covers_typo_jump_inside_hard_limit() {
+        let (last, misread) = (174u32, 193u32);
+        assert!(misread > last && misread <= last + JUMP_HARD_MAX, "误读的 193 当初确实在放行区间内");
+        assert!(jump_extra_confirm(misread - last, JUMP_HARD_MAX) > 0, "当初也只要求了额外确认票");
+        // 误读发生后基线变 193, 真号 175 属于"远低于基线" -> 序列重置是唯一出口
+        assert!(seq_reset_eligible(true, 193, 175));
+    }
+
+    // ———— 改动二: 首轮读空不得清 day_reseed ————
+    // 开机第一轮 OCR 常读空(闪黑/未聚焦/换号动画), 若照样清标记, 下一轮屏上残留
+    // 的昨日大号就会被"无基线取最大"播出去并把基线毒化成它(2026-10-26 上午 GA219)。
+    #[test]
+    fn day_reseed_kept_when_round_handled_nothing() {
+        // 本轮没有任何候选被处理(读空 / 全被票数或去重挡掉) -> 保住标记
+        assert!(keep_day_reseed(false), "读空的一轮不能把 day_reseed 清掉");
+        // 本轮真处理过至少一个候选(标记或播报) -> 标记用完, 清掉
+        assert!(!keep_day_reseed(true), "处理过候选后就该清标记, 否则真小号会被当成残留吞掉");
+    }
+
+    // 端到端口径: 标记 + 无基线 = 只标记不播(压制开机首批); 清标记后才正常播。
+    #[test]
+    fn boot_first_batch_marked_then_normal_after_clear() {
+        // 首个候选(屏上昨日残留 GA219)到位: 标记生效 + 前缀无基线 -> 只标记
+        assert!(seed_only_decide(true, false), "开机首批必须只标记不播");
+        // 同一轮处理完成后标记被清, 之后真号(GA002)无基线 -> 走正常播报
+        assert!(!seed_only_decide(!keep_day_reseed(true), false));
+        // 若那一轮其实读空(标记没被清), 后续残留号仍然只标记 —— 不毒化基线
+        assert!(seed_only_decide(keep_day_reseed(false), false));
+    }
+
+    // ———— 改动三: 序列重置(连续 K 轮稳定) ————
+    /// 模拟连续多轮都看见同一个号时的票数推进, 返回首次够 K 轮的轮次号(1-based)。
+    fn rounds_until_fire() -> u32 {
+        let mut rounds = 0u32;
+        for i in 1..=20u32 {
+            let (n, fire) = seq_reset_tick(rounds);
+            rounds = n;
+            if fire {
+                return i;
+            }
+        }
+        panic!("{} 轮内应触发序列重置", 20);
+    }
+
+    #[test]
+    fn seq_reset_fires_at_k_rounds_and_passes_number() {
+        // 基线 193(被 GA193 误读毒化), 真号 175 稳定出现 -> 第 K 轮重置并放行
+        assert_eq!(rounds_until_fire(), SEQ_RESET_ROUNDS, "必须恰好在第 K 轮触发");
+        assert_eq!(SEQ_RESET_ROUNDS, 5, "K=5 是现场约定(≈6~7s)");
+        // 触发条件与"远低于基线"口径一致: 193 vs 175 差 18 够格
+        assert!(seq_reset_eligible(true, 193, 175));
+        // 票数推进是单调的, 且触发后仍保持 >= K(调用方会清表, 不依赖此值)
+        let (n1, f1) = seq_reset_tick(0);
+        assert_eq!((n1, f1), (1, false), "第 1 轮只计数不放行");
+        let (n2, f2) = seq_reset_tick(SEQ_RESET_ROUNDS);
+        assert!(n2 > SEQ_RESET_ROUNDS && f2, "已够 K 轮后继续调用仍应判定为可重置");
+    }
+
+    #[test]
+    fn seq_reset_not_fired_below_k_rounds() {
+        // 候选小于基线但只出现 < K 轮: 一律不放行(残影通常撑不到 K 轮)
+        let mut rounds = 0u32;
+        for _ in 0..SEQ_RESET_ROUNDS - 1 {
+            let (n, fire) = seq_reset_tick(rounds);
+            assert!(!fire, "不满 {} 轮绝不能重置基线", SEQ_RESET_ROUNDS);
+            rounds = n;
+        }
+        assert_eq!(rounds, SEQ_RESET_ROUNDS - 1);
+        // 中间断一轮(调用方把票清零)后重新数, 依旧不会提前触发
+        let (n, fire) = seq_reset_tick(0);
+        assert_eq!((n, fire), (1, false), "断开后从头数, 第一轮不放行");
     }
 }
