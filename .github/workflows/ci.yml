@@ -44,6 +44,10 @@ jobs:
         run: cargo fmt --all --check
 
       # ★2026-10-23 低危修复: Python 侧(配置台/TTS 服务)此前完全裸奔在 CI 外,
-      #   安全最关键的 config_web.py 没有任何门禁。补 pytest 步骤。
+      #   安全最关键的 config_web.py 没有任何门禁。补测试步骤。
+      # ★2026-10-27: 原命令 `python3 -m pytest` 在 ubuntu runner 上直接
+      #   ModuleNotFoundError(runner 的系统 python3 没有 pytest, 该步骤自加入起
+      #   一直是红的)。全部用例都是标准 unittest.TestCase, 改用内置 unittest
+      #   discover: 零第三方依赖, 与本地/播报机跑法完全一致(142 用例通过)。
       - name: Python 单元测试
-        run: python3 -m pytest tests/ -q
+        run: python3 -m unittest discover -s tests -q
