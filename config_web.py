@@ -555,6 +555,16 @@ def validate_and_build(body):
             rw_p = int(cur_det.get("row_pitch") or 0)
         d["row_pitch"] = min(400, max(0, rw_p))
         d["rows"] = 1 if d["row_pitch"] == 0 else min(5, max(1, rw_n))
+        # 高亮行 1-based；0/空 = 自动挑最亮行。固定值只允许落在 rows 范围内，
+        # 避免把现场误配成“第 4 行”却永远没有该行可识别。
+        raw_hr = det.get("highlight_row", cur_det.get("highlight_row"))
+        try:
+            hr = int(raw_hr or 0)
+        except (TypeError, ValueError):
+            return None, "highlight_row 必须是整数（0=自动，或 1~rows）"
+        if hr < 0 or hr > d["rows"]:
+            return None, "highlight_row 需为 0（自动）或 1~%d" % d["rows"]
+        d["highlight_row"] = hr or None
         d.setdefault("min_interval_sec", 0.5)
         if not (0 < d["changed_ratio"] < 1):
             return None, "changed_ratio 必须在 (0,1)"
@@ -752,6 +762,7 @@ fps <input id=fps type=number value=3 step=0.5>
 <label>跳号上限 max_jump <input id=d_jump type=number step=1 min=0 max=20>（0=关闭；2 表示只放行 +1/+2）</label>
 <label>列表行数 rows <input id=d_rows type=number step=1 min=1 max=5>（1=只认框内这一行）</label>
 <label>行距 row_pitch <input id=d_pitch type=number step=1 min=0 max=400>（像素，相邻两行间距；0=不分行）</label>
+<label>高亮行 highlight_row <input id=d_highlight type=number step=1 min=0 max=5>（0=自动；现场可固定为 1~rows）</label>
 </fieldset>
 
 <fieldset><legend>播报</legend>
@@ -943,6 +954,7 @@ function fillForm(c){
  $('d_jump').value=(c.detect.max_jump!=null?c.detect.max_jump:2);
  $('d_rows').value=(c.detect.rows!=null?c.detect.rows:1);
  $('d_pitch').value=(c.detect.row_pitch!=null?c.detect.row_pitch:0);
+ $('d_highlight').value=(c.detect.highlight_row!=null?c.detect.highlight_row:0);
  $('t_en').checked=c.tts.enabled;$('t_rep').value=c.tts.repeat;$('t_rate').value=c.tts.rate;
  $('t_len').value=(c.tts.piper_length_scale!=null?c.tts.piper_length_scale:1.25);
  $('t_wl').checked=c.tts.speak_window_letter||false;
@@ -981,7 +993,8 @@ function collect(){
    stable_frames:+$('d_stable').value,confirm_ttl_sec:+$('d_ttl').value,
    active_sec:+$('d_act').value,fallback_ocr_sec:+$('d_fb').value,
    settle_sec:+$('d_settle').value,max_jump:+$('d_jump').value,
-   rows:+$('d_rows').value,row_pitch:+$('d_pitch').value},
+   rows:+$('d_rows').value,row_pitch:+$('d_pitch').value,
+   highlight_row:+$('d_highlight').value},
   tts:{enabled:$('t_en').checked,repeat:+$('t_rep').value,rate:+$('t_rate').value,
    piper_length_scale:+$('t_len').value,speak_window_letter:$('t_wl').checked,
    spell_number:$('t_spell').checked,

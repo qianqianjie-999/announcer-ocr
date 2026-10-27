@@ -67,6 +67,10 @@ const JUMP_HARD_MAX: u32 = 30;
 /// 挡住。K=5 覆盖两窗口紧挨着连续叫号的场景。
 const BACKFILL_MAX: u32 = 5;
 
+/// 高亮行增强会把图像放大到 2 倍，并跑 31x31 局部均值。限制原始 ROI 总像素，
+/// 防止高度误配时预处理在 tesseract 超时保护之外长时间占满主循环。
+const MAX_ENHANCE_PIXELS: u64 = 400_000;
+
 /// ★序列重置(2026-10-26 现场 GA174→GA193 事故): 候选【远小于基线】(差 > BACKFILL_MAX)
 /// 时, 若同一号**连续 K 轮稳定出现**, 判定为"新一轮序列开始"(回退/换队列/系统重置
 /// 编号), 重置基线为该号并正常播报它 —— 它就是屏幕当前真实叫号。
@@ -464,6 +468,52 @@ fn seed_only_decide(day_reseed: bool, has_baseline: bool) -> bool {
 fn keep_day_reseed(handled_any_candidate: bool) -> bool {
     !handled_any_candidate
 }
+
+/// 多行扫描是否可以在下一行前退出。
+///
+/// 必须同时满足：至少看过一个候选、候选全部已播、且已经越过高亮行。
+/// 空集合的 `all()` 恒真，不能直接用于这里；否则第 1 行读空会把第 2 行高亮号一起跳过。
+fn should_stop_before_row(
+    row_index: usize,
+    highlight_row: Option<usize>,
+    seen_count: usize,
+    all_announced: bool,
+) -> bool {
+    row_index > 0
+        && seen_count > 0
+        && all_announced
+        && highlight_row.is_none_or(|h| row_index > h)
+}
+
+/// 固定高亮行优先；配置无效或未配置时退回自动判定。
+fn resolve_highlight_row(
+    configured: Option<u32>,
+    detected: Option<usize>,
+    rows: usize,
+) -> Option<usize> {
+    configured
+        .and_then(|v| (1..=rows as u32).contains(&v).then_some(v as usize - 1))
+        .or(detected)
+}
+
+/// OCR 候选质量：完整窗口 > 仅号码 > 空结果。用于在 psm 主/副档之间选更完整结果，
+/// 避免主档只读出号码就提前结束、始终没机会让副档补出窗口。
+fn ocr_candidate_quality(cands: &HashSet<(String, String)>) -> u8 {
+    if cands.is_empty() {
+        0
+    } else if cands.iter().any(|(_, w)| !w.trim().is_empty()) {
+        2
+    } else {
+        1
+    }
+}
+
+fn enhancement_pixels_allowed(width: usize, height: usize) -> bool {
+    width <= 1280
+        && (width as u64).saturating_mul(height as u64) <= MAX_ENHANCE_PIXELS
+}
+
+type RankedOcrResult = (String, HashSet<(String, String)>, u8);
 
 /// 作息闸判定(纯函数, 便于单测): 当前 "HH:MM" 是否落在 start~end 工作窗口内。
 /// start<=end 为普通窗口(含 start、不含 end); start>end 为跨零点窗口
@@ -1062,7 +1112,11 @@ impl Loop {
             ));
         }
         let lumas: Vec<u8> = crops.iter().map(detect::median_luma_red).collect();
-        let highlight_row = detect::pick_highlight_row(&lumas);
+        let highlight_row = resolve_highlight_row(
+            self.det.highlight_row,
+            detect::pick_highlight_row(&lumas),
+            rows,
+        );
         // 判定结果变化时才打日志: 现场光照/版式一变, 这行能立刻看出判据还准不准。
         if self.highlight_row != highlight_row {
             match highlight_row {
@@ -1076,7 +1130,9 @@ impl Loop {
             self.highlight_row = highlight_row;
         }
         for (i, crop) in crops.iter().enumerate() {
-            if i > 0 && cands.iter().all(|c| self.announced.contains_key(&c.0)) {
+            let all_announced = !cands.is_empty()
+                && cands.iter().all(|c| self.announced.contains_key(&c.0));
+            if should_stop_before_row(i, highlight_row, cands.len(), all_announced) {
                 break;
             }
             // 第一行失败才真报错(与单行时代语义一致); 后续行失败只当这一行没读出来,
@@ -1107,10 +1163,10 @@ impl Loop {
     ///   - 普通行(深蓝底白字): 原图 -> 旧增强 psm(主) -> 旧增强 psm(副)
     ///   - 高亮行(浅蓝底白字): 新增强 psm(主) -> 新增强 psm(副) -> 原图兜底
     ///
-    /// ★高亮行为什么要"跳过原图": 原图对高亮行常给出**号对窗错**的假阳性
+    /// ★高亮行为什么优先专用增强: 原图对高亮行常给出**号对窗错**的假阳性
     ///   (实测 `到C0 而力有`、`到G05号窗日`)。原图一旦"解析出候选"就不会再走
-    ///   兜底, 于是假窗口被当成真值播出去 —— 比读不出更糟。所以高亮行必须
-    ///   让专用增强先上, 增强两档都空了才回退原图。
+    ///   兜底, 于是假窗口被当成真值播出去 —— 比读不出更糟。所以优先专用增强；
+    ///   增强只读到号码时允许原图仅补完整窗口，两档都空时才无条件回退原图。
     /// ★旧增强在高亮行上是负收益(浅底被判成字, 61% 像素连成黑块), 所以高亮行
     ///   完全不走旧链。
     fn recognize_one(
@@ -1124,21 +1180,39 @@ impl Loop {
         let psm_alt = if psm_main == 6 { 11 } else { 6 };
         // 大图不做增强(CPU 保护, 与旧逻辑一致): ROI 宽超过 1280 说明分辨率远超
         // 现场布局, 增强的 2x 放大代价会翻倍。
-        let enhance_ok = self.roi.2 <= 1280;
+        let enhance_ok = enhancement_pixels_allowed(self.roi.2, self.roi.3);
 
         if highlight && enhance_ok {
             let up = detect::enhance_highlight_for_ocr(crop);
             let mut fallback_raw = String::new();
+            let mut best: Option<RankedOcrResult> = None;
             for psm in [psm_main, psm_alt] {
                 if let Ok(raw2) = self.ocr.recognize_psm(&up, psm) {
                     let c2 = self.ocr.parse(&raw2);
-                    if !c2.is_empty() {
-                        return Ok((raw2, c2));
-                    }
                     if fallback_raw.is_empty() {
-                        fallback_raw = raw2;
+                        fallback_raw = raw2.clone();
+                    }
+                    let q = ocr_candidate_quality(&c2);
+                    if q > best.as_ref().map_or(0, |(_, _, old_q)| *old_q) {
+                        best = Some((raw2, c2, q));
+                    }
+                    if q == 2 {
+                        break;
                     }
                 }
+            }
+            if let Some((best_raw, best_cands, best_q)) = best {
+                if best_q == 2 {
+                    return Ok((best_raw, best_cands));
+                }
+                // 增强图只读到号码时，允许原图补完整窗口；但原图只读到号码不替换，
+                // 避免回退到本函数注释里提到的“号对窗错”假阳性。
+                let raw = self.ocr.recognize(crop)?;
+                let cands = self.ocr.parse(&raw);
+                if ocr_candidate_quality(&cands) > best_q {
+                    return Ok((raw, cands));
+                }
+                return Ok((best_raw, best_cands));
             }
             // 专用增强全空: 退回原图再试一次。此刻原图大概率也读不出, 但只要
             // 能读出就是净收益, 读不出也只是回到"这行没认到"。
@@ -1150,9 +1224,12 @@ impl Loop {
             return Ok((raw, cands));
         }
 
-        let mut raw = self.ocr.recognize(crop)?;
-        let mut cands = self.ocr.parse(&raw);
-        if cands.is_empty() && enhance_ok {
+        let raw = self.ocr.recognize(crop)?;
+        let cands = self.ocr.parse(&raw);
+        let mut best_raw = raw;
+        let mut best_cands = cands;
+        let mut best_q = ocr_candidate_quality(&best_cands);
+        if best_q < 2 && enhance_ok {
             // 兜底增强识别链: 原图(上面已跑) -> 增强图 psm(主) -> 增强图 psm(副)。
             // ★为什么要增强: 真实摄像头画面是"白字深底+小字+糊", tesseract 对
             //   原图几乎全乱码(靶机实测 [播报] 长期为 0 的根因之一), 沙盒用干净
@@ -1161,19 +1238,21 @@ impl Loop {
             //   (实测同一图一个读对窗口、一个读对号码), 各试一次先中先用。
             let up = detect::enhance_for_ocr(crop);
             for psm in [psm_main, psm_alt] {
-                if !cands.is_empty() {
+                if best_q == 2 {
                     break;
                 }
                 if let Ok(raw2) = self.ocr.recognize_psm(&up, psm) {
                     let c2 = self.ocr.parse(&raw2);
-                    if !c2.is_empty() {
-                        cands = c2;
-                        raw = raw2;
+                    let q = ocr_candidate_quality(&c2);
+                    if q > best_q {
+                        best_q = q;
+                        best_cands = c2;
+                        best_raw = raw2;
                     }
                 }
             }
         }
-        Ok((raw, cands))
+        Ok((best_raw, best_cands))
     }
 
     /// 把本轮识别结果归账: 诊断计数 -> 确认窗口/退避 -> 预热 -> 确认状态机 -> 票决播报。
@@ -1746,9 +1825,10 @@ fn main() {
 mod tests {
     use super::{
         announce_sort_key, drop_shadow_empty, effective_ttl, gate_day_rollover, in_work_window,
-        jump_extra_confirm, keep_day_reseed, number_votes, resolve_row_pitch, seed_only_decide,
-        seq_reset_eligible, seq_reset_tick, settle_ready, time_plausible_y, JUMP_HARD_MAX,
-        SEQ_RESET_SECS, SETTLE_MAX_WAIT_SECS,
+        jump_extra_confirm, keep_day_reseed, number_votes, ocr_candidate_quality,
+        resolve_highlight_row, resolve_row_pitch, seed_only_decide, seq_reset_eligible,
+        seq_reset_tick, settle_ready, should_stop_before_row, time_plausible_y,
+        enhancement_pixels_allowed, JUMP_HARD_MAX, SEQ_RESET_SECS, SETTLE_MAX_WAIT_SECS,
     };
     use std::collections::{HashMap, HashSet};
 
@@ -1766,6 +1846,46 @@ mod tests {
         // 边界: 2025(部署前, 视为时钟回退) 与 2036(超界)
         assert!(!time_plausible_y(2025));
         assert!(!time_plausible_y(2036));
+    }
+
+    #[test]
+    fn row_scan_never_stops_before_highlight_row() {
+        // 第 1 行是已播旧号，但高亮行在第 2 行：不能提前退出。
+        assert!(!should_stop_before_row(1, Some(1), 1, true));
+        // 第 1 行读空：空集合不能触发 all() 的真空真。
+        assert!(!should_stop_before_row(1, Some(1), 0, false));
+        // 已扫过高亮行且所见全是已播号：允许退出。
+        assert!(should_stop_before_row(2, Some(1), 1, true));
+        // 没有高亮行时保留原优化。
+        assert!(should_stop_before_row(1, None, 1, true));
+        // 已读到未播号：继续扫后续行补漏。
+        assert!(!should_stop_before_row(2, Some(1), 1, false));
+    }
+
+    #[test]
+    fn configured_highlight_row_overrides_auto_detection() {
+        assert_eq!(resolve_highlight_row(Some(2), Some(0), 3), Some(1));
+        assert_eq!(resolve_highlight_row(None, Some(1), 3), Some(1));
+        assert_eq!(resolve_highlight_row(Some(0), Some(1), 3), Some(1));
+        assert_eq!(resolve_highlight_row(Some(4), Some(1), 3), Some(1));
+    }
+
+    #[test]
+    fn ocr_candidate_quality_prefers_complete_window() {
+        let mut c = HashSet::new();
+        assert_eq!(ocr_candidate_quality(&c), 0);
+        c.insert(("GA200".to_string(), String::new()));
+        assert_eq!(ocr_candidate_quality(&c), 1);
+        c.insert(("GA200".to_string(), "C08".to_string()));
+        assert_eq!(ocr_candidate_quality(&c), 2);
+    }
+
+    #[test]
+    fn enhancement_pixel_budget_blocks_large_roi() {
+        assert!(enhancement_pixels_allowed(570, 69));
+        assert!(enhancement_pixels_allowed(1280, 200));
+        assert!(!enhancement_pixels_allowed(1280, 1080));
+        assert!(!enhancement_pixels_allowed(1600, 80));
     }
 
     // ———— 跳幅分档: 叫号员会过号, 卡 +2 会漏播; 分档后大跳只多等确认, 不丢号 ————

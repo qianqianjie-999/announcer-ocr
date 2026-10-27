@@ -340,6 +340,26 @@ class TestValidateAndBuild(unittest.TestCase):
         self.assertIsNone(cfg)
         self.assertIn("changed_ratio", err)
 
+    def test_highlight_row_accepts_auto_and_valid_row(self):
+        b = _base_body()
+        b["detect"].update({"rows": "3", "row_pitch": "70", "highlight_row": "2"})
+        cfg, err = cw.validate_and_build(b)
+        self.assertIsNone(err)
+        self.assertEqual(cfg["detect"]["highlight_row"], 2)
+
+        b["detect"]["highlight_row"] = "0"
+        cfg, err = cw.validate_and_build(b)
+        self.assertIsNone(err)
+        self.assertIsNone(cfg["detect"]["highlight_row"])
+
+    def test_highlight_row_rejects_out_of_range(self):
+        for bad in ("4", "-1"):
+            b = _base_body()
+            b["detect"].update({"rows": "3", "row_pitch": "70", "highlight_row": bad})
+            cfg, err = cw.validate_and_build(b)
+            self.assertIsNone(cfg, bad)
+            self.assertIn("highlight_row", err, bad)
+
     def test_missing_required_key(self):
         b = _base_body()
         del b["roi"]

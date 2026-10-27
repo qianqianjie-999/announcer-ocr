@@ -84,6 +84,9 @@ pub struct Detect {
     /// 仅在 `row_pitch = 0`(未给绝对像素)时生效; 两者都给则以 `row_pitch` 为准。
     /// 默认 0 = 不使用(保持"row_pitch=0 即单行"的旧语义)。
     #[serde(default)] pub row_pitch_ratio: f64,
+    /// 固定高亮行(1-based)。None/0 = 自动判最亮行；现场版式或反光导致自动判错时，
+    /// 可明确指到第 1~rows 行。启用后只影响增强链路，不改变逐行 OCR 的顺序。
+    #[serde(default)] pub highlight_row: Option<u32>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -259,6 +262,16 @@ impl Config {
                 self.fps
             ));
         }
+        if let Some(h) = self.detect.highlight_row {
+            let has_rows = self.detect.row_pitch > 0 || self.detect.row_pitch_ratio > 0.0;
+            if h > self.detect.rows.max(1) || (h > 1 && !has_rows) {
+                return Err(format!(
+                    "detect.highlight_row 必须为 0(自动)或 1~{} 内的行号，且多行识别必须启用 (当前 {})",
+                    self.detect.rows.max(1),
+                    h
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -363,6 +376,39 @@ mod tests {
             Err(e) => panic!("默认配置不应被拒: {e}"),
         };
         assert!(cfg.capture_width > 0 && cfg.capture_height > 0);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn load_rejects_invalid_highlight_row() {
+        for bad in [4, 5] {
+            let err = expect_load_err(&format!(
+                r#"{{"detect":{{"rows":3,"row_pitch":70,"highlight_row":{bad}}}}}"#
+            ));
+            assert!(err.contains("highlight_row"), "{err}");
+        }
+    }
+
+    #[test]
+    fn load_accepts_valid_highlight_row() {
+        let p = write_tmp_cfg(
+            r#"{"detect":{"rows":3,"row_pitch":70,"highlight_row":2}}"#,
+        );
+        let cfg = Config::load(&p).expect("合法高亮行配置应通过");
+        assert_eq!(cfg.detect.highlight_row, Some(2));
+        std::fs::remove_file(&p).ok();
+
+        let p = write_tmp_cfg(
+            r#"{"detect":{"rows":3,"row_pitch":70,"highlight_row":0}}"#,
+        );
+        let cfg = Config::load(&p).expect("highlight_row=0 应保持为自动模式");
+        assert_eq!(cfg.detect.highlight_row, Some(0));
+        std::fs::remove_file(&p).ok();
+
+        // 单行场景固定第 1 行无额外意义，但也不应让服务启动失败。
+        let p = write_tmp_cfg(r#"{"detect":{"highlight_row":1}}"#);
+        let cfg = Config::load(&p).expect("单行 highlight_row=1 应兼容");
+        assert_eq!(cfg.detect.highlight_row, Some(1));
         std::fs::remove_file(&p).ok();
     }
 
