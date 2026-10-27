@@ -8,18 +8,22 @@
   * 抓帧预览: ffmpeg 从 RTSP 或 USB 设备抓一帧 JPEG(超时 15s)
   * ROI 拖框: 预览图上鼠标拖矩形, 坐标按抓帧分辨率换算
   * 保存: 校验 -> 原子写 config.json -> sudo announce-schedule-apply
-    (sudoers 窄授权 3 条: /etc/sudoers.d/announce-web 放行 restart /
-    net-apply / schedule-apply, 见 deploy/sudoers.announce-web)
-端口 8080, 仅限内网使用, 无认证(调试场景)。
+  * HTTP Basic 认证: 部署脚本生成持久口令；非回环监听未配置口令时自动生成临时口令。
+端口 8080。默认只应部署在内网，公网访问必须加 TLS 反向代理。
 """
 import errno
+import base64
 import fcntl
 import glob
 import hashlib
+import hmac
+import ipaddress
 import json
 import math
 import os
 import re
+import secrets
+import socket
 import struct
 import subprocess
 import tempfile
@@ -30,6 +34,11 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = 8080
+WEB_BIND = os.environ.get("ANNOUNCE_WEB_BIND", "0.0.0.0").strip()
+WEB_USER = os.environ.get("ANNOUNCE_WEB_USER", "admin").strip() or "admin"
+# 非回环监听默认必须认证。部署脚本会生成持久口令并通过 EnvironmentFile 注入；
+# 手工直接启动时由 main() 生成一次性口令并打印到 journal。
+WEB_PASSWORD = os.environ.get("ANNOUNCE_WEB_PASSWORD", "").strip()
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG = os.path.join(HERE, "config.json")
 SIM_FRAME = os.path.join(HERE, "sim_frame.jpg")
@@ -38,7 +47,10 @@ RESTART_CMD = ["sudo", "-n", "/usr/bin/systemctl", "restart", "announce-rs"]
 # 工作时间调度：root 辅助脚本，负责「写 systemd timer + 按当前时刻校正运行状态」。
 # 保存配置后优先走它（未启用调度时它会退化为 restart，等价旧行为）。
 MAINT_CMD = ["sudo", "-n", "/usr/local/sbin/announce-maint"]
-SCHED_CMD = ["sudo", "-n", "/usr/local/sbin/announce-schedule-apply"]
+SCHED_CMD = [
+    "sudo", "-n", "/usr/local/sbin/announce-schedule-apply",
+    "--apply", "--conf", CONFIG,
+]
 NET_SCRIPT = "/usr/local/sbin/announce-net-apply.sh"
 # 手工校时: 配置台以 debian13 跑, 改系统时间要 root。现场无 sudo, 用 su 就得在
 # 这里明文存 root 密码(不可接受) —— 改为"请求文件", 由 root 的 announce-time.timer
@@ -46,6 +58,40 @@ NET_SCRIPT = "/usr/local/sbin/announce-net-apply.sh"
 TIME_DIR = "/var/lib/announce-rs/time"
 
 NET_DEFAULT_IP = "192.168.31.1"  # 出厂默认(直连调试场景; 有路由器的现场勿用, 多为网关地址)
+
+
+def _loopback_bind(bind):
+    """监听地址是否只暴露在本机回环接口。"""
+    value = (bind or "").strip().strip("[]").lower()
+    if value == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(value).is_loopback
+    except ValueError:
+        return False
+
+
+def ensure_web_password(bind, password):
+    """返回最终 Web 口令；非回环监听在未配置时自动生成强口令。"""
+    password = (password or "").strip()
+    if password or _loopback_bind(bind):
+        return password
+    return secrets.token_urlsafe(24)
+
+
+def basic_auth_ok(header, password):
+    """校验 HTTP Basic 凭据。空口令表示仅限本机开发模式。"""
+    if not password:
+        return True
+    if not header or not header.startswith("Basic "):
+        return False
+    try:
+        supplied = base64.b64decode(header[6:].strip(), validate=True)
+    except (ValueError, TypeError):
+        return False
+    expected = ("%s:%s" % (WEB_USER, password)).encode("utf-8")
+    return hmac.compare_digest(supplied, expected)
+
 
 # ---------------------------------------------------------------- config io
 
@@ -384,9 +430,30 @@ def validate_rtsp(src):
             return False, "RTSP 地址含非法序列 %r" % bad
     if not _RTSP_RE.match(src):
         return False, "RTSP 地址格式非法(仅允许 rtsp:// 主机/路径 与常见参数)"
-    # 主机段不能为空
-    host = src[len("rtsp://"):].split("/")[0].split("@")[-1].split(":")[0]
-    if not host or host in ("localhost", "127.0.0.1", "0.0.0.0", "::1"):
+    # 主机段不能为空；用 URL 解析而非字符串切分，正确处理账号、端口和 IPv6 方括号。
+    try:
+        parsed = urllib.parse.urlsplit(src)
+        host = (parsed.hostname or "").strip().rstrip(".").lower()
+        _ = parsed.port  # 非法端口在这里抛出 ValueError
+    except ValueError:
+        return False, "RTSP 主机或端口格式非法"
+    if not host:
+        return False, "RTSP 主机不允许指向本机"
+
+    def is_local_host(value):
+        if value == "localhost":
+            return True
+        try:
+            ip = ipaddress.ip_address(value)
+        except ValueError:
+            # inet_aton 覆盖 127.1、127.0.0.2、2130706433 等 IPv4 简写。
+            try:
+                ip = ipaddress.ip_address(socket.inet_aton(value))
+            except OSError:
+                return False
+        return ip.is_loopback or ip.is_unspecified
+
+    if is_local_host(host):
         return False, "RTSP 主机不允许指向本机"
     return True, src
 
@@ -1709,7 +1776,25 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _require_auth(self):
+        """未认证时发 401；返回 True 表示调用方应立即结束本次请求。"""
+        if basic_auth_ok(self.headers.get("Authorization"), WEB_PASSWORD):
+            return False
+        data = json.dumps(
+            {"error": "需要认证", "user": WEB_USER},
+            ensure_ascii=False,
+        ).encode("utf-8")
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="announce-rs", charset="UTF-8"')
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+        return True
+
     def do_GET(self):
+        if self._require_auth():
+            return
         u = urllib.parse.urlparse(self.path)
         try:
             if u.path == "/":
@@ -1813,8 +1898,10 @@ class Handler(BaseHTTPRequestHandler):
             return None, "读取请求体失败: %s" % e, 400
 
     def do_POST(self):
+        if self._require_auth():
+            return
         u = urllib.parse.urlparse(self.path)
-        # ★CSRF 防御(2026-10-22): 本服务无认证, 所有 POST 都是"改配置/断网/重启"
+        # ★CSRF 防御(2026-10-22): POST 都是"改配置/断网/重启"
         #   级别的副作用操作, 必须先过同源校验(独立成 _same_origin 是为了能进单测)。
         if not _same_origin(self.headers.get("Origin"),
                             self.headers.get("Referer"),
@@ -2015,8 +2102,19 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
-    print("[config_web] listening on 0.0.0.0:%d, config=%s" % (PORT, CONFIG), flush=True)
+    global WEB_PASSWORD
+    had_password = bool(WEB_PASSWORD)
+    WEB_PASSWORD = ensure_web_password(WEB_BIND, WEB_PASSWORD)
+    srv = ThreadingHTTPServer((WEB_BIND, PORT), Handler)
+    print("[config_web] listening on %s:%d, config=%s" % (WEB_BIND, PORT, CONFIG), flush=True)
+    if WEB_PASSWORD and not had_password:
+        print(
+            "[config_web] 未配置 ANNOUNCE_WEB_PASSWORD，本次生成临时口令。"
+            "用户名=%s 口令=%s（重启后会变化）" % (WEB_USER, WEB_PASSWORD),
+            flush=True,
+        )
+    elif WEB_PASSWORD:
+        print("[config_web] HTTP Basic 认证已启用，用户名=%s" % WEB_USER, flush=True)
     srv.serve_forever()
 
 

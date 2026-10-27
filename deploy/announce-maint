@@ -10,22 +10,103 @@
 #
 # 安全设计:
 #   * 恢复前把当前二进制+配置再留底一层到 backup/pre-restore-<时间戳>/,
-#     万一恢复错了还能一键翻回来(手工 cp 即可);
+#     任一步失败自动回滚到这份留底并重新拉起服务;
 #   * 恢复包文件缺失/为空时直接拒绝, 不停服务;
 #   * 不恢复 config_web.py —— 配置台保留最新版, 避免把新功能/安全修复一并回退。
-set -u
-OPT=/opt/announce-rs
-BK=$OPT/backup
+set -euo pipefail
+
+find_app_root() {
+  local c
+  if [[ -n "${ANNOUNCE_ROOT:-}" ]]; then
+    printf '%s\n' "$ANNOUNCE_ROOT"
+    return
+  fi
+  for c in /opt/announce-rs /home/debian/anntest /root/anntest; do
+    if [[ -x "$c/announce-rs" || -r "$c/config.json" ]]; then
+      printf '%s\n' "$c"
+      return
+    fi
+  done
+}
+
+OPT="$(find_app_root)"
+[[ -n "$OPT" ]] || {
+  printf '[maint] 错误: 找不到 announce-rs 部署目录（可用 ANNOUNCE_ROOT 指定）\n' >&2
+  exit 1
+}
+BK="${ANNOUNCE_BACKUP_DIR:-$OPT/backup}"
 SVC=announce-rs
 
 say() { printf '[maint] %s\n' "$*"; }
 die() { printf '[maint] 错误: %s\n' "$*" >&2; exit 1; }
 
+# 运维动作会停服并替换二进制，必须全脚本串行；双击按钮或并发请求时
+# 第二个执行体直接报错，而不是与第一个互相覆盖/抢着收尸。
+mkdir -p "$BK" || die "无法创建备份目录: $BK"
+exec 9>"$BK/.announce-maint.lock"
+flock -n 9 || die "另一个运维操作正在执行，请稍后再试"
+
+wait_active() {
+  local i
+  for i in {1..20}; do
+    if systemctl is-active --quiet "$SVC"; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  return 1
+}
+
+restart_and_verify() {
+  systemctl restart "$SVC" || die "重启 $SVC 失败"
+  wait_active || die "重启后 $SVC 未进入 active 状态"
+  say "announce-rs 状态: active"
+}
+
+restore_files() {
+  local pkg="$1" pre="$2"
+  local stage_bin="$OPT/.announce-rs.restore.$$"
+  local stage_cfg="$OPT/.config.json.restore.$$"
+  local owner
+  owner="$(stat -c '%U:%G' "$OPT/announce-rs")" || die "无法读取当前二进制属主"
+
+  mkdir -p "$pre" || die "无法创建恢复前留底目录: $pre"
+  cp -a "$OPT/announce-rs" "$pre/" || die "备份当前二进制失败，未做任何替换"
+  cp -a "$OPT/config.json" "$pre/" || die "备份当前配置失败，未做任何替换"
+  [[ -s "$pre/announce-rs" && -s "$pre/config.json" ]] \
+    || die "恢复前留底不完整，未做任何替换"
+
+  cp "$pkg/announce-rs" "$stage_bin" || die "暂存恢复二进制失败"
+  cp "$pkg/config.json" "$stage_cfg" || die "暂存恢复配置失败"
+  chown "$owner" "$stage_bin" "$stage_cfg" || die "设置暂存文件属主失败"
+  chmod 755 "$stage_bin"
+  chmod 644 "$stage_cfg"
+
+  systemctl stop "$SVC" || die "停止 $SVC 失败，未替换生产文件"
+  if ! mv -f "$stage_bin" "$OPT/announce-rs" \
+      || ! mv -f "$stage_cfg" "$OPT/config.json"; then
+    say "替换生产文件失败，开始回滚"
+    cp -a "$pre/announce-rs" "$OPT/announce-rs" || true
+    cp -a "$pre/config.json" "$OPT/config.json" || true
+    systemctl start "$SVC" || true
+    die "恢复失败，已尝试回滚到恢复前版本"
+  fi
+
+  if ! systemctl start "$SVC" || ! wait_active; then
+    say "恢复版本启动失败，开始回滚"
+    cp -a "$pre/announce-rs" "$OPT/announce-rs" || true
+    cp -a "$pre/config.json" "$OPT/config.json" || true
+    if systemctl restart "$SVC" && wait_active; then
+      die "恢复版本启动失败，已回滚且旧版本服务正常"
+    fi
+    die "恢复版本启动失败，自动回滚后旧版本仍未恢复，请立即人工介入"
+  fi
+  say "announce-rs 状态: active"
+}
+
 case "${1:-}" in
   restart-service)
-    systemctl restart "$SVC"
-    sleep 2
-    say "announce-rs 状态: $(systemctl is-active "$SVC")"
+    restart_and_verify
     ;;
 
   restore-substream|restore-mainstream)
@@ -37,22 +118,9 @@ case "${1:-}" in
     [ -s "$PKG/announce-rs" ] || die "恢复包缺二进制或为空: $PKG/announce-rs"
     [ -s "$PKG/config.json" ] || die "恢复包缺配置或为空: $PKG/config.json"
 
-    # 当前版本留底(可回退)
     PRE="$BK/pre-restore-$(date +%Y%m%d-%H%M%S)"
-    mkdir -p "$PRE"
-    cp -a "$OPT/announce-rs" "$PRE/" 2>/dev/null
-    cp -a "$OPT/config.json" "$PRE/" 2>/dev/null
-
-    systemctl stop "$SVC"
-    cp "$PKG/announce-rs" "$OPT/announce-rs"
-    cp "$PKG/config.json" "$OPT/config.json"
-    chown debian13:debian13 "$OPT/announce-rs" "$OPT/config.json"
-    chmod 755 "$OPT/announce-rs"
-    chmod 644 "$OPT/config.json"
-    systemctl start "$SVC"
-    sleep 2
+    restore_files "$PKG" "$PRE"
     say "已执行 $1, 恢复前版本留底: $PRE"
-    say "announce-rs 状态: $(systemctl is-active "$SVC")"
     ;;
 
   reboot)

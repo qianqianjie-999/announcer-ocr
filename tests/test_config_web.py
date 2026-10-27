@@ -171,25 +171,19 @@ class TestValidateRtsp(unittest.TestCase):
                     "rtsp://0.0.0.0/s", "rtsp://::1/s"):
             ok, msg = cw.validate_rtsp(bad)
             self.assertFalse(ok, bad)
+            self.assertRegex(msg, "本机|非法", bad)
+
+    def test_reject_loopback_variants(self):
+        """IPv6 方括号、IPv4 简写和其他整型写法都必须按实际地址判定。"""
+        for bad in (
+            "rtsp://[::1]/s",
+            "rtsp://127.1/s",
+            "rtsp://127.0.0.2/s",
+            "rtsp://2130706433/s",
+        ):
+            ok, msg = cw.validate_rtsp(bad)
+            self.assertFalse(ok, bad)
             self.assertIn("本机", msg, bad)
-
-    def test_loopback_variants_known_gap(self):
-        """★已知缺口（本用例固化现状，非"期望行为"）：
-
-        "不允许指向本机"这道防线目前只枚举了 4 个字面主机名，
-        以下两种等价写法仍能通过：
-
-          * rtsp://[::1]/s       —— IPv6 回环的方括号写法，host 解析成 "[" 逃过比对
-          * rtsp://127.1/s       —— 127.0.0.0/8 整段的简写
-
-        危害有限（只是让 ffmpeg 去连本机，读文件类攻击已由伪协议黑名单拦死），
-        但属纵深防御的漏网。修复方向：解析出 host 后做 is_loopback 判定而非字面比对。
-        ★2026-10-23 低危修复: 加 skip 标记, 修复后取消 skip 并改为断言"拒绝"。
-        """
-        self.skipTest("已知安全缺口: rtsp://[::1]/s 和 rtsp://127.1/s 仍能通过回环校验, "
-                      "修复后取消 skip 并改为 assertFalse")
-        self.assertTrue(cw.validate_rtsp("rtsp://[::1]/s")[0])
-        self.assertTrue(cw.validate_rtsp("rtsp://127.1/s")[0])
 
 
 # ---------------------------------------------------------------- spell_*

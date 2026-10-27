@@ -131,12 +131,13 @@ Rust 版当前在用：
 | 文件 | 作用 |
 |---|---|
 | `announce-rs.service` | 主服务：`Restart=always`、`RestartSec=5`、`CPUQuota=300%`、`MemoryMax=300M` |
-| `announce-web.service` | Web 配置调试台（8080，**仅供内网调试**，故未加鉴权） |
+| `announce-web.service` | Web 配置调试台（8080，HTTP Basic 认证；仍只应部署在内网） |
 | `announce-piper.service` | 常驻 piper TTS 服务（避免每句重载模型） |
 | `announce-worktime-{start,stop}.{service,timer}` | 工作时段自动启停：每日 08:00 起、18:00 停。**注意**：Web 台每次保存都会经 `announce-schedule-apply` 的 `write_units` 同名覆盖为「`ExecStart=systemctl start/stop announce-rs.service` 直启单元 + `Persistent=false` + `announce-worktime-boot.service` 开机校正」——仓库里 `deploy/` 下指向 `announce-worktime-act.sh` 的静态单元仅在该脚本未接管时生效 |
 | `announce-worktime-act.sh` | worktime 幂等执行体（读 config.json 的 schedule 决定执行/跳过；schedule-apply 生成的单元不经过它） |
 | `announce-time.{service,timer}` + `announce-time-apply.sh` | Web 台手工校时：timer 每 5s 消费校时请求 |
-| `sudoers.announce-web` | Web 台 sudo 窄授权片段（restart / net-apply / schedule-apply 三条） |
+| `sudoers.announce-web` | Web 台 sudo 窄授权模板（restart / net-apply / schedule-apply / maint） |
+| `announce-maint` | Web 运维执行体：重启服务、恢复备份版本、重启主机；失败自动回滚 |
 | `announce-resmon.{service,timer}` + `announce-resmon.sh` | 资源巡检（CPU/内存/磁盘，写 CSV；timer 每 5 分钟触发一次） |
 | `audio_health.sh` | 播报音频链路自检/自愈（声卡复位→USB 热复位→重启升级链） |
 | `announce-cleanup.{service,timer}` + `announce-cleanup.sh` | 每日 03:30 清理：CSV 轮转、存证按天保留、journald 限额 |
@@ -150,3 +151,19 @@ Rust 版当前在用：
 
 > ⚠️ `deploy/config_web.py` 是 2026-09 的历史快照，与仓库根目录的 `config_web.py` 已不一致。
 > **配置台一律以根目录的 `config_web.py` 为准。**
+
+### Web 配置台认证
+
+`announce-rs-deploy/deploy.sh` 首次部署时生成 `/etc/announce-rs-web.env`，浏览器访问时
+使用用户名 `admin` 和脚本输出到终端的口令登录。文件权限为 `0600`，重复部署不会覆盖已有口令。
+
+手工启动时，非回环监听且未设置口令会生成一次性口令并打印到 journal：
+
+```bash
+export ANNOUNCE_WEB_BIND=0.0.0.0
+export ANNOUNCE_WEB_USER=admin
+export ANNOUNCE_WEB_PASSWORD='请替换为强口令'
+python3 config_web.py
+```
+
+HTTP Basic 不加密传输内容；公网或不可信网络必须置于 HTTPS 反向代理之后。

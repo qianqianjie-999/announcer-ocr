@@ -12,7 +12,9 @@
 #   sudo install -m 440 deploy/sudoers.announce-web /etc/sudoers.d/announce-web
 #   sudo visudo -c   # 必须显示 parsed OK
 #
-# 运行账号按现场调整(当前为 debian; 配置台服务以该账号运行)。
-debian ALL=(root) NOPASSWD: /usr/bin/systemctl restart announce-rs
-debian ALL=(root) NOPASSWD: /usr/local/sbin/announce-schedule-apply
-debian ALL=(root) NOPASSWD: /usr/local/sbin/announce-net-apply.sh
+# 运行账号由部署脚本按实际 Web 服务用户替换 __APP_USER__；手工安装也必须先替换：
+#   sed "s/__APP_USER__/$WEB_USER/g" ...
+__APP_USER__ ALL=(root) NOPASSWD: /usr/bin/systemctl restart announce-rs
+__APP_USER__ ALL=(root) NOPASSWD: /usr/local/sbin/announce-schedule-apply
+__APP_USER__ ALL=(root) NOPASSWD: /usr/local/sbin/announce-net-apply.sh
+__APP_USER__ ALL=(root) NOPASSWD: /usr/local/sbin/announce-maint

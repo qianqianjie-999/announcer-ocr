@@ -1,7 +1,7 @@
 [Unit]
 # announce-rs Web 配置器 — 192.168.8.100:8080
 # 调试人员在浏览器打开 http://192.168.8.100:8080 即可改配置(摄像头源/ROI拖框/参数)。
-# 依赖: /etc/sudoers.d/announce-web 窄授权(仅 restart announce-rs), 由部署脚本写入。
+# 认证: /etc/announce-rs-web.env；sudo 辅助命令由部署脚本写入窄授权。
 Description=announce-rs Web Configurator
 After=network.target announce-rs.service
 
@@ -9,6 +9,7 @@ After=network.target announce-rs.service
 Type=simple
 User=debian
 Group=debian
+EnvironmentFile=-/etc/announce-rs-web.env
 WorkingDirectory=/home/debian/anntest
 ExecStart=/usr/bin/python3 /home/debian/anntest/config_web.py
 Restart=always

@@ -6,7 +6,7 @@
 （要读写 `config.json`/`announce_log.csv`/`sim_frame.jpg`）。
 
 - **Python 标准库实现，零 pip 依赖**——弱靶机不用装任何包
-- 端口 `8080`，**仅限内网、无认证**（调试场景定位，勿暴露公网）
+- 端口 `8080`，默认启用 **HTTP Basic 认证**；仍只应部署在内网，公网必须加 HTTPS
 - 启动：`python3 config_web.py`，浏览器开 `http://<靶机IP>:8080/`
 
 ## 功能页
@@ -16,7 +16,7 @@
 | 配置编辑 | 摄像头源(USB/RTSP 含 IP+密码)/分辨率/检测参数/播报参数 |
 | **ROI 拖框** | 预览图上鼠标拖矩形，坐标按「配置的采集分辨率」自动换算（`capW()`），标定 ROI 不用手工算坐标 |
 | 抓帧预览 | `/api/snapshot`：ffmpeg 对 USB/RTSP 抓一帧 JPEG（超时 15s），失败给中文错误（IP/密码/网络可达） |
-| 一键保存 | 校验 → **原子写** config.json(tmp+rename) → `sudo announce-schedule-apply`（按作息决定 restart/stop；sudoers 窄授权另含 restart 与 net-apply，共 3 条） |
+| 一键保存 | 校验 → **原子写** config.json(tmp+rename) → `sudo announce-schedule-apply --apply --conf <当前配置>`（按作息决定 restart/stop） |
 | 服务状态 | systemd ActiveState/PID/内存 + 实时播报日志 |
 | OCR 自测 | `/api/test_ocr`：当前配置跑一轮识别，直接看解析结果 |
 | TTS 自测 | `/api/test_tts`：合成"GA200→08号窗口"试听，piper 走常驻服务优先 |
@@ -24,6 +24,7 @@
 | USB 设备枚举 | `/api/devices`：列出可用摄像头 |
 | 日志管理 | `/api/logs`：查看/清理播报 CSV |
 | 网络配置 | `/api/network`：配 RTSP 相机 IP 等，经 `announce-net-apply.sh` 应用，**二次确认**后生效 |
+| 运维操作 | `/api/maint`：重启服务、恢复主/辅码流备份版本、重启主机；脚本失败自动回滚 |
 
 ## API 一览
 
@@ -44,20 +45,22 @@ POST /api/test_ocr         OCR 自测
 POST /api/test_tts         TTS 试听
 POST /api/audio_fix        音频修复
 POST /api/time             手工校时(写请求, announce-time.timer 每 5s 消费)
+POST /api/maint            重启服务/恢复备份版本/重启主机
 ```
 
 ## 安全设计
 
 | 措施 | 原因 |
 |---|---|
-| sudoers 窄授权 | `/etc/sudoers.d/announce-web` 只放行 3 条命令：`systemctl restart announce-rs`、`announce-schedule-apply`（排班应用）、`announce-net-apply.sh`（网络配置，脚本内自带 `valid_host` 严格参数校验）。完整片段见 `deploy/sudoers.announce-web`（2026-10-23 修复：net-apply 一直未授权导致网络页必失败）。Web 进程即使被攻破也只能执行这三个白名单动作 |
+| HTTP Basic 认证 | 默认所有 GET/POST 都要认证。部署脚本生成 `/etc/announce-rs-web.env` 持久口令；手工非回环启动时自动生成临时口令。直接访问和 `curl` 都必须携带凭据 |
+| sudoers 窄授权 | 只放行固定辅助命令：服务重启、排班应用、网络配置和 `announce-maint`。完整模板见 `deploy/sudoers.announce-web` 与 `deploy/sudoers.announce-maint`，用户名在安装时按实际服务账号替换 |
 | `validate_rtsp` 纵深防御 | 非法 RTSP 源在入口和 ffmpeg 调用前各拦一道（防内网 SSRF 类探测） |
 | 请求体上限 | 全部 POST 端点经 `_read_body`：负/非法 Content-Length 400，超 64KB 413 并断开连接（防 `read(-1)` 挂线程与内存打爆） |
-| 同源校验 | POST 入口校验 Origin/Referer 与 Host 一致（防跨站页面触发改配置/断网）。**残余风险（2026-10-23 第八轮声明，接受不修）**：同源模型防不住 DNS rebinding —— 攻击者控制域名先解析到攻击站发页面、再改解析到 192.168.x.x 靶机，浏览器同源判定通过。现场缓解靠部署形态（无认证调试台只接内网、不暴露公网、 attacker 需先能控制用户访问的域名/DNS）；若未来暴露到不可信网络，必须加认证而不是叠更多 header 校验 |
+| 同源校验 | POST 入口校验 Origin/Referer 与 Host 一致，作为 Basic 认证之外的 CSRF 纵深防御 |
 | 乐观锁 | `/api/config` 下发内容指纹 `rev`，保存时校验，两窗口并发保存后者被 409 拦下 |
 | 配置原子写 | tmp + `os.replace`，主服务/配置器永不读到半截 config.json |
 | `CONFIG_LOCK` 串行化 | 多浏览器同时保存不互相踩 |
-| 无认证但限内网 | 调试台定位；`NET_DEFAULT_IP=192.168.31.1` 是直连调试出厂值，有路由器现场勿用（多为网关） |
+| 安全边界 | 默认只监听内网用途；HTTP Basic 不提供传输加密，跨不可信网络必须置于 HTTPS 反向代理后。`NET_DEFAULT_IP=192.168.31.1` 是直连调试出厂值，有路由器现场勿用（多为网关） |
 
 ## 本地验证记录（2026-10-07）
 

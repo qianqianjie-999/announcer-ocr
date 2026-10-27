@@ -1,3 +1,4 @@
-# announce-rs Web 配置台运维操作：仅放行运维脚本，其余一律拒绝
-# （脚本内部自行校验子命令与恢复包完整性）
-debian13 ALL=(root) NOPASSWD: /usr/local/sbin/announce-maint
+# announce-rs Web 配置台运维操作：仅放行运维脚本，其余一律拒绝。
+# 部署脚本会按实际 Web 服务用户替换 __APP_USER__；手工安装也必须先替换：
+#   sed "s/__APP_USER__/$WEB_USER/g" ...
+__APP_USER__ ALL=(root) NOPASSWD: /usr/local/sbin/announce-maint

@@ -19,6 +19,10 @@ LOG_DIR="/var/log/announce-rs"
 PIPER_DIR="${APP_DIR}/piper"
 REPO="https://github.com/qianqianjie-999/announcer-ocr.git"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WEB_ENV_FILE="/etc/announce-rs-web.env"
+SCHED_SELF="/usr/local/sbin/announce-schedule-apply"
+MAINT_SELF="/usr/local/sbin/announce-maint"
+NET_SELF="/usr/local/sbin/announce-net-apply.sh"
 RTSP_URL=""
 WITH_PIPER=0
 WITH_SWAP=0
@@ -299,13 +303,36 @@ if ! command -v sudo >/dev/null 2>&1; then
     warn "sudo 安装失败：配置台的「保存并重启」将不可用，需手动 systemctl restart announce-rs"
 fi
 
+if [[ ! -s "$WEB_ENV_FILE" ]]; then
+  umask 077
+  WEB_PASS="$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')"
+  {
+    printf 'ANNOUNCE_WEB_BIND=0.0.0.0\n'
+    printf 'ANNOUNCE_WEB_USER=admin\n'
+    printf 'ANNOUNCE_WEB_PASSWORD=%s\n' "$WEB_PASS"
+  } > "$WEB_ENV_FILE"
+  chmod 0600 "$WEB_ENV_FILE"
+  log "已生成 Web 持久认证口令（用户名 admin，口令 ${WEB_PASS}）"
+else
+  log "保留已有 Web 认证配置: ${WEB_ENV_FILE}"
+fi
+
+NET_SRC="${BUILD_DIR}/deploy/announce-net-apply.sh"
+if [[ -f "$NET_SRC" ]]; then
+  install -m 0755 -o root -g root "$NET_SRC" "$NET_SELF"
+  log "已安装 ${NET_SELF}"
+else
+  warn "缺少 ${NET_SRC}，网络配置页将不可用"
+fi
+
 if command -v sudo >/dev/null 2>&1; then
   cat > /etc/sudoers.d/announce-web <<EOF
-# announce-rs Web 配置台专用：仅放行重启本服务，其余一律拒绝
+# announce-rs Web 配置台专用：仅放行本项目的固定辅助命令
 ${APP_USER} ALL=(root) NOPASSWD: /usr/bin/systemctl restart announce-rs
+${APP_USER} ALL=(root) NOPASSWD: ${NET_SELF}
 EOF
   chmod 0440 /etc/sudoers.d/announce-web
-  visudo -c >/dev/null 2>&1 && log "sudoers 窄授权已生效（仅 restart announce-rs）" \
+  visudo -c >/dev/null 2>&1 && log "sudoers 窄授权已生效（restart / network）" \
                              || warn "sudoers 校验失败，请检查 /etc/sudoers.d/announce-web"
 fi
 
@@ -320,6 +347,7 @@ Type=simple
 User=${APP_USER}
 Group=${APP_USER}
 SupplementaryGroups=audio video
+EnvironmentFile=-${WEB_ENV_FILE}
 WorkingDirectory=${APP_DIR}
 ExecStart=/usr/bin/python3 ${APP_DIR}/config_web.py
 Restart=always
@@ -328,7 +356,7 @@ RestartSec=3
 [Install]
 WantedBy=multi-user.target
 EOF
-log "已写入 /etc/systemd/system/announce-web.service（监听 0.0.0.0:8080）"
+log "已写入 /etc/systemd/system/announce-web.service（监听 0.0.0.0:8080，HTTP Basic 认证）"
 
 # 主程序持有 /dev/video0 时，配置台是通过与主程序握手取预览帧的，
 # 不会与采集进程抢占设备；主程序没跑时才直接开设备抓帧。
@@ -339,9 +367,9 @@ step "安装工作时间调度（到点自动启停, Web 可配置）"
 # 完全不改主程序。时间表存在 config.json 的 schedule 段，由 Web 台编辑保存。
 # 本阶段只装「root 辅助脚本 + 窄授权 + 默认段」，初始默认【不启用】（保持常开）,
 # 需要时在 Web 台勾选「启用工作时间调度」并保存即可生效。
-SCHED_SELF="/usr/local/sbin/announce-schedule-apply"
-if [[ -f "${SCRIPT_DIR}/announce-schedule-apply" ]]; then
-  install -m 0755 -o root -g root "${SCRIPT_DIR}/announce-schedule-apply" "$SCHED_SELF"
+SCHED_SRC="${BUILD_DIR}/deploy/announce-schedule-apply"
+if [[ -f "${SCHED_SRC}" ]]; then
+  install -m 0755 -o root -g root "${SCHED_SRC}" "$SCHED_SELF"
   log "已安装 ${SCHED_SELF}"
   if command -v sudo >/dev/null 2>&1; then
     cat > /etc/sudoers.d/announce-schedule <<EOF
@@ -367,7 +395,26 @@ PY
   # 应用一次：未启用时等价于 restart，不会停服务
   "$SCHED_SELF" >/dev/null 2>&1 || warn "调度脚本首次执行失败，请手动运行 ${SCHED_SELF} 查看原因"
 else
-  warn "缺少 ${SCRIPT_DIR}/announce-schedule-apply，跳过工作时间调度（Web 台该项保存会失败）"
+  warn "缺少 ${SCHED_SRC}，跳过工作时间调度（Web 台该项保存会失败）"
+fi
+
+# ---------------------------------------------------------------- 阶段 7.7 运维操作
+step "安装 Web 运维操作执行体"
+MAINT_SRC="${BUILD_DIR}/deploy/announce-maint"
+if [[ -f "$MAINT_SRC" ]]; then
+  install -m 0755 -o root -g root "${MAINT_SRC}" "${MAINT_SELF}"
+  log "已安装 ${MAINT_SELF}"
+  if command -v sudo >/dev/null 2>&1; then
+    cat > /etc/sudoers.d/announce-maint <<EOF
+# announce-rs Web 配置台运维操作：仅放行固定执行体
+${APP_USER} ALL=(root) NOPASSWD: ${MAINT_SELF}
+EOF
+    chmod 0440 /etc/sudoers.d/announce-maint
+    visudo -c >/dev/null 2>&1 && log "sudoers 窄授权已生效（announce-maint）" \
+                               || warn "sudoers 校验失败，请检查 /etc/sudoers.d/announce-maint"
+  fi
+else
+  warn "缺少 ${MAINT_SRC}，Web 运维操作面板将不可用"
 fi
 
 # ---------------------------------------------------------------- 阶段 8 piper

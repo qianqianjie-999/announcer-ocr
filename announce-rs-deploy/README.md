@@ -59,6 +59,19 @@ sudo bash deploy.sh --rtsp 'rtsp://user:pass@192.168.1.64:554/stream2' --with-pi
 
 脚本是幂等的，重复执行不会重复破坏已有配置。
 
+### Web 配置台登录
+
+首次部署会生成 `/etc/announce-rs-web.env`，终端最后会输出 Web 配置台的用户名和口令。
+重复执行不会覆盖已有口令。忘记口令时可先备份配置，再删除该文件后重跑部署脚本；
+也可以直接编辑其中的 `ANNOUNCE_WEB_PASSWORD`，然后执行：
+
+```bash
+sudo systemctl restart announce-web
+```
+
+HTTP Basic 只负责访问控制，不提供传输加密。跨不可信网络访问时必须经过 HTTPS
+反向代理；配置台仍只应开放给运维网段。
+
 ---
 
 ## 三、三个真正的坑（不在软件本身，在环境）

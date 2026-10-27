@@ -19,20 +19,50 @@
 # ============================================================
 set -euo pipefail
 
-CONF="${ANNOUNCE_CONF:-/opt/announce-rs/config.json}"
 UNIT_DIR=/etc/systemd/system
 SVC=announce-rs.service
-
-MODE="apply"
-case "${1:-}" in
-  ""|--apply) MODE="apply" ;;
-  --sync)     MODE="sync"  ;;
-  --stop)     MODE="stop"  ;;
-  *) echo "用法: $0 [--apply|--sync|--stop]" >&2; exit 2 ;;
-esac
-
 say() { printf '[schedule] %s\n' "$*"; }
 
+MODE="apply"
+CONF_ARG=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    ""|--apply) MODE="apply"; shift ;;
+    --sync)     MODE="sync";  shift ;;
+    --stop)     MODE="stop";  shift ;;
+    --conf)
+      [[ $# -ge 2 ]] || { echo "用法: $0 [--apply|--sync|--stop] [--conf PATH]" >&2; exit 2; }
+      CONF_ARG="$2"
+      shift 2
+      ;;
+    *) echo "用法: $0 [--apply|--sync|--stop] [--conf PATH]" >&2; exit 2 ;;
+  esac
+done
+
+# Web 台传 --conf 指定自身目录；systemd 单元不带参数时按现场两种布局探测。
+# 显式传入的路径具有最高优先级，不会被其他候选“兜底纠错”掩盖。
+if [[ -n "$CONF_ARG" ]]; then
+  CONF="$CONF_ARG"
+elif [[ -n "${ANNOUNCE_CONF:-}" ]]; then
+  CONF="$ANNOUNCE_CONF"
+else
+  CONF=""
+  for c in /opt/announce-rs/config.json /home/debian/anntest/config.json /root/anntest/config.json; do
+    if [[ -r "$c" ]]; then CONF="$c"; break; fi
+  done
+fi
+
+# apply/stop 都是真实运维动作：配置缺失或不可读时必须报错，不能把
+# “部署异常”静默解释成“用户关闭了调度”，更不能因此删除 timer 或停服务。
+if [[ -z "$CONF" || ! -r "$CONF" ]]; then
+  if [[ "$MODE" == "sync" ]]; then
+    say "配置尚未就位，开机校正按全天运行处理"
+  else
+    echo "[schedule] 错误: 找不到可读的 config.json（已检查 --conf / ANNOUNCE_CONF / /opt /home/debian/anntest /root/anntest）" >&2
+    echo "[schedule] 拒绝按 ENABLED=0 兜底继续 —— 请检查部署路径或显式指定 --conf" >&2
+    exit 1
+  fi
+fi
 # ---------- 0. 系统时间可信度守卫 ----------
 # RTC 纽扣电池没电/断电回退会让时钟跳到出厂值, 按坏时间启停服务必误伤
 # (该播时停机 / 深夜被拉起)。年份不在 2026~2035 = 时间明显不对:
