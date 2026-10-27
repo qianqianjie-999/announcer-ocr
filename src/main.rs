@@ -471,8 +471,13 @@ fn keep_day_reseed(handled_any_candidate: bool) -> bool {
 
 /// 多行扫描是否可以在下一行前退出。
 ///
-/// 必须同时满足：至少看过一个候选、候选全部已播、且已经越过高亮行。
-/// 空集合的 `all()` 恒真，不能直接用于这里；否则第 1 行读空会把第 2 行高亮号一起跳过。
+/// 必须同时满足：至少看过一个候选、候选全部已播、**且已经越过高亮行**。
+/// 两点都不能松：
+///   - 空集合的 `all()` 恒真, 不能直接用于这里; 否则第 1 行读空会把第 2 行高亮号一起跳过。
+///   - 高亮行**未知时必须继续扫**(`is_some_and` 而非 `is_none_or`)。自动判定返回 None
+///     的场景(夜间低照度、反光、切回自检页)恰恰是"第 1 行残留旧号、第 2 行才是新号"
+///     最容易发生的场景, 此时按旧逻辑 break 就等于把漏播留在兜底路径上。
+///     代价是每轮多 1~2 次 OCR; 相比漏播一次的业务代价是划算的(2026-10-27 评审)。
 fn should_stop_before_row(
     row_index: usize,
     highlight_row: Option<usize>,
@@ -482,7 +487,7 @@ fn should_stop_before_row(
     row_index > 0
         && seen_count > 0
         && all_announced
-        && highlight_row.is_none_or(|h| row_index > h)
+        && highlight_row.is_some_and(|h| row_index > h)
 }
 
 /// 固定高亮行优先；配置无效或未配置时退回自动判定。
@@ -927,7 +932,7 @@ impl Loop {
         let mut handled = false;
         // 元组含 f64(无 Ord), 走排序键: (前缀, 数值, 窗口) —— 数值序与业务编号
         // 顺序一致(GA9 先于 GA10), 字符串序会把 GA10 排到 GA9 前(第八轮低危)。
-        hit.sort_by(|a, b| announce_sort_key(&a.0, &a.1).cmp(&announce_sort_key(&b.0, &b.1)));
+        hit.sort_by_key(|a| announce_sort_key(&a.0, &a.1));
         let t_ann = now_secs();
         for (number, window, _votes, first, _last) in hit {
             handled = true;
@@ -1112,20 +1117,33 @@ impl Loop {
             ));
         }
         let lumas: Vec<u8> = crops.iter().map(detect::median_luma_red).collect();
-        let highlight_row = resolve_highlight_row(
-            self.det.highlight_row,
-            detect::pick_highlight_row(&lumas),
-            rows,
-        );
+        // 实测最亮行与最终裁定分开存: 现场把 highlight_row 固定成 2 之后, 版式一变
+        // 就只会"静默地用错行", 日志里必须能同时看到配置值和实测值才排得出来。
+        let detected = detect::pick_highlight_row(&lumas);
+        let highlight_row = resolve_highlight_row(self.det.highlight_row, detected, rows);
         // 判定结果变化时才打日志: 现场光照/版式一变, 这行能立刻看出判据还准不准。
         if self.highlight_row != highlight_row {
             match highlight_row {
-                Some(h) => println!(
-                    "[识别] 高亮行=第{}行(各行底色亮度{:?}), 该行改走高亮专用增强",
-                    h + 1,
-                    lumas
+                Some(h) => {
+                    println!(
+                        "[识别] 高亮行=第{}行(各行底色亮度{:?}, 配置={:?}, 实测最亮={:?}), 该行改走高亮专用增强",
+                        h + 1,
+                        lumas,
+                        self.det.highlight_row,
+                        detected.map(|d| d + 1)
+                    );
+                    if let Some(d) = detected.filter(|d| *d != h) {
+                        println!(
+                            "[警告] 高亮行配置与实测不一致: 配置=第{}行, 实测最亮=第{}行 —— 若已换版式/分辨率, 请同步 highlight_row 或改回 0(自动)",
+                            h + 1,
+                            d + 1
+                        );
+                    }
+                }
+                None => println!(
+                    "[识别] 未识别到高亮行(各行底色亮度{:?}, 配置={:?}), 全部走常规链路, 逐行扫满不提前退出",
+                    lumas, self.det.highlight_row
                 ),
-                None => println!("[识别] 未识别到高亮行(各行底色亮度{:?}), 全部走常规链路", lumas),
             }
             self.highlight_row = highlight_row;
         }
@@ -1178,8 +1196,8 @@ impl Loop {
         // 兜底第二档必须与主档**不同**: 配置 psm=6 时旧代码硬编码第二档也是 6,
         // 同一张图同一参数跑两遍, 第二遍永远不可能带来新信息(纯浪费 1.5s)。
         let psm_alt = if psm_main == 6 { 11 } else { 6 };
-        // 大图不做增强(CPU 保护, 与旧逻辑一致): ROI 宽超过 1280 说明分辨率远超
-        // 现场布局, 增强的 2x 放大代价会翻倍。
+        // 大图不做增强(CPU 保护): 宽度超 1280 或 ROI 面积超预算时, 增强的 2x 放大
+        // 加上 31x31 局部均值会让预处理在 tesseract 超时保护之外长时间占住主循环。
         let enhance_ok = enhancement_pixels_allowed(self.roi.2, self.roi.3);
 
         if highlight && enhance_ok {
@@ -1206,11 +1224,15 @@ impl Loop {
                     return Ok((best_raw, best_cands));
                 }
                 // 增强图只读到号码时，允许原图补完整窗口；但原图只读到号码不替换，
-                // 避免回退到本函数注释里提到的“号对窗错”假阳性。
-                let raw = self.ocr.recognize(crop)?;
-                let cands = self.ocr.parse(&raw);
-                if ocr_candidate_quality(&cands) > best_q {
-                    return Ok((raw, cands));
+                // 避免回退到本段注释里提到的“号对窗错”假阳性。
+                //
+                // ★原图这一档用 Ok 判定、不用 `?`: tesseract 超时/管道错误在现场是常态,
+                //   一次超时不该把增强图已经读到的号码连带丢掉(第 1 行时还会让整轮识别报错)。
+                if let Ok(raw) = self.ocr.recognize(crop) {
+                    let cands = self.ocr.parse(&raw);
+                    if ocr_candidate_quality(&cands) > best_q {
+                        return Ok((raw, cands));
+                    }
                 }
                 return Ok((best_raw, best_cands));
             }
@@ -1558,7 +1580,7 @@ impl Loop {
         // 读空的一轮不算"首批已处理", 否则标记会被白白清掉。
         let mut handled = false;
         // 同 fast_confirm: 数值序播报(GA9 先于 GA10), 不用字符串序(第八轮低危)。
-        winners.sort_by(|a, b| announce_sort_key(&a.0, &a.1).cmp(&announce_sort_key(&b.0, &b.1)));
+        winners.sort_by_key(|a| announce_sort_key(&a.0, &a.1));
         for (number, window, votes, first, _last) in winners {
             // 跳幅大 -> 多要几票(每票≈一轮 OCR), 防过渡帧/反光残影把大号送出去。
             let extra = self.jump_extra(&number);
@@ -1856,8 +1878,10 @@ mod tests {
         assert!(!should_stop_before_row(1, Some(1), 0, false));
         // 已扫过高亮行且所见全是已播号：允许退出。
         assert!(should_stop_before_row(2, Some(1), 1, true));
-        // 没有高亮行时保留原优化。
-        assert!(should_stop_before_row(1, None, 1, true));
+        // 高亮行未知(夜间/反光/自检页)必须继续扫：这正是"第 1 行旧号、第 2 行新号"
+        // 最容易出现的场景，旧逻辑在这里 break 就把漏播留在了兜底路径上。
+        assert!(!should_stop_before_row(1, None, 1, true));
+        assert!(!should_stop_before_row(2, None, 1, true));
         // 已读到未播号：继续扫后续行补漏。
         assert!(!should_stop_before_row(2, Some(1), 1, false));
     }
@@ -2151,7 +2175,7 @@ mod tests {
             ("GA9".to_string(), "C02".to_string()),
             ("GA100".to_string(), "C01".to_string()),
         ];
-        v.sort_by(|a, b| announce_sort_key(&a.0, &a.1).cmp(&announce_sort_key(&b.0, &b.1)));
+        v.sort_by_key(|a| announce_sort_key(&a.0, &a.1));
         let order: Vec<&str> = v.iter().map(|x| x.0.as_str()).collect();
         assert_eq!(order, vec!["GA9", "GA10", "GA100"], "数值序: 小号先播");
         // 同号不同窗口: 窗口号字符串序兜底(稳定即可)
