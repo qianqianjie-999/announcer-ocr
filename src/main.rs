@@ -344,6 +344,9 @@ struct Loop {
     pitch: usize,
     /// 帧差检测框 = ROI 首行 +（rows-1)个行距, 覆盖整块列表。
     det_roi: (usize, usize, usize, usize),
+    /// 上一轮判出的高亮行(0-based)。只用于"判定结果变化时打一行日志",
+    /// 免得每轮 OCR 都刷屏; 现场调光线时这行日志能直接看出判据是否还在工作。
+    highlight_row: Option<usize>,
 }
 
 /// 号码分解: "GA158" -> Some(("GA", 158))。无数字段返回 None(该候选不参与闸门)。
@@ -605,6 +608,7 @@ impl Loop {
             rows,
             pitch,
             det_roi,
+            highlight_row: None,
 
             det,
             roi,
@@ -1026,17 +1030,24 @@ impl Loop {
     ///   可接受: 业务上最新号在首行, 2/3 行的残留号走补播窗口另有闸口。
     ///   若现场版式反过来(最新在底部), 应把 rows 配准让首行命中不了候选,
     ///   自然会读完全部行。
+    ///
+    /// ★2026-10-27 按行分流: 三行列表里有一行是"浅蓝高亮底"(当前办理), 它的
+    ///   对比度只有深底行的一半, 旧增强链会把浅底判成字、把这一行读废(实测
+    ///   行2 完整率 39%, 行1/行3 是 99%)。这里先量各行底色, 挑出最亮的那个
+    ///   (相对比较, 不吃自动曝光漂移), 只有它走 `enhance_highlight_for_ocr`。
     fn recognize_candidates(
-        &self,
+        &mut self,
         frame: &Arc<capture::Frame>,
     ) -> Result<(String, HashSet<(String, String)>), String> {
         let rows = self.rows.max(1);
         let mut cands: HashSet<(String, String)> = HashSet::new();
         let mut raws: Vec<String> = Vec::new();
+        // ★2026-10-27: 先把各行裁出来、量一遍底色亮度, 找出"高亮行"。
+        //   裁定必须在识别之前 —— 每行走哪条增强链依赖这个结果, 而认完第 1 行
+        //   可能就提前退出了, 到时候再补算就会漏掉没裁过的行。
+        //   裁剪成本可忽略(3 行 × 570×69×3 ≈ 350KB), OCR 一次是 1.5s 量级。
+        let mut crops: Vec<image::RgbImage> = Vec::with_capacity(rows);
         for i in 0..rows {
-            if i > 0 && cands.iter().all(|c| self.announced.contains_key(&c.0)) {
-                break;
-            }
             let y = self.roi.1 + i * self.pitch;
             // ★2026-10-22 第五轮审查: pitch==0(单行/默认配置)时首轮 i=0 也会命中,
             //   连第一行都不裁不认 -> 候选恒空 -> 整条播报链静默全灭(93912f3 多行
@@ -1045,10 +1056,32 @@ impl Loop {
             if (i > 0 && self.pitch == 0) || y + self.roi.3 > frame.h {
                 break;
             }
-            let crop = capture::crop_rgb(frame, (self.roi.0, y, self.roi.2, self.roi.3));
+            crops.push(capture::crop_rgb(
+                frame,
+                (self.roi.0, y, self.roi.2, self.roi.3),
+            ));
+        }
+        let lumas: Vec<u8> = crops.iter().map(detect::median_luma_red).collect();
+        let highlight_row = detect::pick_highlight_row(&lumas);
+        // 判定结果变化时才打日志: 现场光照/版式一变, 这行能立刻看出判据还准不准。
+        if self.highlight_row != highlight_row {
+            match highlight_row {
+                Some(h) => println!(
+                    "[识别] 高亮行=第{}行(各行底色亮度{:?}), 该行改走高亮专用增强",
+                    h + 1,
+                    lumas
+                ),
+                None => println!("[识别] 未识别到高亮行(各行底色亮度{:?}), 全部走常规链路", lumas),
+            }
+            self.highlight_row = highlight_row;
+        }
+        for (i, crop) in crops.iter().enumerate() {
+            if i > 0 && cands.iter().all(|c| self.announced.contains_key(&c.0)) {
+                break;
+            }
             // 第一行失败才真报错(与单行时代语义一致); 后续行失败只当这一行没读出来,
             // 不能因为第二行糊了就把第一行已经读到的结果丢掉。
-            let (raw_i, c_i) = match self.recognize_one(&crop) {
+            let (raw_i, c_i) = match self.recognize_one(crop, highlight_row == Some(i)) {
                 Ok(v) => v,
                 Err(e) if i == 0 => return Err(e),
                 Err(_) => continue,
@@ -1068,23 +1101,66 @@ impl Loop {
         Ok((raws.join(" "), drop_shadow_empty(cands)))
     }
 
-    /// 单行裁剪图的识别: 原图 -> (读不出时)增强图 psm11 -> 增强图 psm6。
-    /// 返回 `(原始文本, 候选集合)`; 只有 tesseract 子进程本身失败才返 Err。
+    /// 单行裁剪图的识别。
+    ///
+    /// 两条链路(2026-10-27 按行分流):
+    ///   - 普通行(深蓝底白字): 原图 -> 旧增强 psm(主) -> 旧增强 psm(副)
+    ///   - 高亮行(浅蓝底白字): 新增强 psm(主) -> 新增强 psm(副) -> 原图兜底
+    ///
+    /// ★高亮行为什么要"跳过原图": 原图对高亮行常给出**号对窗错**的假阳性
+    ///   (实测 `到C0 而力有`、`到G05号窗日`)。原图一旦"解析出候选"就不会再走
+    ///   兜底, 于是假窗口被当成真值播出去 —— 比读不出更糟。所以高亮行必须
+    ///   让专用增强先上, 增强两档都空了才回退原图。
+    /// ★旧增强在高亮行上是负收益(浅底被判成字, 61% 像素连成黑块), 所以高亮行
+    ///   完全不走旧链。
     fn recognize_one(
         &self,
         crop: &image::RgbImage,
+        highlight: bool,
     ) -> Result<(String, HashSet<(String, String)>), String> {
+        let psm_main = self.ocr.default_psm();
+        // 兜底第二档必须与主档**不同**: 配置 psm=6 时旧代码硬编码第二档也是 6,
+        // 同一张图同一参数跑两遍, 第二遍永远不可能带来新信息(纯浪费 1.5s)。
+        let psm_alt = if psm_main == 6 { 11 } else { 6 };
+        // 大图不做增强(CPU 保护, 与旧逻辑一致): ROI 宽超过 1280 说明分辨率远超
+        // 现场布局, 增强的 2x 放大代价会翻倍。
+        let enhance_ok = self.roi.2 <= 1280;
+
+        if highlight && enhance_ok {
+            let up = detect::enhance_highlight_for_ocr(crop);
+            let mut fallback_raw = String::new();
+            for psm in [psm_main, psm_alt] {
+                if let Ok(raw2) = self.ocr.recognize_psm(&up, psm) {
+                    let c2 = self.ocr.parse(&raw2);
+                    if !c2.is_empty() {
+                        return Ok((raw2, c2));
+                    }
+                    if fallback_raw.is_empty() {
+                        fallback_raw = raw2;
+                    }
+                }
+            }
+            // 专用增强全空: 退回原图再试一次。此刻原图大概率也读不出, 但只要
+            // 能读出就是净收益, 读不出也只是回到"这行没认到"。
+            let raw = self.ocr.recognize(crop)?;
+            let cands = self.ocr.parse(&raw);
+            // 原图也没读出字: 把增强图的乱码留在 raw 里, 日志能看出"这行不是没看,
+            // 是看了读不成", 排查时与"根本没跑 OCR"区分得开。
+            let raw = if raw.trim().is_empty() { fallback_raw } else { raw };
+            return Ok((raw, cands));
+        }
+
         let mut raw = self.ocr.recognize(crop)?;
         let mut cands = self.ocr.parse(&raw);
-        if cands.is_empty() && self.roi.2 <= 1280 {
-            // 兜底增强识别链: 原图(上面已跑) -> 增强图 psm11 -> 增强图 psm6。
+        if cands.is_empty() && enhance_ok {
+            // 兜底增强识别链: 原图(上面已跑) -> 增强图 psm(主) -> 增强图 psm(副)。
             // ★为什么要增强: 真实摄像头画面是"白字深底+小字+糊", tesseract 对
             //   原图几乎全乱码(靶机实测 [播报] 长期为 0 的根因之一), 沙盒用干净
             //   测试卡测不出来。2x放大+红通道+自动对比度+反相后靶机实测能把
-            //   "GA777到C03号窗口/GA999到C01号窗口"读出来。psm11 与 psm6 错误
-            //   模式不同(实测同一图一个读对窗口、一个读对号码), 各试一次先中先用。
+            //   "GA777到C03号窗口/GA999到C01号窗口"读出来。两档 psm 错误模式不同
+            //   (实测同一图一个读对窗口、一个读对号码), 各试一次先中先用。
             let up = detect::enhance_for_ocr(crop);
-            for psm in [self.ocr.default_psm(), 6u32] {
+            for psm in [psm_main, psm_alt] {
                 if !cands.is_empty() {
                     break;
                 }
