@@ -305,7 +305,9 @@ fn try_piper(cfg: &Tts) -> Option<Box<dyn Engine>> {
         .clone()
         .filter(|m| !m.is_empty())
         .filter(|m| std::path::Path::new(m).exists());
-    if bin.is_none() && model.is_none() && url.is_none() {
+    // 常驻服务可独立使用；走 CLI 回退时则必须同时具备二进制和模型，
+    // 否则 auto 模式会把半个 CLI 配置误判为“piper 可用”而不再尝试 espeak。
+    if url.is_none() && (bin.is_none() || model.is_none()) {
         return None;
     }
     let lib_dir = cfg
@@ -400,4 +402,31 @@ pub fn spell_window(s: &str, speak_letter: bool) -> String {
         .filter_map(|c| c.to_digit(10).map(|d| DIGIT_CN[d as usize].to_string()))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn piper_cli_requires_both_binary_and_model() {
+        let cfg = Tts {
+            piper_bin: Some("/bin/true".into()),
+            piper_model: None,
+            piper_url: None,
+            ..Tts::default()
+        };
+        assert!(try_piper(&cfg).is_none(), "缺模型的 CLI 配置应视为不可用");
+    }
+
+    #[test]
+    fn piper_server_does_not_require_local_cli_files() {
+        let cfg = Tts {
+            piper_bin: None,
+            piper_model: None,
+            piper_url: Some("http://127.0.0.1:5001/".into()),
+            ..Tts::default()
+        };
+        assert!(try_piper(&cfg).is_some(), "常驻服务可用时不应要求本地 CLI");
+    }
 }

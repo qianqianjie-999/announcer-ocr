@@ -1950,7 +1950,7 @@ mod tests {
     // ———— 同批播报数值序(2026-10-23 第八轮低危): GA9 必须先于 GA10 ————
     #[test]
     fn announce_sort_key_numeric_not_lexical() {
-        let mut v = vec![
+        let mut v = [
             ("GA10".to_string(), "C01".to_string()),
             ("GA9".to_string(), "C02".to_string()),
             ("GA100".to_string(), "C01".to_string()),

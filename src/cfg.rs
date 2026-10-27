@@ -372,16 +372,20 @@ mod tests {
 
     /// 默认配置上把某字段改成给定值后跑 validate, 返回 Err 文案。
     fn validate_err_with(set: impl Fn(&mut Config)) -> String {
-        let mut cfg = Config::default();
         // Default derive 不给 serde 默认值: 尺寸是 0, 会先触发尺寸校验, 补成合法值
-        cfg.capture_width = 1920;
-        cfg.capture_height = 1080;
+        let mut cfg = Config {
+            capture_width: 1920,
+            capture_height: 1080,
+            ..Config::default()
+        };
         set(&mut cfg);
         match cfg.validate() {
             Err(e) => e,
             Ok(_) => panic!("配置应被 validate 拒绝"),
         }
     }
+
+    type F64Mutator = fn(&mut Config, f64);
 
     #[test]
     fn validate_rejects_non_finite_fps() {
@@ -401,7 +405,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_non_finite_detect_fields() {
-        let cases: [(&str, fn(&mut Config, f64)); 9] = [
+        let cases: [(&str, F64Mutator); 9] = [
             ("diff_threshold", |c, v| c.detect.diff_threshold = v),
             ("changed_ratio", |c, v| c.detect.changed_ratio = v),
             ("confirm_ttl_sec", |c, v| c.detect.confirm_ttl_sec = v),
@@ -420,7 +424,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_non_finite_top_level_fields() {
-        let cases: [(&str, fn(&mut Config, f64)); 5] = [
+        let cases: [(&str, F64Mutator); 5] = [
             ("frame_stale_sec", |c, v| c.frame_stale_sec = v),
             ("health_alert_min", |c, v| c.health_alert_min = v),
             ("diag_every_sec", |c, v| c.diag_every_sec = v),
