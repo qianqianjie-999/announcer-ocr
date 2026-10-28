@@ -1223,16 +1223,28 @@ impl Loop {
                 if best_q == 2 {
                     return Ok((best_raw, best_cands));
                 }
-                // 增强图只读到号码时，允许原图补完整窗口；但原图只读到号码不替换，
-                // 避免回退到本段注释里提到的“号对窗错”假阳性。
+                // 增强图只读到号码时，允许原图补完整窗口 —— 但**号码锁死增强图, 只借窗口**。
+                // ★2026-10-28 改: 旧实现按"完整度"整组替换(`原图q > 增强q` 就 return 原图),
+                //   原图把 GA013 读成 GAO013 的错号会盖掉增强图已经读对的号。判据见
+                //   fill_window_keep_number()。
                 //
                 // ★原图这一档用 Ok 判定、不用 `?`: tesseract 超时/管道错误在现场是常态,
                 //   一次超时不该把增强图已经读到的号码连带丢掉(第 1 行时还会让整轮识别报错)。
                 if let Ok(raw) = self.ocr.recognize(crop) {
-                    let cands = self.ocr.parse(&raw);
-                    if ocr_candidate_quality(&cands) > best_q {
-                        return Ok((raw, cands));
+                    let donor = self.ocr.parse(&raw);
+                    let (merged, filled, rejected) = fill_window_keep_number(&best_cands, &donor);
+                    // 只在"真补到窗口"或"原图给了不同号码"时打一行: 两种情况都少见,
+                    // 但正是复盘 4 位数误播时最想看到的证据(增强图 vs 原图各读了什么)。
+                    if !filled.is_empty() || !rejected.is_empty() {
+                        println!(
+                            "[识别] 高亮行原图补窗口: 补={:?} 拒收号码={:?} 增强图原文=[{}] 原图原文=[{}]",
+                            filled,
+                            rejected,
+                            short(&best_raw),
+                            short(&raw)
+                        );
                     }
+                    return Ok((best_raw, merged));
                 }
                 return Ok((best_raw, best_cands));
             }
@@ -1786,6 +1798,89 @@ fn drop_shadow_empty(cands: HashSet<(String, String)>) -> HashSet<(String, Strin
         .collect()
 }
 
+/// 日志里 OCR 原文的截断长度。现场一行原文常带一长串噪声字符,
+/// 全打会把 service.log 冲爆, 80 字符足够看出"读成了什么"。
+const SHORT_MAX: usize = 80;
+
+/// 把 OCR 原文压成一行短串, 只用于打日志。
+fn short(s: &str) -> String {
+    let t: String = s
+        .trim()
+        .chars()
+        .filter(|c| *c != '\r')
+        .map(|c| if c == '\n' { ' ' } else { c })
+        .collect();
+    let mut out: String = t.chars().take(SHORT_MAX).collect();
+    if t.chars().count() > SHORT_MAX {
+        out.push('…');
+    }
+    out
+}
+
+/// `fill_window_keep_number` 的返回值: (合并后的候选, 补上的窗口, 被拒收的原图号码)。
+/// 后两项只用于打日志 —— 抽成别名是为了过 `clippy::type_complexity`。
+type WindowFill = (HashSet<(String, String)>, Vec<(String, String)>, Vec<String>);
+
+/// 高亮行"原图补窗口"的采纳规则: **号码锁死增强图, 只从原图借窗口**。
+///
+/// 起因(2026-10-28 复盘 4 位数误播): 旧实现按 `ocr_candidate_quality` 择优 ——
+/// 只看"有没有窗口", 不看号码是否一致。增强图只读到号码(q=1)、原图恰好读到
+/// "号+窗口"(q=2) 时整组替换, 于是原图把 `GA013` 读成 `GAO013`(旧解析拼成
+/// `GA0013`) 的错号, 会盖掉增强图已经读对的 `GA013`。原注释只防了"号对窗错"
+/// 的假窗口, 没防"错号盖对号"。
+///
+/// 判据: 原图给出的号码与增强图**完全一致**才借它的窗口; 号码不同一律拒收。
+/// 宁可播"请GA013到号窗口办理"这半句, 也不播一个不存在的号 —— 窗口读错只是
+/// 引导到错窗口(现场还能问), 号码读错是叫错人。
+///
+/// 返回 (合并后的候选, 补上的窗口, 被拒收的原图号码), 后两项只用于打日志。
+fn fill_window_keep_number(
+    kept: &HashSet<(String, String)>,
+    donor: &HashSet<(String, String)>,
+) -> WindowFill {
+    // 原图里 "号码 -> 第一个非空窗口"(同一号码理论上只有一个窗口, 取任意一个即可)
+    let donor_win: HashMap<&str, &str> = {
+        let mut m: HashMap<&str, &str> = HashMap::new();
+        for (n, w) in donor {
+            if !w.is_empty() {
+                m.entry(n.as_str()).or_insert(w.as_str());
+            }
+        }
+        m
+    };
+
+    let mut out: HashSet<(String, String)> = HashSet::with_capacity(kept.len());
+    let mut filled: Vec<(String, String)> = Vec::new();
+    for (n, w) in kept {
+        if !w.is_empty() {
+            out.insert((n.clone(), w.clone())); // 增强图自己有窗口, 原图无权改
+            continue;
+        }
+        match donor_win.get(n.as_str()) {
+            Some(dw) => {
+                filled.push((n.clone(), (*dw).to_string()));
+                out.insert((n.clone(), (*dw).to_string()));
+            }
+            None => {
+                out.insert((n.clone(), w.clone()));
+            }
+        }
+    }
+
+    // 原图读到、但增强图完全没有的号码: 一个都不采纳, 只记录供现场排查。
+    let mut rejected: Vec<String> = donor
+        .iter()
+        .map(|(n, _)| n)
+        .filter(|n| !kept.iter().any(|(k, _)| k == *n))
+        .cloned()
+        .collect();
+    rejected.sort();
+    rejected.dedup();
+    filled.sort();
+
+    (out, filled, rejected)
+}
+
 /// 清理 `_live/` 里"确定是上一轮残留"的临时文件: 预览原子写留下的半截 `.tmp`、
 /// 以及没人消费的预览请求 `req`。
 ///
@@ -1846,11 +1941,13 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        announce_sort_key, drop_shadow_empty, effective_ttl, gate_day_rollover, in_work_window,
+        announce_sort_key, drop_shadow_empty, effective_ttl, fill_window_keep_number,
+        gate_day_rollover, in_work_window,
         jump_extra_confirm, keep_day_reseed, number_votes, ocr_candidate_quality,
         resolve_highlight_row, resolve_row_pitch, seed_only_decide, seq_reset_eligible,
         seq_reset_tick, settle_ready, should_stop_before_row, time_plausible_y,
-        enhancement_pixels_allowed, JUMP_HARD_MAX, SEQ_RESET_SECS, SETTLE_MAX_WAIT_SECS,
+        enhancement_pixels_allowed, JUMP_HARD_MAX, SEQ_RESET_SECS, SETTLE_MAX_WAIT_SECS, SHORT_MAX,
+        short,
     };
     use std::collections::{HashMap, HashSet};
 
@@ -2121,6 +2218,83 @@ mod tests {
         .collect();
         let out = drop_shadow_empty(s);
         assert_eq!(out.len(), 2, "没有带窗口版本时, 空窗口候选应原样保留");
+    }
+
+    // ———— 高亮行"原图补窗口": 号码锁死增强图 (2026-10-28 4 位数误播复盘) ————
+
+    fn mk(pairs: &[(&str, &str)]) -> HashSet<(String, String)> {
+        pairs
+            .iter()
+            .map(|(n, w)| (n.to_string(), w.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn window_fill_borrows_window_when_number_matches() {
+        // 增强图只读到号码, 原图读到"号+窗口"且号码一致 -> 借窗口
+        let (out, filled, rejected) =
+            fill_window_keep_number(&mk(&[("GA013", "")]), &mk(&[("GA013", "C06")]));
+        assert_eq!(out, mk(&[("GA013", "C06")]));
+        assert_eq!(filled, vec![("GA013".to_string(), "C06".to_string())]);
+        assert!(rejected.is_empty());
+    }
+
+    #[test]
+    fn window_fill_rejects_donor_with_different_number() {
+        // ★现场事故回归: 增强图读对 GA013(无窗口), 原图读成 GAO013->GA0013 且带窗口。
+        //   旧实现按 q=2 > q=1 整组替换, 播出不存在的 GA0013。现在号码必须一致,
+        //   宁可只播号码, 也不采纳原图的错号。
+        let (out, filled, rejected) =
+            fill_window_keep_number(&mk(&[("GA013", "")]), &mk(&[("GA0013", "C06")]));
+        assert_eq!(out, mk(&[("GA013", "")]), "错号不得覆盖已读对的号");
+        assert!(filled.is_empty());
+        assert_eq!(rejected, vec!["GA0013".to_string()], "被拒的号码要留证据");
+    }
+
+    #[test]
+    fn window_fill_never_overwrites_existing_window() {
+        // 增强图自己有窗口: 原图无论给什么都不改(高亮行原图的窗口本就不可信)
+        let (out, filled, _) =
+            fill_window_keep_number(&mk(&[("GA170", "C03")]), &mk(&[("GA170", "C06")]));
+        assert_eq!(out, mk(&[("GA170", "C03")]));
+        assert!(filled.is_empty());
+    }
+
+    #[test]
+    fn window_fill_noop_when_donor_has_number_only() {
+        // 原图也只有号码: 什么都不补, 号码一致不算"拒收"
+        let (out, filled, rejected) =
+            fill_window_keep_number(&mk(&[("GA170", "")]), &mk(&[("GA170", "")]));
+        assert_eq!(out, mk(&[("GA170", "")]));
+        assert!(filled.is_empty());
+        assert!(rejected.is_empty());
+    }
+
+    #[test]
+    fn window_fill_handles_empty_and_multi() {
+        // 增强图空 -> 不凭空造候选, 原图的号只进"拒收"记录
+        let (out, filled, rejected) =
+            fill_window_keep_number(&mk(&[]), &mk(&[("GA001", "C01")]));
+        assert!(out.is_empty() && filled.is_empty());
+        assert_eq!(rejected, vec!["GA001".to_string()]);
+
+        // 多号码: 缺窗口的借, 已有窗口的不动
+        let (out, filled, rejected) = fill_window_keep_number(
+            &mk(&[("GA001", ""), ("GA002", "C02")]),
+            &mk(&[("GA001", "C05"), ("GA002", "C09")]),
+        );
+        assert_eq!(out, mk(&[("GA001", "C05"), ("GA002", "C02")]));
+        assert_eq!(filled, vec![("GA001".to_string(), "C05".to_string())]);
+        assert!(rejected.is_empty());
+    }
+
+    #[test]
+    fn short_truncates_and_flattens_newlines() {
+        assert_eq!(short("  a\r\nb  "), "a b");
+        let long = "x".repeat(SHORT_MAX + 5);
+        let s = short(&long);
+        assert_eq!(s.chars().count(), SHORT_MAX + 1, "超长要截断并加省略号");
+        assert!(s.ends_with('…'));
     }
 
     // ———— 闸门跨日重置: 7×24 连跑时, 次日从头递增的低号码不能被昨天的高基线吞掉 ————
