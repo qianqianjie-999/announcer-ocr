@@ -251,12 +251,34 @@ impl Ocr {
                     continue; // 数字段被噪声吃光 -> 这组不算候选, 别播半截号
                 }
                 out.insert((
-                    format!("{}{}", pre, num_digits),
+                    format!("{}{}", pre, fold_number_zeros(&num_digits)),
                     fold_window_zeros(&Self::norm_digits(win)),
                 ));
             }
         }
         out
+    }
+}
+
+/// 号码数字段的定长位数(本系统号码是 GA001~GA999 的三位补零写法)。
+const NUMBER_DIGITS: usize = 3;
+
+/// 号码数字段前导零折叠。
+///
+/// 由来(2026-10-28 现场事故): 屏幕上的 "GA010" 被 tesseract 读成 "GAO010"(A 后多认
+/// 一个字母 O), `norm_digits` 把 O 归一成 0 后数字段变成 "0010", 拼出 "GA0010" ——
+/// 一个不存在的四位数, 去重键也不同, 于是照常播报。当天 08:57~09:01 一小时内误播
+/// 五次(GA0009/GA0010/GA0011/GA0012/GA0013), 逐个对应真号 GA009~GA013。
+/// 前一天同样机制只出现一次, 属高频随机噪声暴露出的确定性问题, 必须在此收掉。
+///
+/// 判据: 数字段是定长 3 位补零写法, 长度超过 3 且以 0 开头, 只能是误插了零;
+/// 直接取末 3 位。"0010"->"010"、"0009"->"009"; 真号 "010"/"009" 长度不足或
+/// 不以 0 开头, 完全不受影响。
+fn fold_number_zeros(digits: &str) -> String {
+    if digits.len() > NUMBER_DIGITS && digits.starts_with('0') {
+        digits[digits.len() - NUMBER_DIGITS..].to_string()
+    } else {
+        digits.to_string()
     }
 }
 
@@ -509,6 +531,46 @@ mod tests {
         assert_eq!(fold_window_zeros("C10"), "C10");  // 尾零不动
         assert_eq!(fold_window_zeros("03"), "03");    // 纯数字窗口不动
         assert_eq!(fold_window_zeros(""), "");
+    }
+
+    #[test]
+    fn fold_number_zeros_cases() {
+        assert_eq!(fold_number_zeros("0010"), "010"); // O 误插: GAO010 -> GA0010 -> GA010
+        assert_eq!(fold_number_zeros("0009"), "009"); // GAO009 -> GA0009 -> GA009
+        assert_eq!(fold_number_zeros("010"), "010"); // 真号不动
+        assert_eq!(fold_number_zeros("009"), "009");
+        assert_eq!(fold_number_zeros("0101"), "101"); // 前导零溢出仍取末 3 位
+        assert_eq!(fold_number_zeros("6123"), "6123"); // 非 0 开头的四位数不动
+        assert_eq!(fold_number_zeros(""), "");
+    }
+
+    #[test]
+    fn parse_number_letter_o_does_not_become_extra_digit() {
+        // ★2026-10-28 现场事故回归: 行1 的 "GA010" 被读成 "GAO010", O 归一成 0 后
+        //   拼出 GA0010 —— 不存在的四位数, 当天一小时内误播 5 次。
+        for (raw, want_num, want_win) in [
+            ("请GAO010到C05号窗口办理 1人", "GA010", "C05"),
+            ("请GAO009到C04号窗口办理 1人", "GA009", "C04"),
+            ("请GAO011到C04号窗口办理 1人", "GA011", "C04"),
+            // 行2 高亮行同样出现: "请GAO012到C04号窗口办理"
+            ("请GAO012到C04号窗口办理 1人", "GA012", "C04"),
+        ] {
+            let (num, win) = one(&parse(raw));
+            assert_eq!((num.as_str(), win.as_str()), (want_num, want_win), "{raw}");
+        }
+    }
+
+    #[test]
+    fn parse_true_three_digit_zero_padded_unchanged() {
+        // 真号必须以 3 位补零原样保留, 不能被折叠误伤
+        for (raw, want) in [
+            ("请GA010到C05号窗", "GA010"),
+            ("请GA009到C04号窗", "GA009"),
+            ("请GA001到C04号窗", "GA001"),
+        ] {
+            let (num, _) = one(&parse(raw));
+            assert_eq!(num, want, "{raw}");
+        }
     }
 
     #[test]
