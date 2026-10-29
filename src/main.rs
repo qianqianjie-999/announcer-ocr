@@ -457,6 +457,38 @@ fn seed_only_decide(day_reseed: bool, has_baseline: bool) -> bool {
     day_reseed && !has_baseline
 }
 
+/// ★2026-10-29 高危修复: 启动时是否**启用**"跨日只标记"(首个候选只标记不播)。
+///
+/// 原判据只有"基线为空", 把两个完全相反的场景混成了一个:
+///   A. 午夜前后启动/跨日 —— 屏上可能挂着昨日尾号(2026-10-26 现场: GA219 被播,
+///      基线毒化成 219, 当天 GA002 起的小号全被"号小了"挡死)。
+///   B. 每天 08:00 systemd 全新启动 —— 当日 CSV 必然为空(基线必为空), 但此刻屏上
+///      是叫号机刚开机的自检页/今日新号, **不存在昨日残留**。原逻辑照 A 处理,
+///      把今日第一个真号(GA001)当残留吞掉, 还写进当日去重表 -> 该号当天永久哑
+///      (2026-10-29 现场, 存证图 trig_10.jpg 铁证: 屏上 GA001 一个音都没出)。
+///
+/// 区分两者靠**启动时刻**: 营业时段内启动 = B(放行), 营业时段外启动 = A(只标记)。
+/// 号码大小不能用来区分 —— 每日号池 001~220(现场实测日最大叫号 220 以内),
+/// 昨日尾号与今日首号落在同一区间, 数值上没有任何分界。
+///
+/// `now_hm` 为 None 表示系统时间不可信(年份越界), 无法判时段 -> 保守启用。
+/// `schedule_enabled=false` 时同样保守启用(没有作息配置就无从判断营业时段)。
+fn seed_only_on_startup(
+    baseline_empty: bool,
+    now_hm: Option<&str>,
+    work_start: &str,
+    work_end: &str,
+    schedule_enabled: bool,
+) -> bool {
+    if !baseline_empty {
+        return false;
+    }
+    match (schedule_enabled, now_hm) {
+        (true, Some(hm)) => !in_work_window(hm, work_start, work_end),
+        _ => true,
+    }
+}
+
 /// ★2026-10-26(改动二): 本轮结束后是否要**保住** day_reseed 标记(不清)。
 ///
 /// 语义: 标记的用途是"首个候选只标记不播" —— 它必须在**真的处理过一个候选**
@@ -579,6 +611,39 @@ impl Loop {
         // ★2026-10-26: 当天一条 OK 记录都没有 => 基线为空 => 屏上残留的大号会被
         //   "无基线取最大"当新号播掉并毒化基线。见下面 day_reseed 的赋值。
         let seed_baselines_is_empty = seed_baselines.is_empty();
+        // ★2026-10-29: 跨日"只标记"只在**非营业时段启动**才启用。每日 08:00
+        //   systemd 全新启动时当日 CSV 必为空, 但屏上是今日新号而非昨日残留;
+        //   沿用旧判据会把今日首号(GA001)当残留吞掉并写进去重表 -> 当天永久哑。
+        //   判据与取舍详见 seed_only_on_startup。
+        let startup_seed_only = {
+            let now_lc = chrono::Local::now();
+            let hm = if time_plausible_y(now_lc.year()) {
+                Some(now_lc.format("%H:%M").to_string())
+            } else {
+                None
+            };
+            let enable = seed_only_on_startup(
+                seed_baselines_is_empty,
+                hm.as_deref(),
+                &cfg.schedule.work_start,
+                &cfg.schedule.work_end,
+                cfg.schedule.enabled,
+            );
+            if enable {
+                println!(
+                    "[闸门] 启动时基线为空且处于非营业时段({}): 首批候选只标记不播, \
+                     防屏上残留大号(如昨日尾号)毒化基线 —— 详见 seed_only_after_reset",
+                    hm.as_deref().unwrap_or("时间不可信")
+                );
+            } else if seed_baselines_is_empty {
+                println!(
+                    "[闸门] 启动时基线为空但处于营业时段({}): 不启用跨日只标记, \
+                     今日首号正常播报(防每日首个真号被当残留吞掉)",
+                    hm.as_deref().unwrap_or("-")
+                );
+            }
+            enable
+        };
         Ok(Loop {
             interval: 1.0 / cfg.fps.max(0.1),
             need_stable: det.stable_frames,
@@ -639,22 +704,13 @@ impl Loop {
             last_num: seed_baselines,
             maint_day: local_day_of(now).unwrap_or_default(),
             mute_warned: false,
-            // ★2026-10-26 高危修复: 每天 08:00 systemd 全新启动时, 当天往往还没有
-            //   任何 OK 记录 -> 基线为空 -> 闸门走"无基线取最大", 把屏上残留的
-            //   昨日尾号(如 GA219)当新号播掉并毒化基线; 之后当天 GA002 起的小号
+            // ★2026-10-26 高危修复: 基线为空时闸门走"无基线取最大", 屏上残留的大号
+            //   (如昨日尾号 GA219)会被当新号播掉并毒化基线; 之后当天 GA002 起的小号
             //   全被"号小了差>5"挡死(2026-10-26 上午现场真实事故)。
-            //   代码里原本只有"零点跨日"路径置这个标记(maintenance), 每日重启这条
-            //   路径没接 —— 两条后果完全等价, 这里补上。
-            day_reseed: {
-                let empty = seed_baselines_is_empty;
-                if empty {
-                    println!(
-                        "[闸门] 启动时基线为空(当日尚无播报记录): 首批候选只标记不播, \
-                         防屏上残留大号(如昨日尾号)毒化基线 —— 详见 seed_only_after_reset"
-                    );
-                }
-                empty
-            },
+            //   代码里原本只有"零点跨日"路径置这个标记(maintenance), 重启这条路径没接。
+            // ★2026-10-29 收窄: 只在**非营业时段启动**才启用。08:00 全新启动时屏上是
+            //   今日新号而非昨日残留, 照旧启用会把 GA001 当残留吞掉且当天永久哑。
+            day_reseed: startup_seed_only,
             max_jump: det.max_jump,
             gate_log_at: 0.0,
             seq_since: HashMap::new(),
@@ -1944,7 +2000,8 @@ mod tests {
         announce_sort_key, drop_shadow_empty, effective_ttl, fill_window_keep_number,
         gate_day_rollover, in_work_window,
         jump_extra_confirm, keep_day_reseed, number_votes, ocr_candidate_quality,
-        resolve_highlight_row, resolve_row_pitch, seed_only_decide, seq_reset_eligible,
+        resolve_highlight_row, resolve_row_pitch, seed_only_decide, seed_only_on_startup,
+        seq_reset_eligible,
         seq_reset_tick, settle_ready, should_stop_before_row, time_plausible_y,
         enhancement_pixels_allowed, JUMP_HARD_MAX, SEQ_RESET_SECS, SETTLE_MAX_WAIT_SECS, SHORT_MAX,
         short,
@@ -2339,6 +2396,30 @@ mod tests {
         assert!(seed_only_decide(true, false));
         // 标记生效但前缀已有基线(首日真号已 note_announced): 不吞后续真号
         assert!(!seed_only_decide(true, true));
+    }
+
+    // ———— 跨日只标记仅在非营业时段启动启用(2026-10-29 每日 GA001 漏播修复) ————
+    #[test]
+    fn seed_only_on_startup_off_hours_only() {
+        // 营业时段内启动(08:00 定时开机): 不启用 —— 屏上是今日新号而非昨日残留,
+        // 启用就会把今日首个真号当残留吞掉并写进去重表(当天永久哑)
+        assert!(!seed_only_on_startup(true, Some("08:00"), "08:00", "17:00", true));
+        assert!(!seed_only_on_startup(true, Some("12:30"), "08:00", "17:00", true));
+        assert!(!seed_only_on_startup(true, Some("16:59"), "08:00", "17:00", true));
+        // 非营业时段启动(午夜/下班后/凌晨): 启用 —— 屏上可能是昨日(上一场)尾号,
+        // 播出去会毒化基线, 让当天后续小号全天静默
+        assert!(seed_only_on_startup(true, Some("17:00"), "08:00", "17:00", true));
+        assert!(seed_only_on_startup(true, Some("23:30"), "08:00", "17:00", true));
+        assert!(seed_only_on_startup(true, Some("02:00"), "08:00", "17:00", true));
+        // 当日已有基线: 无论何时都不启用(重启时屏上已播号由去重表挡住)
+        assert!(!seed_only_on_startup(false, Some("02:00"), "08:00", "17:00", true));
+        assert!(!seed_only_on_startup(false, Some("12:30"), "08:00", "17:00", true));
+        // 作息闸关闭 或 系统时间不可信: 无法判时段 -> 保守启用
+        assert!(seed_only_on_startup(true, Some("12:30"), "08:00", "17:00", false));
+        assert!(seed_only_on_startup(true, None, "08:00", "17:00", true));
+        // 跨零点夜班窗口(22:00~06:00): 04:00 属工作时段 -> 不启用
+        assert!(!seed_only_on_startup(true, Some("04:00"), "22:00", "06:00", true));
+        assert!(seed_only_on_startup(true, Some("12:00"), "22:00", "06:00", true));
     }
 
     // ———— 同批播报数值序(2026-10-23 第八轮低危): GA9 必须先于 GA10 ————
