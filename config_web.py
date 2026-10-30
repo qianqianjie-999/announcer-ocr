@@ -543,6 +543,19 @@ def validate_and_build(body):
         except (TypeError, ValueError):
             mj = int(cur_det.get("max_jump") or 2)
         d["max_jump"] = min(20, max(0, mj))
+        # 号码池上限: 数字段超过该值的候选直接判 INVALID，不进入闸门兜底。
+        # 默认 400，当前现场最大约 240；范围 1~9999，和 Rust 侧校验一致。
+        raw_pool_max = det.get("number_pool_max")
+        if raw_pool_max in (None, ""):
+            npm = int(cur_det.get("number_pool_max") or 400)
+        else:
+            try:
+                npm = int(raw_pool_max)
+            except (TypeError, ValueError):
+                return None, "number_pool_max 必须是整数（1~9999）"
+        if not (1 <= npm <= 9999):
+            return None, "number_pool_max 需在 1~9999 之间"
+        d["number_pool_max"] = npm
         # 多行列表(2026-10-21): rows=识别行数, row_pitch=相邻行纵向间距(像素)。
         # 只改行数不改行距没有意义(会把同一行读 N 遍), 所以行距为 0 时行数强制回 1。
         try:
@@ -760,6 +773,7 @@ fps <input id=fps type=number value=3 step=0.5>
 <label>兜底OCR间隔 fallback_ocr_sec <input id=d_fb type=number step=0.5 min=0.5></label>
 <label>稳帧再认 settle_sec <input id=d_settle type=number step=0.1 min=0.1></label>
 <label>跳号上限 max_jump <input id=d_jump type=number step=1 min=0 max=20>（0=关闭；2 表示只放行 +1/+2）</label>
+<label>号码池上限 number_pool_max <input id=d_pool type=number step=1 min=1 max=9999>（超过直接判 INVALID）</label>
 <label>列表行数 rows <input id=d_rows type=number step=1 min=1 max=5>（1=只认框内这一行）</label>
 <label>行距 row_pitch <input id=d_pitch type=number step=1 min=0 max=400>（像素，相邻两行间距；0=不分行）</label>
 <label>高亮行 highlight_row <input id=d_highlight type=number step=1 min=0 max=5>（0=自动；现场可固定为 1~rows）</label>
@@ -952,6 +966,7 @@ function fillForm(c){
  $('d_act').value=c.detect.active_sec;$('d_fb').value=c.detect.fallback_ocr_sec;
  $('d_settle').value=(c.detect.settle_sec!=null?c.detect.settle_sec:0.5);
  $('d_jump').value=(c.detect.max_jump!=null?c.detect.max_jump:2);
+ $('d_pool').value=(c.detect.number_pool_max!=null?c.detect.number_pool_max:400);
  $('d_rows').value=(c.detect.rows!=null?c.detect.rows:1);
  $('d_pitch').value=(c.detect.row_pitch!=null?c.detect.row_pitch:0);
  $('d_highlight').value=(c.detect.highlight_row!=null?c.detect.highlight_row:0);
@@ -993,6 +1008,7 @@ function collect(){
    stable_frames:+$('d_stable').value,confirm_ttl_sec:+$('d_ttl').value,
    active_sec:+$('d_act').value,fallback_ocr_sec:+$('d_fb').value,
    settle_sec:+$('d_settle').value,max_jump:+$('d_jump').value,
+   number_pool_max:+$('d_pool').value,
    rows:+$('d_rows').value,row_pitch:+$('d_pitch').value,
    highlight_row:+$('d_highlight').value},
   tts:{enabled:$('t_en').checked,repeat:+$('t_rep').value,rate:+$('t_rate').value,

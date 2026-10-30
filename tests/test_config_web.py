@@ -48,6 +48,7 @@ def _base_cur():
             "fallback_ocr_sec": 3.0, "stable_frames": 2,
             "confirm_ttl_sec": 4.0, "active_sec": 3.0,
             "settle_sec": 0.5, "min_interval_sec": 0.5,
+            "number_pool_max": 400,
         },
         "tts": {
             "enabled": True, "repeat": 1, "rate": 0,
@@ -75,6 +76,7 @@ def _base_body():
             "diff_threshold": "10", "changed_ratio": "0.02",
             "fallback_ocr_sec": "3", "stable_frames": "2",
             "confirm_ttl_sec": "4", "active_sec": "3",
+            "number_pool_max": "400",
         },
         "tts": {"enabled": "on", "repeat": "1", "rate": "135"},
         "ocr": {"psm": "7"},
@@ -339,6 +341,21 @@ class TestValidateAndBuild(unittest.TestCase):
         cfg, err = cw.validate_and_build(b)
         self.assertIsNone(cfg)
         self.assertIn("changed_ratio", err)
+
+    def test_number_pool_max_accepts_valid_value(self):
+        b = _base_body()
+        b["detect"]["number_pool_max"] = "401"
+        cfg, err = cw.validate_and_build(b)
+        self.assertIsNone(err)
+        self.assertEqual(cfg["detect"]["number_pool_max"], 401)
+
+    def test_number_pool_max_rejects_invalid_values(self):
+        for bad in ("0", "-1", "10000", "not-a-number"):
+            b = _base_body()
+            b["detect"]["number_pool_max"] = bad
+            cfg, err = cw.validate_and_build(b)
+            self.assertIsNone(cfg, bad)
+            self.assertIn("number_pool_max", err, bad)
 
     def test_highlight_row_accepts_auto_and_valid_row(self):
         b = _base_body()

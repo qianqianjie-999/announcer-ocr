@@ -148,7 +148,9 @@ fn jump_extra_confirm(delta: u32, max_jump: u32) -> u32 {
 ///
 /// 抽成自由函数便于单测: 这条防线一旦退化, 症状是"屏幕有号但永远不播", 极难定位。
 fn effective_ttl(ttl: f64, iter_secs: f64, fb_prev: f64, fb_next: f64) -> f64 {
-    ttl.max(3.0 * iter_secs).max(1.5 * fb_prev).max(1.5 * fb_next)
+    ttl.max(3.0 * iter_secs)
+        .max(1.5 * fb_prev)
+        .max(1.5 * fb_next)
 }
 
 /// 行距(像素)的解析: 绝对像素优先, 其次按"相对行高"折算, 都没有则 0(退化为单行)。
@@ -204,8 +206,7 @@ fn settle_ready(
     change_fired: bool,
     change_start: f64,
 ) -> (bool, bool) {
-    let overdue =
-        !change_fired && change_start > 0.0 && now - change_start >= SETTLE_MAX_WAIT_SECS;
+    let overdue = !change_fired && change_start > 0.0 && now - change_start >= SETTLE_MAX_WAIT_SECS;
     let ready = now >= settle_until || overdue;
     (ready, ready && !change_fired)
 }
@@ -330,6 +331,8 @@ struct Loop {
     day_reseed: bool,
     /// 跳幅上限。0 = 关闭闸门。
     max_jump: u32,
+    /// 号码池上限。超过本值的 OCR 候选不进入确认或静默兜底。
+    number_pool_max: u32,
     /// 闸门拦截日志节流时刻(被拦的号每 10s 最多打一行, 防刷屏)。
     gate_log_at: f64,
     /// ★序列重置(2026-10-26): 号码 -> 本静帧段内**首次看见它**的时刻。
@@ -363,6 +366,35 @@ fn split_num(number: &str) -> Option<(String, u32)> {
     digits.parse::<u32>().ok().map(|v| (pre.to_string(), v))
 }
 
+/// 号码是否落在配置的业务号池范围内。
+///
+/// 解析不出数字段的候选保持调用方原有语义，不在这里额外拦截。
+fn number_pool_accepts(number: &str, max: u32) -> bool {
+    match split_num(number) {
+        Some((_, value)) => value <= max,
+        None => true,
+    }
+}
+
+/// 剔除超过号池上限的误识别，返回 `(保留候选, 被拒号码)`。
+fn filter_number_pool(
+    cands: HashSet<(String, String)>,
+    max: u32,
+) -> (HashSet<(String, String)>, Vec<String>) {
+    let mut kept = HashSet::new();
+    let mut rejected = Vec::new();
+    for (number, window) in cands {
+        if number_pool_accepts(&number, max) {
+            kept.insert((number, window));
+        } else {
+            rejected.push(number);
+        }
+    }
+    rejected.sort();
+    rejected.dedup();
+    (kept, rejected)
+}
+
 /// 同批播报的排序键: (前缀, 数值, 窗口)。
 /// ★2026-10-23 低危修复(第八轮): 旧版按字符串排, "GA10" < "GA9"('1'<'9'),
 ///   同批确认多个号时 GA10 抢在 GA9 前播 —— 与现场"小号先叫"的业务顺序相反。
@@ -380,7 +412,7 @@ fn announce_sort_key(n: &str, w: &str) -> (String, u32, String) {
 /// 若闸门没有基线, 第一轮就会把屏上那个"已经播过的号"再播一遍 —— 这正是
 /// 2026-10-21 13:56 现场听到的重复播报。只认当天记录, 避免跨天编号重置后
 /// 拿昨天的号码当基线, 把早上的低号码全挡在门外。
-fn seed_last_numbers(log_file: &str) -> (HashMap<String, u32>, Vec<String>) {
+fn seed_last_numbers(log_file: &str, number_pool_max: u32) -> (HashMap<String, u32>, Vec<String>) {
     use chrono::Local;
     let mut base = HashMap::new();
     let mut announced: Vec<String> = Vec::new();
@@ -397,10 +429,17 @@ fn seed_last_numbers(log_file: &str) -> (HashMap<String, u32>, Vec<String>) {
         if cols.len() < 5 || cols[cols.len() - 1].trim() != "OK" {
             continue;
         }
-        if !cols[0].trim().trim_start_matches('\u{feff}').starts_with(&today) {
+        if !cols[0]
+            .trim()
+            .trim_start_matches('\u{feff}')
+            .starts_with(&today)
+        {
             continue;
         }
         let num = cols[1].trim().to_string();
+        if !number_pool_accepts(&num, number_pool_max) {
+            continue;
+        }
         if let Some((pre, v)) = split_num(&num) {
             // 倒序扫描: 只认每个前缀"最新"的那条
             base.entry(pre).or_insert(v);
@@ -516,10 +555,7 @@ fn should_stop_before_row(
     seen_count: usize,
     all_announced: bool,
 ) -> bool {
-    row_index > 0
-        && seen_count > 0
-        && all_announced
-        && highlight_row.is_some_and(|h| row_index > h)
+    row_index > 0 && seen_count > 0 && all_announced && highlight_row.is_some_and(|h| row_index > h)
 }
 
 /// 固定高亮行优先；配置无效或未配置时退回自动判定。
@@ -546,8 +582,7 @@ fn ocr_candidate_quality(cands: &HashSet<(String, String)>) -> u8 {
 }
 
 fn enhancement_pixels_allowed(width: usize, height: usize) -> bool {
-    width <= 1280
-        && (width as u64).saturating_mul(height as u64) <= MAX_ENHANCE_PIXELS
+    width <= 1280 && (width as u64).saturating_mul(height as u64) <= MAX_ENHANCE_PIXELS
 }
 
 type RankedOcrResult = (String, HashSet<(String, String)>, u8);
@@ -568,7 +603,11 @@ fn in_work_window(now: &str, start: &str, end: &str) -> bool {
     if s == e {
         return true;
     }
-    if s < e { n >= s && n < e } else { n >= s || n < e }
+    if s < e {
+        n >= s && n < e
+    } else {
+        n >= s || n < e
+    }
 }
 
 impl Loop {
@@ -579,7 +618,12 @@ impl Loop {
             .clone()
             .filter(|r| r.len() == 4)
             .ok_or("请先运行 calibrate.py 框选识别区域")?;
-        let roi = (roi_v[0] as usize, roi_v[1] as usize, roi_v[2] as usize, roi_v[3] as usize);
+        let roi = (
+            roi_v[0] as usize,
+            roi_v[1] as usize,
+            roi_v[2] as usize,
+            roi_v[3] as usize,
+        );
 
         let ocr = ocr::Ocr::new(&cfg.ocr)?;
         let ann = announcer::Announcer::new(&cfg)?;
@@ -602,12 +646,17 @@ impl Loop {
                 );
             }
         }
-        let rows = if pitch == 0 { 1 } else { det.rows.max(1) as usize };
+        let rows = if pitch == 0 {
+            1
+        } else {
+            det.rows.max(1) as usize
+        };
         // 检测框向下扩到覆盖 rows 行; 识别仍按 pitch 逐行裁。
         let det_roi = (roi.0, roi.1, roi.2, roi.3 + (rows - 1) * pitch);
         let now = now_secs();
         // 开机 seed: 基线(每前缀最新 OK 号) + 当日全部已播号(灌去重表)。
-        let (seed_baselines, seed_announced) = seed_last_numbers(&cfg.log_file);
+        let (seed_baselines, seed_announced) =
+            seed_last_numbers(&cfg.log_file, det.number_pool_max);
         // ★2026-10-26: 当天一条 OK 记录都没有 => 基线为空 => 屏上残留的大号会被
         //   "无基线取最大"当新号播掉并毒化基线。见下面 day_reseed 的赋值。
         let seed_baselines_is_empty = seed_baselines.is_empty();
@@ -712,6 +761,7 @@ impl Loop {
             //   今日新号而非昨日残留, 照旧启用会把 GA001 当残留吞掉且当天永久哑。
             day_reseed: startup_seed_only,
             max_jump: det.max_jump,
+            number_pool_max: det.number_pool_max,
             gate_log_at: 0.0,
             seq_since: HashMap::new(),
             seq_seg: 0.0,
@@ -866,7 +916,11 @@ impl Loop {
             return;
         }
         let span = now - self.diag_last;
-        let tag = if self.diag_max > self.det.changed_ratio { ">>> 有变化" } else { "静" };
+        let tag = if self.diag_max > self.det.changed_ratio {
+            ">>> 有变化"
+        } else {
+            "静"
+        };
         let ocr_info = if self.diag_ocr_n > 0 {
             format!(
                 " OCR={}次 均匀{:.1}s 最长{:.1}s",
@@ -1109,10 +1163,8 @@ impl Loop {
         let _ = std::fs::create_dir_all(SAVE_DIR);
         let p = format!("{}/trig_{:02}.jpg", SAVE_DIR, self.n_saved);
         let res = std::fs::File::create(&p).and_then(|f| {
-            let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(
-                std::io::BufWriter::new(f),
-                92,
-            );
+            let mut enc =
+                image::codecs::jpeg::JpegEncoder::new_with_quality(std::io::BufWriter::new(f), 92);
             enc.encode_image(&image::DynamicImage::ImageRgb8(crop.clone()))
                 .map_err(std::io::Error::other)
         });
@@ -1204,8 +1256,8 @@ impl Loop {
             self.highlight_row = highlight_row;
         }
         for (i, crop) in crops.iter().enumerate() {
-            let all_announced = !cands.is_empty()
-                && cands.iter().all(|c| self.announced.contains_key(&c.0));
+            let all_announced =
+                !cands.is_empty() && cands.iter().all(|c| self.announced.contains_key(&c.0));
             if should_stop_before_row(i, highlight_row, cands.len(), all_announced) {
                 break;
             }
@@ -1310,7 +1362,11 @@ impl Loop {
             let cands = self.ocr.parse(&raw);
             // 原图也没读出字: 把增强图的乱码留在 raw 里, 日志能看出"这行不是没看,
             // 是看了读不成", 排查时与"根本没跑 OCR"区分得开。
-            let raw = if raw.trim().is_empty() { fallback_raw } else { raw };
+            let raw = if raw.trim().is_empty() {
+                fallback_raw
+            } else {
+                raw
+            };
             return Ok((raw, cands));
         }
 
@@ -1360,6 +1416,17 @@ impl Loop {
         // 屏幕上只有老号时, 说明读得很清楚, 不该被当成"没读到"去翻倍兜底间隔,
         // 否则下一个新号要靠兜底轮才发现, 反应会被拖慢到 30s。
         let raw_has = !cands.is_empty();
+        let (cands, pool_rejected) = filter_number_pool(cands, self.number_pool_max);
+        if by_change && !pool_rejected.is_empty() {
+            println!(
+                "[闸门] 号码池上限 {} 拒绝候选: {}",
+                self.number_pool_max,
+                pool_rejected.join(", ")
+            );
+            for number in &pool_rejected {
+                logger::log(&self.cfg.log_file, number, "", raw, "INVALID");
+            }
+        }
         let (cands, jump_blocked) = self.gate_filter(cands, now);
         // ★确认窗口自适应: OCR 一步就要 1.5~10s 时, 固定 4s 的 TTL 会在
         //   下一轮到来前把候选清掉 -> 永远凑不齐 stable_frames 轮 -> 不播报。
@@ -1431,6 +1498,9 @@ impl Loop {
     /// 保留作闸门语义的文档与未来调用点, 抑制 dead_code 告警。
     #[allow(dead_code)]
     fn gate_accepts(&self, number: &str) -> bool {
+        if !number_pool_accepts(number, self.number_pool_max) {
+            return false;
+        }
         if self.max_jump == 0 {
             return true;
         }
@@ -1575,7 +1645,8 @@ impl Loop {
         // 没读到时把首尾时间差当成"连续稳定"。
         let seen = cand_all;
         self.seq_since.retain(|k, _| seen.contains(k));
-        if !blocked.is_empty() && now - self.gate_log_at >= 10.0 {            self.gate_log_at = now;
+        if !blocked.is_empty() && now - self.gate_log_at >= 10.0 {
+            self.gate_log_at = now;
             println!(
                 "[闸门] 拦截 {} (上限 +{}, 当前基线 {:?})",
                 blocked.join(", "),
@@ -1752,7 +1823,10 @@ impl Loop {
         }
         self.last_maint = now;
         if gate_day_rollover(&mut self.maint_day, local_day_of(now)) && !self.last_num.is_empty() {
-            println!("[闸门] 跨日重置号码基线 {:?} (去重表已按日清零, 基线跟随)", self.last_num);
+            println!(
+                "[闸门] 跨日重置号码基线 {:?} (去重表已按日清零, 基线跟随)",
+                self.last_num
+            );
             self.last_num.clear();
             // ★2026-10-23 中危修复(第八轮): 置"等待首个候选"标记 —— 屏上若还停着
             // 昨日尾号, 首个无基线候选只标记不播报(见 seed_only_after_reset)。
@@ -1776,9 +1850,12 @@ impl Loop {
         } else {
             self.cfg.log_archive_dir.trim()
         };
-        if let Some(p) =
-            logger::rotate_if_needed(&self.cfg.log_file, dir, self.log_max_bytes, self.cfg.log_keep)
-        {
+        if let Some(p) = logger::rotate_if_needed(
+            &self.cfg.log_file,
+            dir,
+            self.log_max_bytes,
+            self.cfg.log_keep,
+        ) {
             println!("[日志] 已达阈值, 轮转 -> {}", p);
         }
     }
@@ -1875,7 +1952,11 @@ fn short(s: &str) -> String {
 
 /// `fill_window_keep_number` 的返回值: (合并后的候选, 补上的窗口, 被拒收的原图号码)。
 /// 后两项只用于打日志 —— 抽成别名是为了过 `clippy::type_complexity`。
-type WindowFill = (HashSet<(String, String)>, Vec<(String, String)>, Vec<String>);
+type WindowFill = (
+    HashSet<(String, String)>,
+    Vec<(String, String)>,
+    Vec<String>,
+);
 
 /// 高亮行"原图补窗口"的采纳规则: **号码锁死增强图, 只从原图借窗口**。
 ///
@@ -1997,16 +2078,39 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        announce_sort_key, drop_shadow_empty, effective_ttl, fill_window_keep_number,
-        gate_day_rollover, in_work_window,
-        jump_extra_confirm, keep_day_reseed, number_votes, ocr_candidate_quality,
-        resolve_highlight_row, resolve_row_pitch, seed_only_decide, seed_only_on_startup,
-        seq_reset_eligible,
-        seq_reset_tick, settle_ready, should_stop_before_row, time_plausible_y,
-        enhancement_pixels_allowed, JUMP_HARD_MAX, SEQ_RESET_SECS, SETTLE_MAX_WAIT_SECS, SHORT_MAX,
-        short,
+        announce_sort_key, drop_shadow_empty, effective_ttl, enhancement_pixels_allowed,
+        fill_window_keep_number, filter_number_pool, gate_day_rollover, in_work_window,
+        jump_extra_confirm, keep_day_reseed, number_pool_accepts, number_votes,
+        ocr_candidate_quality, resolve_highlight_row, resolve_row_pitch, seed_only_decide,
+        seed_only_on_startup, seq_reset_eligible, seq_reset_tick, settle_ready, short,
+        should_stop_before_row, time_plausible_y, JUMP_HARD_MAX, SEQ_RESET_SECS,
+        SETTLE_MAX_WAIT_SECS, SHORT_MAX,
     };
     use std::collections::{HashMap, HashSet};
+
+    #[test]
+    fn number_pool_rejects_impossible_four_digit_misreads() {
+        assert!(number_pool_accepts("GA001", 400));
+        assert!(number_pool_accepts("GA400", 400));
+        assert!(!number_pool_accepts("GA401", 400));
+        assert!(!number_pool_accepts("GA1142", 400));
+        assert!(!number_pool_accepts("GA2141", 400));
+    }
+
+    #[test]
+    fn number_pool_filter_keeps_valid_and_drops_outliers() {
+        let input = HashSet::from([
+            ("GA400".to_string(), "C04".to_string()),
+            ("GA401".to_string(), "C04".to_string()),
+            ("GA1142".to_string(), "C06".to_string()),
+        ]);
+        let (kept, rejected) = filter_number_pool(input, 400);
+        assert_eq!(
+            kept,
+            HashSet::from([("GA400".to_string(), "C04".to_string())])
+        );
+        assert_eq!(rejected, vec!["GA1142".to_string(), "GA401".to_string()]);
+    }
 
     // ———— 时间可信度守卫: RTC 掉电时时钟跳出厂值, 作息闸必须自动失效 ————
     #[test]
@@ -2098,7 +2202,10 @@ mod tests {
         // ★回归现场死锁: 过曝帧 0.1s 空输出 -> 兜底间隔被退避拉到 30s,
         //   若 TTL 仍按 3×0.1s 算出 4s, 下一轮开头 retain 就把计数清掉 -> 永不播报。
         let ttl = effective_ttl(4.0, 0.1, 24.0, 30.0);
-        assert!(ttl > 30.0, "TTL 必须大于等待间隔(30s), 否则候选每轮被清零: {ttl}");
+        assert!(
+            ttl > 30.0,
+            "TTL 必须大于等待间隔(30s), 否则候选每轮被清零: {ttl}"
+        );
     }
 
     #[test]
@@ -2182,8 +2289,12 @@ mod tests {
     #[test]
     fn settle_not_overdue_before_max_wait() {
         let start = 100.0;
-        let (ready, _) =
-            settle_ready(start + SETTLE_MAX_WAIT_SECS - 0.01, start + 999.0, false, start);
+        let (ready, _) = settle_ready(
+            start + SETTLE_MAX_WAIT_SECS - 0.01,
+            start + 999.0,
+            false,
+            start,
+        );
         assert!(!ready, "未到最长等待前仍应等画面定型");
     }
 
@@ -2207,7 +2318,11 @@ mod tests {
     #[test]
     fn number_votes_merges_windows_into_one_number() {
         // 现场实况: GA174 被窗口误读成 C04/CC04/C045 三个键 -> 必须并成一个号码
-        let m = conf(&[("GA174", "C04", 2), ("GA174", "CC04", 1), ("GA174", "C045", 1)]);
+        let m = conf(&[
+            ("GA174", "C04", 2),
+            ("GA174", "CC04", 1),
+            ("GA174", "C045", 1),
+        ]);
         let v = number_votes(&m);
         assert_eq!(v.len(), 1, "三个窗口候选应并入同一号码");
         assert_eq!(v[0].0, "GA174");
@@ -2330,8 +2445,7 @@ mod tests {
     #[test]
     fn window_fill_handles_empty_and_multi() {
         // 增强图空 -> 不凭空造候选, 原图的号只进"拒收"记录
-        let (out, filled, rejected) =
-            fill_window_keep_number(&mk(&[]), &mk(&[("GA001", "C01")]));
+        let (out, filled, rejected) = fill_window_keep_number(&mk(&[]), &mk(&[("GA001", "C01")]));
         assert!(out.is_empty() && filled.is_empty());
         assert_eq!(rejected, vec!["GA001".to_string()]);
 
@@ -2500,7 +2614,7 @@ mod tests {
         assert!(!seq_reset_eligible(true, 175, 171)); // 差恰好 4, 仍在补播窗口(≤5)内
         assert!(!seq_reset_eligible(true, 175, 170)); // 差恰好 5 = 补播窗口边界, 不算"远低"
         assert!(seq_reset_eligible(true, 175, 169)); // 差 6 > 5 -> 够格
-        // 等于/大于基线: 不是"小号", 交给跳幅闸门
+                                                     // 等于/大于基线: 不是"小号", 交给跳幅闸门
         assert!(!seq_reset_eligible(true, 175, 175));
         assert!(!seq_reset_eligible(true, 175, 176));
         // 无基线: 由"无基线取最大"处理, 与序列重置无关
@@ -2512,8 +2626,14 @@ mod tests {
     #[test]
     fn seq_reset_covers_typo_jump_inside_hard_limit() {
         let (last, misread) = (174u32, 193u32);
-        assert!(misread > last && misread <= last + JUMP_HARD_MAX, "误读的 193 当初确实在放行区间内");
-        assert!(jump_extra_confirm(misread - last, JUMP_HARD_MAX) > 0, "当初也只要求了额外确认票");
+        assert!(
+            misread > last && misread <= last + JUMP_HARD_MAX,
+            "误读的 193 当初确实在放行区间内"
+        );
+        assert!(
+            jump_extra_confirm(misread - last, JUMP_HARD_MAX) > 0,
+            "当初也只要求了额外确认票"
+        );
         // 误读发生后基线变 193, 真号 175 属于"远低于基线" -> 序列重置是唯一出口
         assert!(seq_reset_eligible(true, 193, 175));
     }
@@ -2526,7 +2646,10 @@ mod tests {
         // 本轮没有任何候选被处理(读空 / 全被票数或去重挡掉) -> 保住标记
         assert!(keep_day_reseed(false), "读空的一轮不能把 day_reseed 清掉");
         // 本轮真处理过至少一个候选(标记或播报) -> 标记用完, 清掉
-        assert!(!keep_day_reseed(true), "处理过候选后就该清标记, 否则真小号会被当成残留吞掉");
+        assert!(
+            !keep_day_reseed(true),
+            "处理过候选后就该清标记, 否则真小号会被当成残留吞掉"
+        );
     }
 
     // 端到端口径: 标记 + 无基线 = 只标记不播(压制开机首批); 清标记后才正常播。
@@ -2537,11 +2660,17 @@ mod tests {
         // 同一轮真处理过候选 -> 标记用完被清 -> 之后真号(GA002)无基线, 走正常播报
         let marked_after_round = keep_day_reseed(true);
         assert!(!marked_after_round, "处理过候选的轮次结束后标记应已被清");
-        assert!(!seed_only_decide(marked_after_round, false), "标记清掉后真号必须正常播");
+        assert!(
+            !seed_only_decide(marked_after_round, false),
+            "标记清掉后真号必须正常播"
+        );
         // 若那一轮其实读空(标记没被清), 后续残留号仍然只标记 —— 不毒化基线
         let marked_after_empty = keep_day_reseed(false);
         assert!(marked_after_empty, "读空的轮次结束后标记必须留着");
-        assert!(seed_only_decide(marked_after_empty, false), "读空后残留大号仍须只标记");
+        assert!(
+            seed_only_decide(marked_after_empty, false),
+            "读空后残留大号仍须只标记"
+        );
     }
 
     // ———— 改动三: 序列重置(静帧内连续稳定 N 秒) ————
@@ -2582,7 +2711,11 @@ mod tests {
         assert!(!f0, "起算当轮绝不放行");
 
         let (_, f) = seq_reset_tick(Some(100.0), 100.0 + SEQ_RESET_SECS - 0.1);
-        assert!(!f, "差一点满 {}s 也不能放行 —— 残影就活在这个区间", SEQ_RESET_SECS);
+        assert!(
+            !f,
+            "差一点满 {}s 也不能放行 —— 残影就活在这个区间",
+            SEQ_RESET_SECS
+        );
 
         let (_, f) = seq_reset_tick(Some(100.0), 100.0 + SEQ_RESET_SECS);
         assert!(f, "刚好满 {}s 应当放行", SEQ_RESET_SECS);
