@@ -502,8 +502,11 @@ class TestValidateAndBuild(unittest.TestCase):
     def test_schedule_default_when_absent(self):
         cfg, err = self._build()
         self.assertIsNone(err)
+        # 2026-10-31 起 schedule 多了工作日/补班日/节假日三键，老配置按下表默认补齐
         self.assertEqual(cfg["schedule"],
-                         {"enabled": False, "work_start": "08:00", "work_end": "18:00"})
+                         {"enabled": False, "work_start": "08:00", "work_end": "18:00",
+                          "workdays": [1, 2, 3, 4, 5],
+                          "extra_work_dates": [], "holidays": []})
 
     def test_schedule_ok(self):
         cfg, err = self._build(
@@ -525,10 +528,81 @@ class TestValidateAndBuild(unittest.TestCase):
         self.assertIsNone(cfg)
         self.assertIn("不能相同", err)
 
+    # ---- 工作日 / 补班日 / 法定节假日（2026-10-31） ----
 
-# ---------------------------------------------------------------- 整数值域（第八轮高危）
+    def test_workdays_roundtrip(self):
+        cfg, err = self._build(
+            schedule={"enabled": "on", "work_start": "08:00", "work_end": "17:00",
+                      "workdays": [6, 1, 2, 3, 4, 5]})
+        self.assertIsNone(err)
+        self.assertEqual(cfg["schedule"]["workdays"], [1, 2, 3, 4, 5, 6])
 
-class TestIntRangeGuard(unittest.TestCase):
+    def test_workdays_empty_when_enabled_rejected(self):
+        cfg, err = self._build(
+            schedule={"enabled": "on", "work_start": "08:00", "work_end": "17:00",
+                      "workdays": []})
+        self.assertIsNone(cfg)
+        self.assertIn("至少要勾选一个工作日", err)
+
+    def test_workdays_out_of_range_rejected(self):
+        for bad in ([0], [8], ["1"], [True]):
+            cfg, err = self._build(
+                schedule={"enabled": "on", "work_start": "08:00", "work_end": "17:00",
+                          "workdays": bad})
+            self.assertIsNone(cfg, bad)
+            self.assertIn("工作日必须是 1~7 的整数", err)
+
+    def test_makeup_and_holiday_dates_parsed(self):
+        cfg, err = self._build(
+            schedule={"enabled": "on", "work_start": "08:00", "work_end": "17:00",
+                      "extra_work_dates": [" 2026-10-31 ", "2026-10-31"],
+                      "holidays": ["2026-10-01", "2026-10-02"]})
+        self.assertIsNone(err)
+        # 去重 + 去空白 + 排序
+        self.assertEqual(cfg["schedule"]["extra_work_dates"], ["2026-10-31"])
+        self.assertEqual(cfg["schedule"]["holidays"], ["2026-10-01", "2026-10-02"])
+
+    def test_bad_date_rejected(self):
+        cfg, err = self._build(
+            schedule={"enabled": "on", "work_start": "08:00", "work_end": "17:00",
+                      "holidays": ["2026/10/01"]})
+        self.assertIsNone(cfg)
+        self.assertIn("不是合法日期", err)
+
+    def test_impossible_date_rejected(self):
+        cfg, err = self._build(
+            schedule={"enabled": "on", "work_start": "08:00", "work_end": "17:00",
+                      "extra_work_dates": ["2026-02-30"]})
+        self.assertIsNone(cfg)
+        self.assertIn("不是真实日期", err)
+
+
+class TestWebPasswordFile(unittest.TestCase):
+    """2026-10-31: 口令文件兜底 —— 手工装机写不了 /etc 时靠它拿到固定口令。"""
+
+    def test_missing_file_returns_empty(self):
+        # 读不到 => 空串 => 调用方生成一次性口令，不会"无认证裸奔"
+        self.assertEqual(cw._read_secret("/nonexistent/dir/web_pass"), "")
+
+    def test_reads_and_strips_trailing_newline(self):
+        fd, path = tempfile.mkstemp()
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write("admin123\n")
+            self.assertEqual(cw._read_secret(path), "admin123")
+        finally:
+            os.unlink(path)
+
+    def test_empty_file_returns_empty(self):
+        fd, path = tempfile.mkstemp()
+        try:
+            os.close(fd)
+            self.assertEqual(cw._read_secret(path), "")
+        finally:
+            os.unlink(path)
+
+
+# ---------------------------------------------------------------- 整数值域（第八轮高危）class TestIntRangeGuard(unittest.TestCase):
     """★回归(2026-10-23 第八轮高危): 整数字段与页面 min/max 同口径拒绝越界值。
 
     旧版 stable_frames/psm 直接 int() 落盘、repeat 只钳下限、rate 不校验 ——

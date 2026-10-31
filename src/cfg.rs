@@ -337,12 +337,27 @@ pub struct Schedule {
     /// 工作结束 "HH:MM"。start > end 表示跨零点(如 22:00~06:00 夜班)。
     #[serde(default = "work_end_d")]
     pub work_end: String,
+    /// 工作日：ISO 周几，1=周一 … 7=周日。默认 1~5（周六周日不播）。
+    /// 不写该字段的老配置 => 自动变成"仅工作日"，周末不再空扫。
+    #[serde(default = "workdays_d")]
+    pub workdays: Vec<u32>,
+    /// 补班日 "YYYY-MM-DD"：法定节假日调休上班（常见于周六），命中则当日按工作日处理。
+    /// 优先级高于 workdays —— 否则补班的周六会被当成休息日漏播。
+    #[serde(default)]
+    pub extra_work_dates: Vec<String>,
+    /// 法定节假日 "YYYY-MM-DD"：即使是周一~周五也停工，命中则当日不播。
+    /// 优先级最高。
+    #[serde(default)]
+    pub holidays: Vec<String>,
 }
 fn work_start_d() -> String {
     "08:00".into()
 }
 fn work_end_d() -> String {
     "18:00".into()
+}
+fn workdays_d() -> Vec<u32> {
+    vec![1, 2, 3, 4, 5]
 }
 
 impl Config {
@@ -425,6 +440,35 @@ impl Config {
                     self.detect.rows.max(1),
                     h
                 ));
+            }
+        }
+        // 工作日表校验: 越界值不会命中任何一天; enabled=true 配空表则等于
+        // "每天都不是工作日" -> 整天静音, 这种配置没人想要, 直接拒启。
+        for wd in &self.schedule.workdays {
+            if !(1..=7).contains(wd) {
+                return Err(format!(
+                    "schedule.workdays 只能是 1~7 (1=周一 … 7=周日, 当前含 {}): 越界值不会命中任何一天",
+                    wd
+                ));
+            }
+        }
+        if self.schedule.enabled && self.schedule.workdays.is_empty() {
+            return Err(
+                "schedule.workdays 不能为空: 想七天都播请写 [1,2,3,4,5,6,7] 或关闭作息闸".into(),
+            );
+        }
+        let date_lists = [
+            ("schedule.extra_work_dates", &self.schedule.extra_work_dates),
+            ("schedule.holidays", &self.schedule.holidays),
+        ];
+        for (name, list) in date_lists {
+            for d in list {
+                if chrono::NaiveDate::parse_from_str(d.trim(), "%Y-%m-%d").is_err() {
+                    return Err(format!(
+                        "{} 里的 {:?} 不是合法日期(需 YYYY-MM-DD, 如 2026-11-01)",
+                        name, d
+                    ));
+                }
             }
         }
         Ok(())

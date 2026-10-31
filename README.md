@@ -157,6 +157,19 @@ Rust 版当前在用：
 `announce-rs-deploy/deploy.sh` 首次部署时生成 `/etc/announce-rs-web.env`，浏览器访问时
 使用用户名 `admin` 和脚本输出到终端的口令登录。文件权限为 `0600`，重复部署不会覆盖已有口令。
 
+**口令文件（2026-10-31 新增，推荐给手工装机用）**：程序还会读 `<程序目录>/web_pass`
+（可用 `ANNOUNCE_WEB_PASSWORD_FILE` 改路径），优先级 环境变量 > 口令文件 > 一次性口令。
+手工拷贝安装时单元里没有 `EnvironmentFile`、写 `/etc` 又要 root，直接放这个文件最省事：
+
+```bash
+printf 'admin123\n' > /opt/announce-rs/web_pass
+chmod 600 /opt/announce-rs/web_pass
+chown debian13:debian13 /opt/announce-rs/web_pass
+systemctl restart announce-web      # 或用 root 重启；改口令必须重启才生效
+```
+
+比环境变量更收敛：`systemctl show -p Environment` 能看到环境变量里的口令，0600 文件看不到。
+
 手工启动时，非回环监听且未设置口令会生成一次性口令并打印到 journal：
 
 ```bash

@@ -316,6 +316,13 @@ struct Loop {
     last_health_warn: f64,
     /// 作息闸静音提示只打一次的标志(2026-10-22): 回到工作时段复位, 别每帧刷屏。
     mute_warned: bool,
+    /// ★2026-10-31: 今天是否工作日(周末/法定节假日 -> false)。带 60s 缓存,
+    /// 非工作日整条识别链直接跳过 —— 详见 workday_active_now。
+    workday_active: bool,
+    /// 上次刷新 workday_active 的时刻(0 = 尚未判定过)。
+    workday_checked_at: f64,
+    /// 工作日状态切换时只打一行日志, 免得 3fps 下每帧刷屏。
+    workday_logged: bool,
     /* —— 号码闸门(2026-10-21) ————————————————————————————————
      * 屏幕改三行列表后, 单数字误读会产出"看起来合理"的号(GA158→GA198、GA150→GA190),
      * 播报后还占住当日去重表, 真号反而不再响。现场编号严格 +1 递增, 用"跳幅上限"
@@ -526,6 +533,54 @@ fn seed_only_on_startup(
         (true, Some(hm)) => !in_work_window(hm, work_start, work_end),
         _ => true,
     }
+}
+
+/// ★2026-10-31: 指定日期是否"该播"(纯函数, 供单测)。
+///
+/// 优先级 **法定节假日 > 补班日 > 星期表**:
+///   - `holidays` 命中 -> 休(国庆/春节这种"周一到周五但放假"的日子, 只看星期会空播);
+///   - `extra_work_dates` 命中 -> 上(国内调休常见"周六补班", 只看星期会整天漏播);
+///   - 其余按 `workdays`(ISO 周几, 1=周一 … 7=周日)判定。
+///
+/// `enabled=false` 时闸不生效, 恒 true(与作息时间闸的语义保持一致)。
+fn schedule_day_active(
+    date: chrono::NaiveDate,
+    enabled: bool,
+    workdays: &[u32],
+    extra_work_dates: &[String],
+    holidays: &[String],
+) -> bool {
+    use chrono::Datelike;
+    if !enabled {
+        return true;
+    }
+    let key = date.format("%Y-%m-%d").to_string();
+    if holidays.iter().any(|d| d.trim() == key) {
+        return false;
+    }
+    if extra_work_dates.iter().any(|d| d.trim() == key) {
+        return true;
+    }
+    workdays.contains(&date.weekday().number_from_monday())
+}
+
+/// 今天是不是工作日。跨零点时段(如 22:00~06:00 夜班)的**凌晨段归属起班那天**:
+/// 周五 22:00 上的夜班, 到周六 02:00 仍算"周五的班", 否则周五夜班天天被腰斩。
+fn workday_ok(now_hm: &str, s: &cfg::Schedule) -> bool {
+    let today = chrono::Local::now().date_naive();
+    let crosses_midnight = s.work_end.as_str() < s.work_start.as_str();
+    let date = if crosses_midnight && now_hm < s.work_end.as_str() {
+        today - chrono::Duration::days(1)
+    } else {
+        today
+    };
+    schedule_day_active(
+        date,
+        s.enabled,
+        &s.workdays,
+        &s.extra_work_dates,
+        &s.holidays,
+    )
 }
 
 /// ★2026-10-26(改动二): 本轮结束后是否要**保住** day_reseed 标记(不清)。
@@ -753,6 +808,10 @@ impl Loop {
             last_num: seed_baselines,
             maint_day: local_day_of(now).unwrap_or_default(),
             mute_warned: false,
+            // 保守初值 true: 首轮 workday_active_now() 会立刻重算并打一行日志。
+            workday_active: true,
+            workday_checked_at: 0.0,
+            workday_logged: false,
             // ★2026-10-26 高危修复: 基线为空时闸门走"无基线取最大", 屏上残留的大号
             //   (如昨日尾号 GA219)会被当新号播掉并毒化基线; 之后当天 GA002 起的小号
             //   全被"号小了差>5"挡死(2026-10-26 上午现场真实事故)。
@@ -788,6 +847,12 @@ impl Loop {
             self.roi.3,
             self.det.stable_frames
         );
+
+        // ★2026-10-31: 启动即判一次工作日。非工作日这一行必须打出来, 否则现场
+        //   看到"服务 active 但一声不响、日志也不长"会以为坏了。
+        if self.cfg.schedule.enabled {
+            self.workday_active_now();
+        }
 
         loop {
             // ★优雅退出检查点: 收到 SIGTERM/SIGINT 就在这里 break, 而不是被信号打死。
@@ -949,6 +1014,38 @@ impl Loop {
         self.diag_ocr_max = 0.0;
     }
 
+    /// ★2026-10-31: 今天是不是工作日(带 60s 缓存)。
+    ///
+    /// 非工作日(周末/法定节假日)整条识别链在 `maybe_ocr` 里最先被跳过 —— 现场
+    /// 2026-10-31(周六) 半天就往 CSV 写了 14 条 INVALID(全是玻璃反光和"设计部门
+    /// 回球"公告牌的文字), 既白烧 CPU 又污染播报日志。跳过只影响 OCR/播报,
+    /// 取帧、配置台预览、健康心跳照常 —— 周末想远程看一眼摄像头仍然可以。
+    ///
+    /// 缓存 60s: 主循环约 3fps, 每帧都格式化日期/比对日期表没必要; 一分钟的
+    /// 切换延迟对"跨天"这种量级的事件完全够用。
+    fn workday_active_now(&mut self) -> bool {
+        let now = now_secs();
+        if self.workday_checked_at > 0.0 && now - self.workday_checked_at < 60.0 {
+            return self.workday_active;
+        }
+        self.workday_checked_at = now;
+        let hm = chrono::Local::now().format("%H:%M").to_string();
+        let active = workday_ok(&hm, &self.cfg.schedule);
+        if !self.workday_logged || active != self.workday_active {
+            self.workday_logged = true;
+            if active {
+                println!("[作息] 今天是工作日, 正常识别播报");
+            } else {
+                println!(
+                    "[作息] 今天({})非工作日(周末/法定节假日), 跳过识别与播报; 屏面预览仍可用",
+                    chrono::Local::now().format("%Y-%m-%d")
+                );
+            }
+        }
+        self.workday_active = active;
+        active
+    }
+
     /// 作息闸统一入口(2026-10-23 高危修复): schedule.enabled 且当前不在工作时段
     /// -> false。两条播报路径(fast_confirm 静帧快路 / announce_winners 投票路)
     /// 都必须过这一关 —— 旧版只闸投票路, 现场主力是静帧快路, "夜里整夜播报"
@@ -973,7 +1070,13 @@ impl Loop {
             }
             return true;
         }
-        let hm = chrono::Local::now().format("%H:%M").to_string();
+        let hm = now_lc.format("%H:%M").to_string();
+        // ★2026-10-31: 周末/法定节假日一律不播(补班日已在 workday_ok 里按"强制上班"处理)。
+        //   与时间闸分开判: 时间闸只管"每天几点到几点", 这里管"哪些天要上班"。
+        if !self.workday_active_now() {
+            self.mute_warned = true;
+            return false;
+        }
         let inside = in_work_window(
             &hm,
             &self.cfg.schedule.work_start,
@@ -1087,6 +1190,15 @@ impl Loop {
     ///   ingest_candidates    诊断 / 确认窗口 / 退避 / 预热 / 确认状态机 / 票决播报
     ///   note_ocr_failure     失败归账(同样进诊断与空转退避)
     fn maybe_ocr(&mut self, frame: &Arc<capture::Frame>, changed: bool, now: f64) {
+        // ★2026-10-31: 非工作日(周末/法定节假日)整条识别链在这里就断掉。
+        //   周末屏上没人叫号, 照常 OCR 只会把反光、公告牌文字认成一堆 INVALID
+        //   写进 CSV(10-31 周六半天 14 条), 白烧 CPU 还污染播报日志。
+        //   放在最前面: 连存证图都不落盘, 一举把 _live/ 和 tesseract 都省掉。
+        //   注意与作息时间闸的区别 —— 时间闸只是"静音"(OCR 照常, 为了到点续播),
+        //   这里是"这一天本来就不上班", 不需要续播, 直接不认。
+        if self.cfg.schedule.enabled && !self.workday_active_now() {
+            return;
+        }
         let by_change = match self.ocr_due(changed, now) {
             Some(v) => v,
             None => return,
@@ -1790,6 +1902,11 @@ impl Loop {
         // ★2026-10-23 中危修复: 作息静音期 last_announce 停更是设计行为, 不是
         //   链路失效 —— 不豁免的话静音期整夜每 health_alert_sec 刷一条误导告警。
         if self.cfg.schedule.enabled {
+            // ★2026-10-31: 非工作日整天不播是设计行为, 同属"静音期", 一样要豁免,
+            //   否则周末每 health_alert_sec 刷一条"链路疑似失效"的误导告警。
+            if !self.workday_active_now() {
+                return;
+            }
             let hm = chrono::Local::now().format("%H:%M").to_string();
             if !in_work_window(
                 &hm,
@@ -2081,12 +2198,59 @@ mod tests {
         announce_sort_key, drop_shadow_empty, effective_ttl, enhancement_pixels_allowed,
         fill_window_keep_number, filter_number_pool, gate_day_rollover, in_work_window,
         jump_extra_confirm, keep_day_reseed, number_pool_accepts, number_votes,
-        ocr_candidate_quality, resolve_highlight_row, resolve_row_pitch, seed_only_decide,
-        seed_only_on_startup, seq_reset_eligible, seq_reset_tick, settle_ready, short,
-        should_stop_before_row, time_plausible_y, JUMP_HARD_MAX, SEQ_RESET_SECS,
+        ocr_candidate_quality, resolve_highlight_row, resolve_row_pitch, schedule_day_active,
+        seed_only_decide, seed_only_on_startup, seq_reset_eligible, seq_reset_tick, settle_ready,
+        short, should_stop_before_row, time_plausible_y, JUMP_HARD_MAX, SEQ_RESET_SECS,
         SETTLE_MAX_WAIT_SECS, SHORT_MAX,
     };
     use std::collections::{HashMap, HashSet};
+
+    /// 2026-10-31: 工作日判定 —— 周末休、周末补班照上、工作日放假照休。
+    #[test]
+    fn workday_skips_weekends_but_honors_makeup_and_holidays() {
+        // 2026-10-31 = 周六, 2026-11-01 = 周日, 2026-11-02 = 周一
+        let sat = chrono::NaiveDate::from_ymd_opt(2026, 10, 31).unwrap();
+        let sun = chrono::NaiveDate::from_ymd_opt(2026, 11, 1).unwrap();
+        let mon = chrono::NaiveDate::from_ymd_opt(2026, 11, 2).unwrap();
+        let weekdays = vec![1, 2, 3, 4, 5];
+        assert!(!schedule_day_active(sat, true, &weekdays, &[], &[]));
+        assert!(!schedule_day_active(sun, true, &weekdays, &[], &[]));
+        assert!(schedule_day_active(mon, true, &weekdays, &[], &[]));
+
+        // 补班日(周六上班): 命中 extra_work_dates -> 照上
+        let makeup = vec!["2026-10-31".to_string()];
+        assert!(schedule_day_active(sat, true, &weekdays, &makeup, &[]));
+        // 补班日不该顺带把周日也放行
+        assert!(!schedule_day_active(sun, true, &weekdays, &makeup, &[]));
+
+        // 法定节假日(周一放假): holidays 优先级最高, 即使当天在 workdays 里也休
+        let holidays = vec!["2026-11-02".to_string()];
+        assert!(!schedule_day_active(mon, true, &weekdays, &[], &holidays));
+        // 同一天同时出现在两张表里时, 节假日优先(宁可少播, 不可乱播)
+        let both = vec!["2026-11-02".to_string()];
+        assert!(!schedule_day_active(mon, true, &weekdays, &both, &holidays));
+
+        // 作息闸关闭 -> 恒播(七天全上), 与时间闸 enabled=false 的语义一致
+        assert!(schedule_day_active(sat, false, &weekdays, &[], &[]));
+
+        // 七天全上的配置: 周末也播(给全年无休的网点留的出口)
+        let all_days = vec![1, 2, 3, 4, 5, 6, 7];
+        assert!(schedule_day_active(sat, true, &all_days, &[], &[]));
+
+        // 日期串带空白也应命中(配置文件手改容易带空格)
+        let padded = vec![" 2026-10-31 ".to_string()];
+        assert!(schedule_day_active(sat, true, &weekdays, &padded, &[]));
+    }
+
+    /// 老配置(没有 workdays 字段)必须自动落到"周一到周五", 否则升级后周末照旧空扫。
+    #[test]
+    fn schedule_defaults_to_weekdays_when_field_absent() {
+        let json = r#"{"enabled":true,"work_start":"08:00","work_end":"17:00"}"#;
+        let s: crate::cfg::Schedule = serde_json::from_str(json).unwrap();
+        assert_eq!(s.workdays, vec![1, 2, 3, 4, 5]);
+        assert!(s.extra_work_dates.is_empty());
+        assert!(s.holidays.is_empty());
+    }
 
     #[test]
     fn number_pool_rejects_impossible_four_digit_misreads() {

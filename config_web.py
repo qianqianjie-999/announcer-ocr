@@ -13,6 +13,7 @@
 """
 import errno
 import base64
+import datetime
 import fcntl
 import glob
 import hashlib
@@ -34,12 +35,34 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = 8080
+HERE = os.path.dirname(os.path.abspath(__file__))
 WEB_BIND = os.environ.get("ANNOUNCE_WEB_BIND", "0.0.0.0").strip()
 WEB_USER = os.environ.get("ANNOUNCE_WEB_USER", "admin").strip() or "admin"
-# 非回环监听默认必须认证。部署脚本会生成持久口令并通过 EnvironmentFile 注入；
-# 手工直接启动时由 main() 生成一次性口令并打印到 journal。
-WEB_PASSWORD = os.environ.get("ANNOUNCE_WEB_PASSWORD", "").strip()
-HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def _read_secret(path):
+    """读口令文件；不存在/无权限一律返回空串（调用方退回"一次性口令"分支）。"""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+# 非回环监听默认必须认证。口令来源优先级:
+#   ① 环境变量 ANNOUNCE_WEB_PASSWORD（部署脚本用 EnvironmentFile 注入）
+#   ② 口令文件（默认 <程序目录>/web_pass，0600）—— 2026-10-31 新增
+#   ③ 都没有: main() 生成一次性口令并打印到 journal
+# 之所以加文件这一路: 现场是手工拷贝安装（单元里没有 EnvironmentFile），
+# 写 /etc 要 root；而 Environment 里的口令连 `systemctl show -p Environment`
+# 都能读到，放 0600 文件里反而更收敛。两条路径并存，谁配了用谁。
+PW_FILE = (
+    os.environ.get("ANNOUNCE_WEB_PASSWORD_FILE", "").strip()
+    or os.path.join(HERE, "web_pass")
+)
+WEB_PASSWORD = os.environ.get("ANNOUNCE_WEB_PASSWORD", "").strip() or _read_secret(
+    PW_FILE
+)
 CONFIG = os.path.join(HERE, "config.json")
 SIM_FRAME = os.path.join(HERE, "sim_frame.jpg")
 LOG_CSV = os.path.join(HERE, "announce_log.csv")
@@ -460,6 +483,8 @@ def validate_rtsp(src):
 
 # 工作时间 HH:MM（00:00 ~ 23:59）
 _HM_RE = re.compile(r"^([01][0-9]|2[0-3]):[0-5][0-9]$")
+# 补班日 / 法定节假日 YYYY-MM-DD（是否真实存在再由 datetime.date 判一次）
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 def _finite(v, name):
@@ -672,6 +697,38 @@ def validate_and_build(body):
             return None, "工作开始时间与结束时间不能相同"
         sched["work_start"], sched["work_end"] = ws, we
 
+        # 工作日/补班日/法定节假日（2026-10-31）。Rust 侧 Config::validate 同样会拒，
+        # 这里先挡一遍是为了让报错出现在页面上，而不是把服务打死在 Restart=always 循环里。
+        wds = sc.get("workdays")
+        if wds is None:
+            wds = sched.get("workdays") or [1, 2, 3, 4, 5]
+        if not isinstance(wds, list) or not all(
+            isinstance(x, int) and not isinstance(x, bool) and 1 <= x <= 7 for x in wds
+        ):
+            return None, "工作日必须是 1~7 的整数（1=周一 … 7=周日）"
+        if sched["enabled"] and not wds:
+            return None, "启用工作时间调度时至少要勾选一个工作日"
+        sched["workdays"] = sorted(set(wds))
+        for key, label in (("extra_work_dates", "补班日"), ("holidays", "法定节假日")):
+            vals = sc.get(key)
+            if vals is None:
+                vals = sched.get(key) or []
+            if not isinstance(vals, list):
+                return None, "%s格式非法（需日期列表）" % label
+            out = []
+            for v in vals:
+                s = str(v).strip()
+                if not s:
+                    continue
+                if not _DATE_RE.match(s):
+                    return None, "%s里的 %r 不是合法日期（需 YYYY-MM-DD）" % (label, s)
+                try:
+                    datetime.date.fromisoformat(s)
+                except ValueError:
+                    return None, "%s里的 %r 不是真实日期（如 2026-02-30 不存在）" % (label, s)
+                out.append(s)
+            sched[key] = sorted(set(out))
+
         cfg = cur
         cfg.update({
             "camera_source": camera_source,
@@ -801,8 +858,14 @@ fps <input id=fps type=number value=3 step=0.5>
 <label>开始 <input id=s_start type=time value="08:00" onchange=schedInfo()></label>
 <label>结束 <input id=s_end type=time value="18:00" onchange=schedInfo()></label>
 <span id=sinfo class=small>…</span>
+<div class=row>工作日 <span id=wd_box></span></div>
+<label>补班日 <input id=s_extra type=text size=34 placeholder="2026-10-31,2026-11-01"></label>
+<label>法定节假日 <input id=s_hol type=text size=34 placeholder="2026-10-01,2026-10-02"></label>
 <div class=small>开启后由系统按时自动<b>拉起/停止播报服务</b>：非工作时间不采集、不识别、不播报
-（省 CPU，也避免非营业时段误播）。保存后立即生效；跨午夜时段（如 22:00 ~ 06:00）同样支持。</div>
+（省 CPU，也避免非营业时段误播）。保存后立即生效；跨午夜时段（如 22:00 ~ 06:00）同样支持。<br>
+<b>工作日</b>默认周一~周五，周六周日<b>不识别、不播报</b>（屏面预览仍可用）。
+国内调休常见"周六补班"——把那天填进<b>补班日</b>（YYYY-MM-DD，逗号分隔），当天照常播；
+国庆/春节这类"工作日放假"填进<b>法定节假日</b>，当天停工。节假日优先于补班日。</div>
 </fieldset>
 
 <fieldset><legend>OCR</legend>
@@ -979,12 +1042,43 @@ function fillForm(c){
  $('s_en').checked=!!sc.enabled;
  $('s_start').value=sc.work_start||'08:00';
  $('s_end').value=sc.work_end||'18:00';
+ // 工作日：默认周一到周五；后端老配置没有该字段时同样按默认显示
+ const wds=(sc.workdays&&sc.workdays.length)?sc.workdays:[1,2,3,4,5];
+ buildWdBtns();
+ for(let i=1;i<=7;i++){const b=$('wd'+i); if(b) b.checked=wds.indexOf(i)>=0;}
+ $('s_extra').value=(sc.extra_work_dates||[]).join(',');
+ $('s_hol').value=(sc.holidays||[]).join(',');
  $('o_lang').value=c.ocr.lang;$('o_psm').value=c.ocr.psm;
  const pn=(c.ocr.pattern||[]).length;
  $('patinfo').textContent=pn?pn+' 条':'0 条（保存会被拒绝）';
  $('patinfo').style.color=pn?'':'#c00';
  srcUI();
  schedInfo();
+}
+
+// 工作日勾选框：周一到周日。回填前重建，避免重复叠加。
+function buildWdBtns(){
+ const box=$('wd_box'); if(!box) return;
+ box.innerHTML='';
+ const names=['一','二','三','四','五','六','日'];
+ for(let i=1;i<=7;i++){
+  const lb=document.createElement('label');
+  const cb=document.createElement('input');
+  cb.type='checkbox'; cb.id='wd'+i; cb.onchange=schedInfo;
+  lb.appendChild(cb); lb.appendChild(document.createTextNode('周'+names[i-1]));
+  box.appendChild(lb);
+ }
+}
+// "2026-11-01, 2026-11-02" -> ['2026-11-01','2026-11-02']；中英文逗号/空白都算分隔符
+function splitDates(v){return (v||'').split(/[,，、\s]+/).map(s=>s.trim()).filter(s=>s);}
+// 今天该不该播（仅用于页面提示，真正的判定在 Rust 侧）
+function dayOkToday(){
+ const d=new Date(),p=x=>('0'+x).slice(-2);
+ const key=d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate());
+ if(splitDates($('s_hol').value).indexOf(key)>=0) return false;
+ if(splitDates($('s_extra').value).indexOf(key)>=0) return true;
+ const cb=$('wd'+(d.getDay()||7));
+ return cb?cb.checked:true;
 }
 
 // 工作时间状态提示：用浏览器本地时间判断当前是否在窗口内（跨午夜亦支持）。
@@ -996,8 +1090,10 @@ function schedInfo(){
  const a=tm(s),b=tm(e),now=new Date(),n=now.getHours()*60+now.getMinutes();
  if(a===b){el.textContent='开始与结束时间相同，保存会被拒绝';el.style.color='#c00';return;}
  const inw=(a<b)?(n>=a&&n<b):(n>=a||n<b);
- el.textContent=inw?'当前 处于工作时间内 —— 服务应运行中':'当前 处于非工作时间 —— 服务应已停止';
- el.style.color=inw?'#0a7':'#c00';
+ const day=dayOkToday();
+ el.textContent=(inw?'当前 处于工作时间内 —— 服务应运行中':'当前 处于非工作时间 —— 服务应已停止')
+  +'；今天'+(day?'是工作日':'不是工作日（周末/节假日，不识别不播报）');
+ el.style.color=(inw&&day)?'#0a7':'#c00';
 }
 
 function collect(){
@@ -1016,7 +1112,10 @@ function collect(){
    spell_number:$('t_spell').checked,
    aplay_device:$('t_dev').value.trim()||null},
   ocr:{lang:$('o_lang').value,psm:+$('o_psm').value},
-  schedule:{enabled:$('s_en').checked,work_start:$('s_start').value,work_end:$('s_end').value}};
+  schedule:{enabled:$('s_en').checked,work_start:$('s_start').value,work_end:$('s_end').value,
+   workdays:[1,2,3,4,5,6,7].filter(i=>{const b=$('wd'+i);return b&&b.checked;}),
+   extra_work_dates:splitDates($('s_extra').value),
+   holidays:splitDates($('s_hol').value)}};
 }
 
 let liveTimer=null,snapBusy=false,prevUrl=null,autoFail=0;
@@ -2121,8 +2220,15 @@ class Handler(BaseHTTPRequestHandler):
                         "rev": config_rev()})
             return
         if sched.get("enabled"):
-            sinfo = "工作时间 %s ~ %s（非工作时间自动停机）" % (
-                sched.get("work_start"), sched.get("work_end"))
+            _names = "一二三四五六日"
+            _wd = sched.get("workdays") or [1, 2, 3, 4, 5]
+            sinfo = "工作时间 %s ~ %s（非工作时间自动停机；工作日 %s）" % (
+                sched.get("work_start"), sched.get("work_end"),
+                "".join("周" + _names[d - 1] for d in _wd))
+            if sched.get("extra_work_dates"):
+                sinfo += "；补班 %d 天" % len(sched["extra_work_dates"])
+            if sched.get("holidays"):
+                sinfo += "；节假日 %d 天" % len(sched["holidays"])
         else:
             sinfo = "未启用工作时间调度（全天运行）"
         self._json({"ok": True, "msg": "已保存并生效。%s；camera_source=%r roi=%s"
@@ -2138,12 +2244,21 @@ def main():
     print("[config_web] listening on %s:%d, config=%s" % (WEB_BIND, PORT, CONFIG), flush=True)
     if WEB_PASSWORD and not had_password:
         print(
-            "[config_web] 未配置 ANNOUNCE_WEB_PASSWORD，本次生成临时口令。"
-            "用户名=%s 口令=%s（重启后会变化）" % (WEB_USER, WEB_PASSWORD),
+            "[config_web] 未配置 ANNOUNCE_WEB_PASSWORD / %s，本次生成临时口令。"
+            "用户名=%s 口令=%s（重启后会变化）" % (PW_FILE, WEB_USER, WEB_PASSWORD),
             flush=True,
         )
     elif WEB_PASSWORD:
-        print("[config_web] HTTP Basic 认证已启用，用户名=%s" % WEB_USER, flush=True)
+        src = (
+            "环境变量"
+            if os.environ.get("ANNOUNCE_WEB_PASSWORD", "").strip()
+            else PW_FILE
+        )
+        print(
+            "[config_web] HTTP Basic 认证已启用，用户名=%s，口令来源=%s"
+            % (WEB_USER, src),
+            flush=True,
+        )
     srv.serve_forever()
 
 
