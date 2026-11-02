@@ -41,6 +41,13 @@ use util::now_secs;
 /// 触发存证帧与 Web 预览请求的落地目录(与 deploy 侧脚本约定一致)。
 const SAVE_DIR: &str = "_live";
 
+/// 每进程存证帧上限(2026-11-02 现场调整: 20 -> 600)。
+/// 原 20 张的额度会在每天开机后 30~40 分钟被叫号屏自检/告警画面耗尽,
+/// 白天真正出问题时反而没有画面可查。600 张 ≈ 一整天触发量(约 300~400 次),
+/// 单张 5~12KB, 一天约 3~5MB —— 本机为 149G 机械盘, 量级可忽略。
+/// 过期清理由 deploy/announce-cleanup.sh 按 7 天统一管理。
+const SAVE_CAP: u32 = 600;
+
 /// 「稳帧再认」的最长等待: 画面持续变化超过本秒数就不再等, 直接认当前帧。
 /// 防"摄像头噪点/亮度漂移一直判有变化 -> 静置窗口无限续期 -> 永不 OCR"的静默失效。
 const SETTLE_MAX_WAIT_SECS: f64 = 2.0;
@@ -1262,18 +1269,28 @@ impl Loop {
     /// ★条件用 `by_change`(静置后为本轮变化跑的那一次)而不是"这一轮有没有变" ——
     ///   现在存的是**定型帧**, 不再是一动就抓到的过渡帧残影(现场调优 2026-10-13)。
     fn save_evidence(&mut self, crop: &image::RgbImage, by_change: bool, now: f64) {
-        if !(self.save_frames && by_change && now - self.last_save >= 2.0 && self.n_saved < 20) {
+        if !(self.save_frames && by_change && now - self.last_save >= 2.0
+            && self.n_saved < SAVE_CAP)
+        {
             return;
         }
-        // ★2026-10-23 低危修复: 存证满 20 张后旧版静默停用 —— 排障时以为还在
+        // ★2026-10-23 低危修复: 存证满上限后旧版静默停用 —— 排障时以为还在
         //   存证其实早停了。到达上限只提示一次, 别每帧刷屏。
-        if self.n_saved + 1 == 20 {
-            println!("[存证] 已达 20 张上限, 本进程内停止存证(重启后重计)");
+        // ★2026-11-02 上限 20 -> SAVE_CAP(600): 20 张半小时就被开机噪声耗尽。
+        if self.n_saved + 1 == SAVE_CAP {
+            println!(
+                "[存证] 已达 {} 张上限, 本进程内停止存证(重启后重计)",
+                SAVE_CAP
+            );
         }
         self.last_save = now;
         self.n_saved += 1;
         let _ = std::fs::create_dir_all(SAVE_DIR);
-        let p = format!("{}/trig_{:02}.jpg", SAVE_DIR, self.n_saved);
+        // ★2026-11-02 文件名由固定序号 trig_NN 改为时间戳: 原来固定 20 个槽位,
+        //   重启即覆盖当天更早的存证; 现在按时间落盘, 直接对应"哪个时点看到了什么",
+        //   保留期交给 deploy 侧 7 天清理(按 mtime), 一整天的事后回溯都能查到。
+        let stamp = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
+        let p = format!("{}/trig_{}.jpg", SAVE_DIR, stamp);
         let res = std::fs::File::create(&p).and_then(|f| {
             let mut enc =
                 image::codecs::jpeg::JpegEncoder::new_with_quality(std::io::BufWriter::new(f), 92);

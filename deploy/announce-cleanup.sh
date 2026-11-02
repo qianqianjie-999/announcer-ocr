@@ -3,13 +3,13 @@
 # 目的: 小主机 7×24 运行, 日志/存证只增不减迟早写满磁盘、也白耗 eMMC 写入寿命。
 #
 # 安全约束(重要):
-#   * 所有读写都限定在 $DIR(/home/debian/anntest) 及其子目录内;
+#   * 所有读写都限定在 $DIR(/opt/announce-rs) 及其子目录内;
 #   * 只用"明确文件名模式"(announce_log_*.csv / trig_*.jpg / *.bak.*), 绝不 rm -rf、绝不通配符横扫;
 #   * 归档只轮转不删除(保留最近 $ARCHIVE_KEEP 个), 仅磁盘告急时才激进清理;
 #   * 输出直接进 journal, 由 journald 的 SystemMaxUse 统一封顶, 不再自己维护一个日志文件。
 set -u
 
-DIR=/home/debian/anntest
+DIR=/opt/announce-rs
 LIVE="$DIR/_live"
 ARCHIVE="$DIR/logs_archive"
 CSV="$DIR/announce_log.csv"
@@ -49,7 +49,7 @@ if [ -d "$ARCHIVE" ]; then
     ls -1t "$ARCHIVE"/announce_log_*.csv 2>/dev/null | tail -n +$((ARCHIVE_KEEP + 1)) |
     while IFS= read -r f; do
       # 双重保险: 只删确实匹配归档模式的普通文件
-      if [ -f "$f" ] && [ "${f#/home/debian/anntest/logs_archive/announce_log_}" != "$f" ]; then
+      if [ -f "$f" ] && [ "${f#/opt/announce-rs/logs_archive/announce_log_}" != "$f" ]; then
         rm -f -- "$f" && say "删除旧归档: $(basename "$f")"
       fi
     done
@@ -58,7 +58,8 @@ if [ -d "$ARCHIVE" ]; then
   fi
 fi
 
-# 3) 存证截图: 主程序自身上限 20 张(文件名固定会覆盖), 这里按时间兜底(超 7 天)
+# 3) 存证截图: 主程序每进程上限 600 张, 文件名带时间戳(trig_20261102_143012.jpg),
+#    这里按时间兜底(超 7 天)—— 2026-11-02 起由"固定20张覆盖"改为"按天留存量"
 find "$LIVE" -maxdepth 1 -type f -name 'trig_*.jpg' -mtime +"$TRIG_KEEP_DAYS" -delete 2>/dev/null
 say "存证截图现存 $(ls -1 "$LIVE"/trig_*.jpg 2>/dev/null | wc -l) 张(已删 ${TRIG_KEEP_DAYS} 天前的)"
 

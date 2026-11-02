@@ -899,6 +899,19 @@ DNS <input id=n_dns type=text size=24>（可留空）</div>
 <fieldset><legend>播报日志尾部（announce_log.csv）</legend>
 <div id=logbox>加载中…</div></fieldset>
 
+<fieldset><legend>音频健康（自检 / 自愈 · audio_health 守护）</legend>
+<div class=row><b id=ah_sum>加载中…</b>
+<button class=gray type=button onclick=loadAudioHealth()>🔄 刷新</button></div>
+<div class=small id=ah_meta>…</div>
+<pre id=ah_tail style="margin:6px 0;padding:8px;background:#f6f6f2;border:1px solid #ccc;
+ border-radius:6px;font-size:12px;white-space:pre-wrap;max-height:260px;overflow:auto">…</pre>
+<div class=small>audio_health.sh 由系统定时器<b>每 60 秒</b>盯一次播报失败、<b>每 5 分钟</b>做一次静音自检；
+无声时自动恢复：混音器复位 → 重启播报服务 → 整机重启（30 分钟限流，连续 3 次停手告警）。<br>
+日志里 <b>SKIP=设备占用中跳过检测</b>（说明正在播报，属正常保护）；
+<b>OK=自检通过</b>；<b>RECOVER 触发→RECOVER-OK=自动恢复成功</b>；
+出现「aplay 播放失败」即当天有号没出声，对应号码需现场人工引导。</div>
+</fieldset>
+
 <fieldset><legend>日志与磁盘（每日 03:30 自动清理）</legend>
 <div id=loginfo class=small>加载中…</div>
 <div class=row>
@@ -1222,6 +1235,7 @@ function refresh(){
   $('logbox').textContent=d.log||'(暂无日志)';
  }).catch(()=>{});
  loadLogs();
+ loadAudioHealth();
 }
 
 function loadNet(){
@@ -1339,11 +1353,23 @@ function showAudio(a){
  $('audioinfo').style.color=(a.Master&&a.Master.muted)?'#c00':'';
 }
 function loadAudio(){fetch('/api/audio').then(r=>r.json()).then(showAudio).catch(()=>{});}
+function loadAudioHealth(){
+ fetch('/api/audio_health').then(r=>r.json()).then(d=>{
+  const n=(d.recover_today||0)+(d.warn_today||0);
+  $('ah_sum').textContent='今日: 自检通过 '+d.ok_today+' 次 · 跳检(播报中) '+d.skip_today
+   +' 次 · 恢复动作 '+d.recover_today+' 次 · 恢复成功 '+(d.recover_ok_today||0)+' 次';
+  $('ah_sum').style.color=n>0?'#c06000':'#080';
+  $('ah_meta').textContent='最近播放失败: '+(d.last_fail||'无')
+   +' · 最近自愈: '+(d.last_recover||'无')+' · 实时声卡: '+(d.pcm||'?')
+   +' · 守护定时器: '+(d.timer||'?');
+  $('ah_tail').textContent=d.tail||'(暂无日志)';
+ }).catch(()=>{$('ah_sum').textContent='加载失败(点刷新重试)';$('ah_sum').style.color='#c00';});
+}
 
 let cfgRev=null; // 配置内容指纹(乐观锁), 与 /api/config 的 rev、/api/save 的 __rev 对应
 fetch('/api/config').then(r=>r.json()).then(d=>{cfgRev=d.rev||null;fillForm(d);})
  .catch(e=>msg('读配置失败: '+e));
-scanUsb();loadAudio();loadTime();
+scanUsb();loadAudio();loadAudioHealth();loadTime();
 // 服务器时间每 30 秒与后端对齐一次(平时靠本地单调时钟推算, 不打请求)
 setInterval(loadTime,30000);
 // 播报日志尾部自动刷新(5s): 现场盯日志不用再手动点「刷新」。
@@ -1584,6 +1610,83 @@ def audio_fix():
             ok = False
             logs.append("%s 失败: %s" % (name, e))
     return ok, "；".join(logs)
+
+
+AUDIO_HEALTH_LOG = "/var/log/announce-rs/audio_health.log"
+SVC_LOG = "/var/log/announce-rs/service.log"
+
+
+def audio_health_status():
+    """音频健康总览（audio_health.sh 自检/自愈）—— 供配置台「音频健康」面板显示。
+
+    只读不修: 真正的自检/自愈仍由 audio-health.timer(60s) 在后台跑,
+    这里负责把它的动态搬上页面: 今日统计、日志尾部、最近播放失败、
+    实时 PCM 占用、守护定时器状态。文件读不到时字段留空, 面板不报错。
+    """
+    today = time.strftime("%Y-%m-%d")
+    out = {"today": today, "tail": "", "ok_today": 0, "skip_today": 0,
+           "recover_today": 0, "recover_ok_today": 0, "warn_today": 0,
+           "last_recover": "", "last_fail": "", "pcm": "", "timer": ""}
+
+    # 1) audio_health.log: 日志尾部 40 行 + 今日计数(文件超长会被脚本自截断, 全读无压力)
+    try:
+        with open(AUDIO_HEALTH_LOG, encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+        out["tail"] = "\n".join(lines[-40:])
+        for ln in lines:
+            if not ln.startswith(today):
+                continue
+            rest = ln.split(" ", 2)[-1] if ln.count(" ") >= 2 else ""
+            if rest.startswith("OK"):
+                out["ok_today"] += 1
+            elif rest.startswith("SKIP"):
+                out["skip_today"] += 1
+            elif rest.startswith("RECOVER-OK"):
+                out["recover_ok_today"] += 1
+                out["last_recover"] = ln
+            elif rest.startswith("RECOVER"):
+                out["recover_today"] += 1
+                out["last_recover"] = ln
+            elif rest.startswith("WARN"):
+                out["warn_today"] += 1
+    except OSError:
+        out["tail"] = "(读不到 audio_health.log —— 可能今日尚未产生记录)"
+
+    # 2) service.log 最近一次「播放失败」: 只倒着扫尾部 2MB, 避免 25MB 全读拖慢页面
+    try:
+        size = os.path.getsize(SVC_LOG)
+        with open(SVC_LOG, "rb") as f:
+            f.seek(max(0, size - 2_000_000))
+            chunk = f.read().decode("utf-8", "replace")
+        idx = chunk.rfind("播放失败")
+        if idx >= 0:
+            ts_list = re.findall(r"\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", chunk[:idx])
+            line1 = chunk[idx:].splitlines()[0][:80]
+            out["last_fail"] = (ts_list[-1] + " " if ts_list else "") + line1
+        else:
+            out["last_fail"] = "近期无（日志尾部 2MB 内未出现）"
+    except OSError:
+        out["last_fail"] = "(读不到 service.log)"
+
+    # 3) 实时 PCM 占用状态(按配置的声卡号解析, 不写死 card0)
+    for card in (alsa_card(), "0"):
+        try:
+            with open("/proc/asound/card%s/pcm0p/sub0/status" % card,
+                      encoding="utf-8", errors="replace") as f:
+                first = f.read().strip().splitlines()
+            out["pcm"] = first[0] if first else ""
+            break
+        except (OSError, IndexError):
+            continue
+    if not out["pcm"]:
+        out["pcm"] = "?"
+
+    # 4) 自愈守护定时器状态
+    try:
+        out["timer"] = _run_quiet(["systemctl", "is-active", "audio-health.timer"]) or "?"
+    except Exception:  # noqa: BLE001
+        out["timer"] = "?"
+    return out
 
 
 def espeak_voice():
@@ -1943,6 +2046,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"devices": list_usb_cams()})
             elif u.path == "/api/audio":
                 self._json(audio_status())
+            elif u.path == "/api/audio_health":
+                self._json(audio_health_status())
             elif u.path == "/api/time":
                 self._json(time_status())
             elif u.path == "/api/network":
