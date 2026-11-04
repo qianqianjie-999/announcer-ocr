@@ -1,0 +1,11 @@
+[Unit]
+# 手工校时请求触发器: /var/lib/announce-rs/time/request 文件一出现(配置台写入)
+# 即拉起 announce-time.service 消费, 无请求时零开销。
+# 取代原 5 秒轮询 timer(每天空转 ~17280 次进程启动, 2026-11-04 改造);
+# announce-time.timer 降频为 5 分钟兜底, 防边沿丢失导致请求滞留。
+Description=Trigger announce-time.service when a time-set request appears
+[Path]
+PathModified=/var/lib/announce-rs/time/request
+Unit=announce-time.service
+[Install]
+WantedBy=multi-user.target

@@ -1,10 +1,12 @@
 [Unit]
-# 手工校时请求轮询: 每 5 秒拉一次 announce-time.service, 取走 config_web.py
-# 写入 /var/lib/announce-rs/time/request 的校时请求(2026-10-23 补入库内)。
-Description=Poll announce-web time-set requests every 5 seconds
+# 手工校时请求兜底轮询: 正常由 announce-time.path 实时触发(2026-11-04 起),
+# 本 timer 降频为每 5 分钟跑一次, 仅兜底 path 边沿丢失(service 忙时触发事件
+# 可能被吞)导致 request 滞留的极端情况。无请求时脚本 exit 0, 开销可忽略。
+Description=Backup poll for announce-web time-set requests every 5 minutes
 [Timer]
-OnBootSec=10s
-OnUnitActiveSec=5s
+OnBootSec=30s
+OnUnitActiveSec=5min
+AccuracySec=30s
 Unit=announce-time.service
 [Install]
 WantedBy=timers.target

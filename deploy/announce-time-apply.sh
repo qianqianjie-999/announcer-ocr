@@ -4,7 +4,8 @@
 # 架构: 配置台(config_web.py)以 debian13 跑，改系统时间要 root。现场无 sudo，
 # 用 su 则需在配置台里明文存 root 密码 —— 不可接受。改为"请求文件"：
 #   配置台写  <dir>/request  (debian13 可写)
-#   本脚本由 announce-time.timer (root) 每 5 秒取走、校验、执行，写 <dir>/result
+#   本脚本由 announce-time.path 实时触发(root), 另有 announce-time.timer
+#   每 5 分钟兜底轮询(2026-11-04 起取代原 5 秒轮询 timer), 取走、校验、执行，写 <dir>/result
 # 参数只来自严格正则校验后的时间串，不经过 shell 求值，无注入面。
 set -u
 DIR=/var/lib/announce-rs/time
