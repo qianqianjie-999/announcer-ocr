@@ -928,15 +928,16 @@ DNS <input id=n_dns type=text size=24>（可留空）</div>
 <fieldset><legend>运维操作（恢复版本 / 重启）</legend>
 <div class=row>
 <button type=button onclick=maintAct('restore_substream','恢复辅码流版本')>⏪ 恢复辅码流版本</button>
-<button type=button onclick=maintAct('restore_mainstream','恢复主码流版本')>⏩ 恢复主码流版本</button>
+<button type=button onclick=maintAct('restore_mainstream','恢复当前运行版本')>⏩ 恢复当前运行版本</button>
 <button class=gray type=button onclick=maintAct('restart_service','重启播报服务')>🔄 重启服务</button>
 <button class=gray type=button onclick=maintAct('reboot','重启服务器')>🔌 重启服务器</button>
 </div>
 <pre id=maintout style="display:none;margin:6px 0;padding:8px;background:#f6f6f2;
  border:1px solid #ccc;border-radius:6px;font-size:12px;white-space:pre-wrap"></pre>
-<div class=small>恢复包在 /opt/announce-rs/backup/（2026-10-23 制作）：<b>辅码流版</b>=旧二进制+辅码流配置，
+<div class=small>恢复包在 /opt/announce-rs/backup/：<b>辅码流版</b>=2026-10-23 旧二进制+辅码流配置，
 紧急回退用（该版有跨日吞号问题：恢复后若不播报，再点一次「重启服务」即可）；
-<b>主码流版</b>=新二进制+备份时主码流配置（作息闸等以备份当时状态为准，需要时重新保存）。
+<b>当前运行版</b>（2026-11-09 刷新）= 与现在正在运行的版本完全一致（二进制 2026-11-05 编译 + 刷新时现场配置：作息闸开启、语速 150），
+点它不会回退版本，只用于把被改乱的配置拉回现场基线（目录名 mainstream-ok-1023 为历史沿用）。
 恢复前会自动把<b>当前</b>版本留底到 backup/pre-restore-时间戳/，恢复错了可手工翻回。
 配置台程序本身不随恢复回退。</div>
 </fieldset>
@@ -947,7 +948,7 @@ const $=id=>document.getElementById(id);
 // ---- 运维操作面板 ----
 const MAINT_TIPS={
  restore_substream:'将以辅码流旧程序运行（紧急回退版）。该版有跨日吞号问题：恢复后若不播报，再点一次「重启服务」即可。',
- restore_mainstream:'将恢复为备份时的主码流版本与配置（作息闸等以备份当时状态为准）。',
+ restore_mainstream:'将恢复为当前运行版本（2026-11-05 编译二进制 + 刷新时现场配置：作息闸开启、语速150），不会回退到 10-23 旧版。',
  restart_service:'播报服务将重启，数秒内完成，画面会闪断一次。',
  reboot:'整个主机将重启（约 1~2 分钟），期间配置台和播报都不可用！'};
 async function maintAct(act,label){
