@@ -381,13 +381,32 @@ fn split_num(number: &str) -> Option<(String, u32)> {
     digits.parse::<u32>().ok().map(|v| (pre.to_string(), v))
 }
 
-/// 号码是否落在配置的业务号池范围内。
+/// 号码是否落在配置的业务号池范围内，且格式合规。
 ///
-/// 解析不出数字段的候选保持调用方原有语义，不在这里额外拦截。
+/// ★2026-11-10 现场复盘(GA16 误播): 旧实现只比数值 ≤400, 位数不设卡。
+///   现场 `ocr.pattern` 是 `\d{2,6}`, 行2 "GA1 6" 去掉空白后被读成 GA16(2 位),
+///   16 ≤ 400 直接放行 -> 08:46:25 播出一声"G A 一 六"; 同理带前导零的
+///   4 位串 GA0021(21 ≤ 400) 在 10-28 也真播过 9 声。业务号池统一
+///   GA001~GA400, 数字段必须严格 3 位 ASCII 数字、前缀 1~2 位大写字母、
+///   数值落在 [1, max]。解析不出合规号码的候选一律拒绝(旧实现 None=>true 会放行脏串)。
+///   宁可漏一声，不可播错号: 错号会占住当日去重表，把真号挡死。
 fn number_pool_accepts(number: &str, max: u32) -> bool {
-    match split_num(number) {
-        Some((_, value)) => value <= max,
-        None => true,
+    let i = match number.find(|c: char| c.is_ascii_digit()) {
+        Some(i) => i,
+        None => return false,
+    };
+    let (pre, digits) = number.split_at(i);
+    // 前缀: 1~2 位 ASCII 大写字母(业务为 GA); 挡住 "GAO021"、"本机1P:..." 之类噪声
+    if pre.is_empty() || pre.len() > 2 || !pre.bytes().all(|b| b.is_ascii_uppercase()) {
+        return false;
+    }
+    // 数字段: 严格 3 位补零写法, 短号(GA16)/多读一位(GA0021) 一律不收
+    if digits.len() != 3 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    match digits.parse::<u32>() {
+        Ok(v) => v > 0 && v <= max,
+        Err(_) => false,
     }
 }
 
@@ -627,8 +646,12 @@ fn resolve_highlight_row(
     detected: Option<usize>,
     rows: usize,
 ) -> Option<usize> {
+    // ★2026-11-10: 惰性 then 取代 then_some —— 后者参数立即求值, 配置值 v=0
+    // (或越界值) 时 `v as usize - 1` 在 debug 模式整数下溢 panic, 既有单测
+    // configured_highlight_row_overrides_auto_detection 因此一直失败。release 下
+    // 溢出 wrap 后该值被丢弃, 行为不变; 改惰性求值让测试与实现一致。
     configured
-        .and_then(|v| (1..=rows as u32).contains(&v).then_some(v as usize - 1))
+        .and_then(|v| (1..=rows as u32).contains(&v).then(|| v as usize - 1))
         .or(detected)
 }
 
@@ -1552,7 +1575,7 @@ impl Loop {
         let (cands, pool_rejected) = filter_number_pool(cands, self.number_pool_max);
         if by_change && !pool_rejected.is_empty() {
             println!(
-                "[闸门] 号码池上限 {} 拒绝候选: {}",
+                "[闸门] 号码池上限 {} 拒绝候选(需前缀+严格3位数字、数值≤上限): {}",
                 self.number_pool_max,
                 pool_rejected.join(", ")
             );
@@ -2295,6 +2318,45 @@ mod tests {
             HashSet::from([("GA400".to_string(), "C04".to_string())])
         );
         assert_eq!(rejected, vec!["GA1142".to_string(), "GA401".to_string()]);
+    }
+
+    /// ★2026-11-10: 现场 ocr.pattern 允许 `\d{2,6}`, 短号 / 带前导零的 4 位串
+    /// 数值都 ≤400, 旧闸门只比上限一律放行 -> GA16 真播出去了(08:46:25)。
+    #[test]
+    fn number_pool_rejects_non_three_digit_numbers() {
+        // 现场事故样本: GA16 是 2 位, GA0021 是 4 位但数值仅 21
+        assert!(!number_pool_accepts("GA16", 400));
+        assert!(!number_pool_accepts("GA1", 400));
+        assert!(!number_pool_accepts("GA0021", 400));
+        assert!(!number_pool_accepts("GA0399", 400));
+        assert!(!number_pool_accepts("GA000", 400));
+        // 脏串/空串: 旧实现 split_num 返回 None 时 => true 会放行
+        assert!(!number_pool_accepts("", 400));
+        assert!(!number_pool_accepts("GA", 400));
+        assert!(!number_pool_accepts("GA abc", 400));
+        assert!(!number_pool_accepts("本机1P:10.159", 400));
+        assert!(!number_pool_accepts("GAO021", 400)); // 前缀 3 位噪声
+        // 正常三位补零号不受影响
+        assert!(number_pool_accepts("GA001", 400));
+        assert!(number_pool_accepts("GA016", 400));
+        assert!(number_pool_accepts("GA399", 400));
+        assert!(number_pool_accepts("GA400", 400));
+    }
+
+    #[test]
+    fn number_pool_filter_drops_short_misread_ga16() {
+        // 复刻 2026-11-10 08:46:25 那一帧: 行1 真号已在去重表, 行2 误读 GA16
+        let input = HashSet::from([
+            ("GA006".to_string(), "C05".to_string()),
+            ("GA16".to_string(), "C06".to_string()),
+            ("GA0021".to_string(), "C05".to_string()),
+        ]);
+        let (kept, rejected) = filter_number_pool(input, 400);
+        assert_eq!(
+            kept,
+            HashSet::from([("GA006".to_string(), "C05".to_string())])
+        );
+        assert_eq!(rejected, vec!["GA0021".to_string(), "GA16".to_string()]);
     }
 
     // ———— 时间可信度守卫: RTC 掉电时时钟跳出厂值, 作息闸必须自动失效 ————
