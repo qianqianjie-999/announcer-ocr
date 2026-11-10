@@ -75,6 +75,27 @@ const JUMP_HARD_MAX: u32 = 30;
 /// 挡住。K=5 覆盖两窗口紧挨着连续叫号的场景。
 const BACKFILL_MAX: u32 = 5;
 
+/// ★2026-11-10 起始窗口: 每天从 GA001 重新叫号, 正常首号实测 001~002; 昨日残留
+/// 号是"前日尾号"的大号(139/196 之流), 天然远离小号段。无基线(每天冷启动/跨天/
+/// 刚部署)时, 旧逻辑"取最大"会把屏上昨日残留大号当新号播掉并毒化基线, 次日 GA001
+/// 起小号全被"号小了"挡死(2026-11-09/11-10 现场: GA139/GA196 早上被复报, 基线毒化)。
+/// 改为只放行 [1, START_WINDOW_MAX] 的小号作为"今日起始号"播种基线, 大号一律不放行,
+/// 等今日首个小号出现才正式启动。上界取 10: 正常首号 1~2, 留容错覆盖"001/002 被
+/// 过渡动画漏读、首读直接 006"的情况; 也与 BACKFILL_MAX=5 错开, 不与漏号补播打架。
+const START_WINDOW_MAX: u32 = 10;
+
+/// 起始窗口的时间兜底(秒): 无基线超过本秒数仍未出现 [1, START_WINDOW_MAX] 的小号
+/// (异常, 如现场直接从 020 开始叫号), 回退到"取最大"放行, 防整天静默。实测残留期
+/// (残留号播报到今日首号播报)为 11~30 分钟, 取 30 分钟足够区分"还没开始叫号"与
+/// "首号确实 > 10"。
+const START_WINDOW_TIMEOUT_SECS: f64 = 1800.0;
+
+/// 起始窗口判定(纯函数, 供单测): 无基线时, 该候选数值是否落在起始窗口
+/// [1, START_WINDOW_MAX] 内(今日起始号)。大号(昨日残留/跳号)返回 false。
+fn start_window_accept(v: u32) -> bool {
+    v >= 1 && v <= START_WINDOW_MAX
+}
+
 /// 高亮行增强会把图像放大到 2 倍，并跑 31x31 局部均值。限制原始 ROI 总像素，
 /// 防止高度误配时预处理在 tesseract 超时保护之外长时间占满主循环。
 const MAX_ENHANCE_PIXELS: u64 = 400_000;
@@ -1723,15 +1744,32 @@ impl Loop {
         let mut blocked: Vec<String> = Vec::new();
         for (pre, items) in by_pre {
             match self.last_num.get(&pre).copied() {
-                // 无基线(刚部署/跨天): 只取最大号 —— 三行列表里最新的一行在最上面,
-                // 号码又是递增的, 所以"最大"就是"最新"。
+                // ★2026-11-10 起始窗口(无基线/刚部署/跨天/每天冷启动): 旧逻辑"取最大"
+                // 会把屏上昨日残留大号(前日尾号 196/195 之流)当新号播掉并毒化基线,
+                // 次日 GA001 起小号全被"号小了"挡死。改为只放行起始窗口内的小号,
+                // 大号一律不放行 —— 等今日首个小号出现才播种基线。详见常量注释。
                 None => {
-                    if let Some(mx) = items.iter().map(|x| x.2).max() {
-                        for (n, w, v) in &items {
-                            if *v == mx {
-                                out.insert((n.clone(), w.clone()));
+                    let mut saw_small = false;
+                    for (n, w, v) in &items {
+                        if start_window_accept(*v) {
+                            out.insert((n.clone(), w.clone()));
+                            saw_small = true;
+                        }
+                    }
+                    // 时间兜底: 无基线超时仍未出现小号(首号异常 > 窗口), 回退取最大,
+                    // 防整天静默。silent 复用主循环口径 now - last_announce(启动即置 now)。
+                    if !saw_small && silent >= START_WINDOW_TIMEOUT_SECS {
+                        if let Some(mx) = items.iter().map(|x| x.2).max() {
+                            for (n, w, v) in &items {
+                                if *v == mx {
+                                    out.insert((n.clone(), w.clone()));
+                                }
                             }
                         }
+                        println!(
+                            "[闸门] 无基线 {:.0}s 未见起始窗口 [1..={}] 号 -> 回退取最大(防整天静默)",
+                            silent, START_WINDOW_MAX
+                        );
                     }
                 }
                 Some(last) => {
@@ -2251,8 +2289,8 @@ mod tests {
         jump_extra_confirm, keep_day_reseed, number_pool_accepts, number_votes,
         ocr_candidate_quality, resolve_highlight_row, resolve_row_pitch, schedule_day_active,
         seed_only_decide, seed_only_on_startup, seq_reset_eligible, seq_reset_tick, settle_ready,
-        short, should_stop_before_row, time_plausible_y, JUMP_HARD_MAX, SEQ_RESET_SECS,
-        SETTLE_MAX_WAIT_SECS, SHORT_MAX,
+        short, should_stop_before_row, start_window_accept, time_plausible_y, JUMP_HARD_MAX,
+        SEQ_RESET_SECS, SETTLE_MAX_WAIT_SECS, SHORT_MAX, START_WINDOW_MAX,
     };
     use std::collections::{HashMap, HashSet};
 
@@ -2823,6 +2861,21 @@ mod tests {
         // 跨零点夜班窗口(22:00~06:00): 04:00 属工作时段 -> 不启用
         assert!(!seed_only_on_startup(true, Some("04:00"), "22:00", "06:00", true));
         assert!(seed_only_on_startup(true, Some("12:00"), "22:00", "06:00", true));
+    }
+
+    // ———— 起始窗口(2026-11-10 残留大号毒化基线修复) ————
+    #[test]
+    fn start_window_accepts_only_small_numbers() {
+        // 今日起始小号: 下界 1 与上界 10 均放行(正常首号实测 1~2)
+        assert!(start_window_accept(1));
+        assert!(start_window_accept(2));
+        assert!(start_window_accept(START_WINDOW_MAX));
+        // 越界: 0 不是合法号; 11 起的大号不放行
+        assert!(!start_window_accept(0));
+        assert!(!start_window_accept(START_WINDOW_MAX + 1));
+        // 昨日残留大号(现场实测 139/196)必然被拦
+        assert!(!start_window_accept(139));
+        assert!(!start_window_accept(196));
     }
 
     // ———— 同批播报数值序(2026-10-23 第八轮低危): GA9 必须先于 GA10 ————
