@@ -1,6 +1,13 @@
 // cfg.rs — 配置结构（与 Python 版 config.json 完全同 schema）
 use serde::Deserialize;
 
+/// 业务号码前缀。现场全库 2067 声 OK 里 2064 声是 GA, 其余 3 声(IG139 /
+/// G139 / CG159)均为 OCR 前缀误读, 不是别的业务号段。
+/// ★换号段时改这里, 并同步改现场 `config.json` 的 `ocr.pattern`
+///   (现为 `(G[A-Z]{0,2}\d{2,6})[到至]...`) 与 `detect.number_pool_max`。
+///   放在 cfg.rs 而非各模块硬编码, 让 OCR 解析层与号码闸门共用同一口径。
+pub const NUMBER_PREFIX: &str = "GA";
+
 fn d25() -> f64 {
     25.0
 }

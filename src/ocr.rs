@@ -1,7 +1,7 @@
 // ocr.rs — tesseract 子进程 OCR + 容错解析（正则与数字归一化逐条对齐 Python 版）
 // 选型依据(实测 J1850 靶机): chi_sim 单语言 + psm 11 + ROI 裁剪原图,
 // 单次 1.43s, 两张测试卡 4 个号全对; chi_sim+eng 慢 33% 无精度增益。
-use crate::cfg::OcrCfg;
+use crate::cfg::{OcrCfg, NUMBER_PREFIX};
 use regex::Regex;
 use std::collections::HashSet;
 use std::io::Read;
@@ -215,12 +215,13 @@ impl Ocr {
                 //   字母 T 落进号码, 同号变新号重复播报(现场实测事故)。守卫把匹配
                 //   起点前一字符并回号码头走原清洗链还原真号。
                 //
-                //   ★已知歧义(第五轮审查): "OGA999" 型输入(杂散大写字母紧邻完整号)
-                //     会被并回重切成 OG999 幻觉号。尝试过的判据"数字段是否纯数字"
-                //     无效 —— GAT174 切出的 AT174 数字段同样纯数字; "3 连大写字母+
-                //     数字"本身数学上不可区分杂讯在哪一侧。选择并回侧的理由:
-                //     ① GAT174 是实测事故, OGA999 是理论构造; ② ROI 只裁号码行,
-                //     行首就是号码, 行前无大写字母来源; ③ 上线后无误播记录。
+                //   ★已修复(2026-11-10): 下面 anchor_number_prefix 会在号码头锚定
+                //     GA 重切, "OGA999" 还原成 GA999; 锚不到 GA 的("IG139" 等)
+                //     保持原样, 交给 main.rs 号码闸门拒收并记 INVALID。
+                //     原先选择"并回侧"的理由仍成立: ① GAT174 是实测事故;
+                //     ② ROI 只裁号码行, 行前无大写字母来源; ③ 上线后无误播记录。
+                //     (旧版取舍记录: 判据"数字段是否纯数字"无效 —— GAT174 切出的
+                //      AT174 数字段同样纯数字, 3 连大写字母+数字两侧杂讯不可区分。)
                 let num_raw = match c.get(1) {
                     Some(m) => {
                         let s = m.start();
@@ -237,7 +238,9 @@ impl Ocr {
                     None => String::new(),
                 };
                 let win = c.get(2).map(|m| m.as_str()).unwrap_or("");
-                let (pre, rest) = split_prefix(&num_raw);
+                // ★前缀锚定(2026-11-10): 被并回的杂散字母会污染前缀, 见下方函数注释
+                let anchored = anchor_number_prefix(&num_raw);
+                let (pre, rest) = split_prefix(anchored);
                 // 窗口号归一化后再折叠误读的前导零: "CO01" -> norm -> "C001" -> "C01"
                 //
                 // ★号码数字段清洗(2026-10-13 现场实测): 糊帧/过渡帧会在"前缀与数字之间"
@@ -411,6 +414,33 @@ fn promote_prefix_lookalikes(chars: &[char]) -> Vec<char> {
     out
 }
 
+/// 号码前缀锚定重切(★2026-11-10)。
+///
+/// 前导大写字母守卫(见 parse 内)会把正则起点前一个大写字母并回号码头, 用于
+/// 还原 "GAT174" 的 A。副作用: 号码行前的杂散大写字母也会并回来 —— 真号
+/// GA999 读成 "OGA999" -> "OG999", GA139 读成 "IG139" / "G139" / "CG159"。
+/// 现场后三种都真播出去了(全库 2067 声 OK 中仅这 3 声非 GA 前缀), 与
+/// 2026-11-10 的 GA16 同属"非标准号却过闸"的病根。
+///
+/// 业务前缀恒为 NUMBER_PREFIX(GA), 故在号码头 3 字节内锚定 GA 重切:
+///   能救回真号("OGA999" -> "GA999", 顺带消掉第五轮审查留的已知歧义);
+///   救不回的("IG139")保持原样, 交给 main.rs 号码闸门统一拒收并记 INVALID ——
+///   不在这里静默丢弃, 现场日志仍能看到究竟读成了什么。
+///
+/// 只在前 3 字节内找: 守卫至多并回 1 个字符, 正则捕获本身以 G 开头,
+/// GA 锚点只可能落在 0 或 1; 放到 2 是给单测宽正则([A-Z]{1,2})留余量。
+/// 前缀段全是 ASCII 大写字母, 切点必落在 UTF-8 字符边界; 仍用 get 兜底。
+fn anchor_number_prefix(s: &str) -> &str {
+    let b = s.as_bytes();
+    let p = NUMBER_PREFIX.as_bytes();
+    for k in 0..3 {
+        if b.len() >= k + p.len() && &b[k..k + p.len()] == p {
+            return s.get(k..).unwrap_or(s);
+        }
+    }
+    s
+}
+
 /// 取前缀大写字母(至多 2 个): "GA999" -> ("GA", "999")
 fn split_prefix(s: &str) -> (&str, &str) {
     let b = s.as_bytes();
@@ -512,15 +542,32 @@ mod tests {
     }
 
     #[test]
-    fn parse_guard_stray_letter_known_ambiguity() {
-        // ★第五轮审查: 固化已知歧义(非期望行为, 见 parse 内第五轮注释)。
-        //   "OGA999" 型输入(杂散大写字母紧邻完整号)会被守卫并回重切成 OG999。
-        //   尝试过的修复判据("数字段纯数字则不并回")会让实测修复 GAT174 失效
-        //   —— "3 连大写字母+数字"两侧杂讯在数学上不可区分, 选择了实测校准侧。
-        //   若未来版式变化让"号码行前出现大写字母"成为真实来源, 需引入
-        //   历史号/闸门信息在 main.rs 层消歧, 而非 parse 层。
+    fn parse_guard_stray_letter_reanchors_ga() {
+        // ★2026-11-10: 第五轮审查留下的"已知歧义"由前缀锚定修掉 ——
+        //   "OGA999" 不再被重切成 OG999 幻觉号, 而是锚定 GA 还原真号 GA999。
+        //   并回守卫本身保留(GAT174 实测修复仍依赖它), 见 parse 内注释。
         let r = parse("请OGA999到C01号窗");
-        assert!(r.contains(&("OG999".to_string(), "C01".to_string())), "{r:?}");
+        assert!(r.contains(&("GA999".to_string(), "C01".to_string())), "{r:?}");
+        assert!(!r.iter().any(|(n, _)| n == "OG999"), "{r:?}");
+    }
+
+    #[test]
+    fn parse_prefix_misreads_kept_for_gate_to_reject() {
+        // 现场三声已播的前缀误读: 锚不到 GA, 原样产出交给号码闸门拒收并记 INVALID
+        for n in ["IG139", "G139", "CG159"] {
+            let r = parse(&format!("请{n}到C01号窗"));
+            assert!(r.iter().any(|(num, _)| num == n), "{n}: {r:?}");
+            assert!(!r.iter().any(|(num, _)| num.starts_with("GA")), "{n}: {r:?}");
+        }
+    }
+
+    #[test]
+    fn anchor_number_prefix_cases() {
+        assert_eq!(anchor_number_prefix("GA139"), "GA139");
+        assert_eq!(anchor_number_prefix("OGA999"), "GA999"); // 杂散 O 并回后锚定
+        assert_eq!(anchor_number_prefix("IG139"), "IG139"); // 救不回, 交闸门拒
+        assert_eq!(anchor_number_prefix("G139"), "G139");
+        assert_eq!(anchor_number_prefix(""), "");
     }
 
     #[test]

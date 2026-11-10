@@ -28,7 +28,7 @@ mod signal;
 mod tts;
 mod util;
 
-use cfg::{Config, SourceKind};
+use cfg::{Config, SourceKind, NUMBER_PREFIX};
 use chrono::Datelike;
 use dedupe::{AgedMap, Expiry};
 use image::GrayImage;
@@ -387,17 +387,23 @@ fn split_num(number: &str) -> Option<(String, u32)> {
 ///   现场 `ocr.pattern` 是 `\d{2,6}`, 行2 "GA1 6" 去掉空白后被读成 GA16(2 位),
 ///   16 ≤ 400 直接放行 -> 08:46:25 播出一声"G A 一 六"; 同理带前导零的
 ///   4 位串 GA0021(21 ≤ 400) 在 10-28 也真播过 9 声。业务号池统一
-///   GA001~GA400, 数字段必须严格 3 位 ASCII 数字、前缀 1~2 位大写字母、
+///   GA001~GA400, 数字段必须严格 3 位 ASCII 数字、前缀必须等于 NUMBER_PREFIX、
 ///   数值落在 [1, max]。解析不出合规号码的候选一律拒绝(旧实现 None=>true 会放行脏串)。
 ///   宁可漏一声，不可播错号: 错号会占住当日去重表，把真号挡死。
+///
+/// ★2026-11-10 前缀误读(与 GA16 同批修): 旧判据只要求"1~2 位大写字母",
+///   而 ocr.rs 的前导大写字母守卫会把号码前的杂散字母并回号码头 ——
+///   屏幕 GA139 被读成 "IG139"/"G139"/"CG159" 时照样放行。全库 2067 声 OK
+///   里仅 3 声非 GA 前缀(11-02 CG159、11-09 IG139 / G139), 全是这类误读,
+///   不存在第二个业务号段, 因此前缀锁死为 NUMBER_PREFIX。
 fn number_pool_accepts(number: &str, max: u32) -> bool {
     let i = match number.find(|c: char| c.is_ascii_digit()) {
         Some(i) => i,
         None => return false,
     };
     let (pre, digits) = number.split_at(i);
-    // 前缀: 1~2 位 ASCII 大写字母(业务为 GA); 挡住 "GAO021"、"本机1P:..." 之类噪声
-    if pre.is_empty() || pre.len() > 2 || !pre.bytes().all(|b| b.is_ascii_uppercase()) {
+    // 前缀: 严格业务前缀 GA。挡住 IG139 / G139 / CG159 / GAO021 / 本机IP 等
+    if pre != NUMBER_PREFIX {
         return false;
     }
     // 数字段: 严格 3 位补零写法, 短号(GA16)/多读一位(GA0021) 一律不收
@@ -1575,8 +1581,9 @@ impl Loop {
         let (cands, pool_rejected) = filter_number_pool(cands, self.number_pool_max);
         if by_change && !pool_rejected.is_empty() {
             println!(
-                "[闸门] 号码池上限 {} 拒绝候选(需前缀+严格3位数字、数值≤上限): {}",
+                "[闸门] 号码池上限 {} 拒绝候选(需 {} 前缀+严格3位数字、数值≤上限): {}",
                 self.number_pool_max,
+                NUMBER_PREFIX,
                 pool_rejected.join(", ")
             );
             for number in &pool_rejected {
@@ -2357,6 +2364,41 @@ mod tests {
             HashSet::from([("GA006".to_string(), "C05".to_string())])
         );
         assert_eq!(rejected, vec!["GA0021".to_string(), "GA16".to_string()]);
+    }
+
+    /// ★2026-11-10: 前导大写字母守卫把号码前的杂散字母并回号码头, 旧闸门
+    /// "1~2 位大写字母" 照样放行 -> 现场三声非 GA 前缀全部真播出去了。
+    /// 业务号段只有 GA, 前缀必须严格相等。
+    #[test]
+    fn number_pool_rejects_prefix_misreads() {
+        for n in [
+            "IG139", "G139", "CG159", "OG999", "GB139", "AG139", "GAO021",
+        ] {
+            assert!(!number_pool_accepts(n, 400), "{n} 不应放行");
+        }
+        assert!(number_pool_accepts("GA139", 400));
+        assert!(number_pool_accepts("GA159", 400));
+        assert!(number_pool_accepts("GA399", 400));
+    }
+
+    #[test]
+    fn number_pool_filter_drops_prefix_misreads_but_keeps_real_number() {
+        // 同帧既有真号又有前缀误读: 只留真号, 错号记 INVALID 不进确认/去重表
+        let input = HashSet::from([
+            ("GA139".to_string(), "C01".to_string()),
+            ("IG139".to_string(), "C01".to_string()),
+            ("G139".to_string(), "C01".to_string()),
+            ("CG159".to_string(), "C02".to_string()),
+        ]);
+        let (kept, rejected) = filter_number_pool(input, 400);
+        assert_eq!(
+            kept,
+            HashSet::from([("GA139".to_string(), "C01".to_string())])
+        );
+        assert_eq!(
+            rejected,
+            vec!["CG159".to_string(), "G139".to_string(), "IG139".to_string()]
+        );
     }
 
     // ———— 时间可信度守卫: RTC 掉电时时钟跳出厂值, 作息闸必须自动失效 ————
