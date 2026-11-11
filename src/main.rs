@@ -53,17 +53,21 @@ const SAVE_CAP: u32 = 4000;
 /// 防"摄像头噪点/亮度漂移一直判有变化 -> 静置窗口无限续期 -> 永不 OCR"的静默失效。
 const SETTLE_MAX_WAIT_SECS: f64 = 2.0;
 
-/// 「号码闸门」的长时间静默兜底: 连续本秒数没有任何播报、而又有更大的号被
-/// 硬上限挡住时, 强制放行一次。防"基线被一次误读带偏 -> 后面全被挡 -> 整天不播"。
-/// 取 20s(原 60s): 分档确认上线后, 挡住的只剩"跳幅 > JUMP_HARD_MAX"的极端情况,
-/// 20s 足够判定它是真号而不是误读, 又不至于让现场等一分钟。
-const GATE_FORCE_SECS: f64 = 20.0;
-
+/// ★2026-11-11 停用「静默强放」兜底(原常量 GATE_FORCE_SECS = 20.0 已删除)。
+/// 原逻辑: 无合规新号且静默 ≥20s 时, 把被硬上限挡住的最大候选强制放行,
+/// 防"基线被误读带偏 -> 后面全被挡 -> 整天不播"。近 6 个有效工作日
+/// (11-04/05/06/09/10/11)的日志 + 5564 张存证图复核证明: 该兜底**从未救回
+/// 任何真号**, 只制造 3434 条刷屏日志与 3 声大跳错号(11-09 GA235 /
+/// 11-10 GA214 / 11-11 GA400, 存证图均无此号); 且误读可稳定驻留 153 轮,
+/// "20s 足够判定真号"的假设不成立。基线真被带偏时由「序列重置 SEQ_RESET_SECS」
+/// 自愈(11-11 实测 9s 从 400 修回 103, 13:19 GA104 正常播出)。
+/// 故 >JUMP_HARD_MAX 现为真硬拦, 不再受静默时长撬动。
+///
 /// 跳幅分档(2026-10-21 现场要求): 叫号员会过号, 卡死 +2 会漏播真号。
 ///   ≤JUMP_INSTANT      —— 立即播(和原来一样, 覆盖绝大多数 +1/+2)
 ///   ≤max_jump          —— 多要 2 个确认量(静帧 tick 或投票轮), 防"过渡帧残影"
 ///   ≤JUMP_HARD_MAX     —— 多要 4 个确认量, 覆盖大过号
-///   >JUMP_HARD_MAX     —— 直接挡, 只留 GATE_FORCE_SECS 兜底(基本只可能是误读)
+///   >JUMP_HARD_MAX     —— **直接挡, 无兜底**(基本只可能是误读)
 const JUMP_INSTANT: u32 = 3;
 const JUMP_HARD_MAX: u32 = 30;
 
@@ -161,6 +165,16 @@ fn jump_extra_confirm(delta: u32, max_jump: u32) -> u32 {
     } else {
         4
     }
+}
+
+/// 跳幅放行区间(唯一口径, 纯函数供单测): 只放行 (基线, 基线 + JUMP_HARD_MAX]。
+/// ★2026-11-11: `silent_secs` 刻意保留参数但**不参与判定** —— 现场 GA400 事故
+/// (基线 103, 行2 把 GA100 的 `1` 读成 `4` => GA400 = +297, 午休静默 424s)
+/// 正是被旧的「静默超时强放」从硬上限之后放出去的。留这个参数是为了让回归
+/// 单测能显式写出 424s 这一现场条件并断言仍不放行, 从结构上杜绝再被时间撬开。
+fn jump_window_accepts(last: u32, v: u32, silent_secs: f64) -> bool {
+    let _ = silent_secs;
+    v > last && v <= last.saturating_add(JUMP_HARD_MAX)
 }
 
 /// 确认窗口的有效 TTL(秒) —— 取四个下界的最大值。
@@ -1654,7 +1668,8 @@ impl Loop {
             self.active_until = now + self.active_sec;
         }
         // 有跳号嫌疑被拦 -> 同样保持观察期, 让下一轮 OCR 尽快重认。
-        // 误读在下一轮多半就变对了; 真跳号连续被拦超过 GATE_FORCE_SECS 会强制放行。
+        // 误读在下一轮多半就变对了; 超硬上限的候选一律拦死, 不再靠静默时长强放
+        // (2026-11-11 停用 GATE_FORCE_SECS 兜底, 见常量区注释)。
         if jump_blocked {
             self.active_until = now + self.active_sec;
         }
@@ -1773,13 +1788,12 @@ impl Loop {
                     }
                 }
                 Some(last) => {
-                    let mut any = false;
                     for (n, w, v) in &items {
                         // 放行区间: (上次号, 上次号 + JUMP_HARD_MAX] —— 老号(≤基线)与
                         // 离谱跳号(>硬上限, 基本是误读)都挡; 中间段靠分档确认把关。
-                        if *v > last && *v <= last + JUMP_HARD_MAX {
+                        // 唯一判据抽成 jump_window_accepts, 静默时长不参与。
+                        if jump_window_accepts(last, *v, silent) {
                             out.insert((n.clone(), w.clone()));
-                            any = true;
                         } else if *v > last {
                             blocked.push(format!("{}(+{})", n, *v - last));
                         } else if *v + BACKFILL_MAX > last && !self.announced.contains_key(n) {
@@ -1787,7 +1801,6 @@ impl Loop {
                             // 紧贴基线下方 + 当日从未播过才放行; 已播过的屏上残留
                             // 被开机 seed 的当日去重表挡住, 不会重播。
                             out.insert((n.clone(), w.clone()));
-                            any = true;
                         } else if seq_reset_eligible(true, last, *v) {
                             // ★序列重置(2026-10-26 现场 GA174→GA193 事故): 远低于基线
                             // (差 > BACKFILL_MAX)的号 —— 旧逻辑一律当"老号"挡死, 于是
@@ -1808,7 +1821,6 @@ impl Loop {
                                     n, now - start, SEQ_RESET_SECS, last, v
                                 );
                                 out.insert(key);
-                                any = true;
                             } else {
                                 self.seq_since.insert(key, start);
                                 blocked.push(format!(
@@ -1821,17 +1833,9 @@ impl Loop {
                             }
                         }
                     }
-                    // 兜底: 长时间一句没播, 而又有"更大的号"被硬上限挡住
-                    // (多半是基线被某次误读带偏了) -> 强制放行最大的那个, 防整天静默。
-                    if !any && silent >= GATE_FORCE_SECS {
-                        if let Some(mx) = items.iter().filter(|x| x.2 > last).max_by_key(|x| x.2) {
-                            println!(
-                                "[闸门] 已静默 {:.0}s, {} 超出硬上限 +{} -> 强制放行(基线 {} 可能被误读带偏)",
-                                silent, mx.0, JUMP_HARD_MAX, last
-                            );
-                            out.insert((mx.0.clone(), mx.1.clone()));
-                        }
-                    }
+                    // ★2026-11-11: 原「静默 ≥ GATE_FORCE_SECS -> 强放最大的超硬上限候选」
+                    // 兜底已删除。超硬上限的号一律留在 blocked; 基线真被带偏时由
+                    // 序列重置(SEQ_RESET_SECS)自愈, 不靠时间维度撬开硬上限。
                 }
             }
         }
@@ -1879,8 +1883,8 @@ impl Loop {
     ///
     /// 场景: 24h 连跑, 零点 maintenance 清空 last_num, 屏上却停着昨日尾号 GA352。
     /// 闸门"无基线取最大"会把它放行进播报 —— 零点误播, 且 note_announced 把基线
-    /// 毒化成 352, 次日 GA001 起全天被 (v>last 才放行) 静默吞掉(强放兜底也只放
-    /// v>last, 救不回小号)。
+    /// 毒化成 352, 次日 GA001 起全天被 (v>last 才放行) 静默吞掉(旧强放兜底也只放
+    /// v>last, 救不回小号; 该兜底 2026-11-11 已停用)。
     ///
     /// 处理: 只进当日去重表(后续轮次被 announced.contains_key 压住), 不 speak、
     /// 不写 OK 日志(写了会被 seed_last_numbers 当基线捡回去)、不动 last_num ——
@@ -2286,7 +2290,7 @@ mod tests {
     use super::{
         announce_sort_key, drop_shadow_empty, effective_ttl, enhancement_pixels_allowed,
         fill_window_keep_number, filter_number_pool, gate_day_rollover, in_work_window,
-        jump_extra_confirm, keep_day_reseed, number_pool_accepts, number_votes,
+        jump_extra_confirm, jump_window_accepts, keep_day_reseed, number_pool_accepts, number_votes,
         ocr_candidate_quality, resolve_highlight_row, resolve_row_pitch, schedule_day_active,
         seed_only_decide, seed_only_on_startup, seq_reset_eligible, seq_reset_tick, settle_ready,
         short, should_stop_before_row, start_window_accept, time_plausible_y, JUMP_HARD_MAX,
@@ -2514,6 +2518,36 @@ mod tests {
         // 上限被调得比"立即档"还小时, 立即档跟着收缩, 不越界放行
         assert_eq!(jump_extra_confirm(1, 1), 0);
         assert_eq!(jump_extra_confirm(2, 1), 4);
+    }
+
+    // ———— 硬上限是真硬拦: 静默再久也不强放(2026-11-11 GA400 事故) ————
+    #[test]
+    fn jump_hard_max_is_absolute_even_after_long_silence() {
+        // 现场复现: 基线 103, 行2 把 GA100 的 `1` 读成 `4` => GA400(+297),
+        // 午休静默 424s 后被旧的「静默超时强放」放出去并播出。
+        assert!(!jump_window_accepts(103, 400, 424.0));
+        // 静默 0s / 20s(旧阈值) / 一整天, 判定完全一致: 时间维度不再撬得开硬上限
+        assert!(!jump_window_accepts(103, 400, 0.0));
+        assert!(!jump_window_accepts(103, 400, 20.0));
+        assert!(!jump_window_accepts(103, 400, 86400.0));
+        // 边界: +30 放行、+31 拦死; 老号与等于基线仍归补播/序列重置判定
+        assert!(jump_window_accepts(103, 133, 424.0));
+        assert!(!jump_window_accepts(103, 134, 424.0));
+        assert!(!jump_window_accepts(103, 103, 424.0));
+        assert!(!jump_window_accepts(103, 90, 424.0));
+        // 正常连续出号不受影响(11-11 下午 GA104 就是这么播的)
+        assert!(jump_window_accepts(103, 104, 424.0));
+        // u32 上界: saturating_add 不溢出, 近上界的正常 +1 仍放行
+        assert!(jump_window_accepts(u32::MAX - 1, u32::MAX, 0.0));
+    }
+
+    #[test]
+    fn seq_reset_recovers_baseline_poisoned_by_misread() {
+        // 删掉强放后, 基线被误读带偏仍有出口: 11-11 基线被 GA400 毒化成 400,
+        // 屏上真号 GA103 静帧稳定 9s -> 判新一轮重置基线并放行(13:19 GA104 正常播)
+        assert!(seq_reset_eligible(true, 400, 103));
+        // 紧贴基线的号属于补播窗口, 不归序列重置
+        assert!(!seq_reset_eligible(true, 400, 399));
     }
 
     // ———— 确认窗口有效 TTL: 空转退避 vs 确认计数的死锁防线(2026-10-22 现场) ————
