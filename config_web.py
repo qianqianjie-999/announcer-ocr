@@ -764,8 +764,11 @@ button.gray{background:#6b7280}
 #msg{white-space:pre-wrap;background:#111;color:#9f9;padding:8px;border-radius:6px;min-height:20px;font-size:12px}
 .row{margin:6px 0}
 .small{font-size:12px;color:#666}
-/* 播报日志尾部: 字体加大 + 行距拉开, 现场远看也清楚(2026-10-23 用户反馈) */
-#logbox{font-size:15px;line-height:2;white-space:pre-wrap;color:#222}
+/* 播报日志尾部: 字体加大 + 行距拉开, 现场远看也清楚(2026-10-23 用户反馈);
+   固定高度 + 滚动条, 与「音频健康」日志区一致(2026-11-12 用户反馈), 免得 15 行 CSV 把整页撑长 */
+#logbox{font-size:15px;line-height:2;white-space:pre-wrap;color:#222;
+ margin:6px 0;padding:8px;background:#f6f6f2;border:1px solid #ccc;
+ border-radius:6px;max-height:260px;overflow:auto}
 #roi4 input{width:64px}
 table.log{font-size:11px;border-collapse:collapse;width:100%}
 table.log td,table.log th{border:1px solid #e2e2e2;padding:2px 6px}
