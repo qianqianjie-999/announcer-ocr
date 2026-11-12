@@ -233,8 +233,23 @@ def status_and_log():
         st["err"] = str(e)
     tail = ""
     try:
+        # 「从今天开始的都要显示」(2026-11-12 用户反馈): 原先只取文件尾部 15 行,
+        # 但 announce_log.csv 是多日累加的(实测 10-26~11-12 共 2805 行), 尾部 15 行
+        # 既可能跨天、又装不下当天全量。改为按行首 ISO 日期过滤出今天及以后的全部行。
+        # 注意首行可能带 UTF-8 BOM(\ufeff), 直接比 l[:10] 会把 BOM 行误判成"今天"。
+        max_today_lines = 2000          # 兜底上限: 防单日日志暴涨把页面拖垮
+        today = time.strftime("%Y-%m-%d")
         with open(LOG_CSV, "r", encoding="utf-8", errors="replace") as f:
-            tail = "".join(f.readlines()[-15:])
+            lines = f.readlines()
+        todays = []
+        for line in lines:
+            m = re.match(r"^\ufeff?(\d{4}-\d{2}-\d{2})T", line)
+            if m and m.group(1) >= today:
+                todays.append(line)
+        if todays:
+            tail = "".join(todays[-max_today_lines:])
+        else:
+            tail = "(今天 %s 暂无播报日志)" % today
     except OSError:
         pass
     return st, tail
@@ -764,11 +779,12 @@ button.gray{background:#6b7280}
 #msg{white-space:pre-wrap;background:#111;color:#9f9;padding:8px;border-radius:6px;min-height:20px;font-size:12px}
 .row{margin:6px 0}
 .small{font-size:12px;color:#666}
-/* 播报日志尾部: 字体加大 + 行距拉开, 现场远看也清楚(2026-10-23 用户反馈);
-   固定高度 + 滚动条, 与「音频健康」日志区一致(2026-11-12 用户反馈), 免得 15 行 CSV 把整页撑长 */
+/* 播报日志: 字体加大 + 行距拉开, 现场远看也清楚(2026-10-23 用户反馈);
+   固定高度 + 滚动条, 容器外观与「音频健康」区一致(2026-11-12 用户反馈);
+   现在展示当天全量日志, 高度放到 420px 让一屏多看几行(同日反馈「显示的信息有点少」) */
 #logbox{font-size:15px;line-height:2;white-space:pre-wrap;color:#222;
  margin:6px 0;padding:8px;background:#f6f6f2;border:1px solid #ccc;
- border-radius:6px;max-height:260px;overflow:auto}
+ border-radius:6px;max-height:420px;overflow:auto}
 #roi4 input{width:64px}
 table.log{font-size:11px;border-collapse:collapse;width:100%}
 table.log td,table.log th{border:1px solid #e2e2e2;padding:2px 6px}
@@ -1234,10 +1250,23 @@ function save(){
  .catch(e=>msg('保存失败: '+e));
 }
 
+// 播报日志: 默认贴住最新一行, 手动往上翻历史时不再自动拉回(2026-11-12)。
+// 5s 自动刷新只换 textContent、元素不重建, 滚动位置统一由这里管。
+let logPinned=true;
+function setLogText(s){
+ const el=$('logbox');
+ el.textContent=s||'(暂无日志)';
+ if(logPinned)el.scrollTop=el.scrollHeight;
+}
+$('logbox').addEventListener('scroll',()=>{
+ const el=$('logbox');
+ logPinned=el.scrollHeight-el.scrollTop-el.clientHeight<24;
+});
+
 function refresh(){
  fetch('/api/status').then(r=>r.json()).then(d=>{
   $('st').textContent='· 播报服务: '+d.active+' · PID '+d.pid+' · '+d.mem;
-  $('logbox').textContent=d.log||'(暂无日志)';
+  setLogText(d.log);
  }).catch(()=>{});
  loadLogs();
  loadAudioHealth();
@@ -1382,7 +1411,7 @@ setInterval(loadTime,30000);
 setInterval(()=>{
  if(document.hidden)return;
  fetch('/api/status').then(r=>r.json()).then(d=>{
-  $('logbox').textContent=d.log||'(暂无日志)';
+  setLogText(d.log);
  }).catch(()=>{});
 },5000);
 refresh();loadNet();
