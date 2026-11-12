@@ -177,6 +177,50 @@ fn jump_window_accepts(last: u32, v: u32, silent_secs: f64) -> bool {
     v > last && v <= last.saturating_add(JUMP_HARD_MAX)
 }
 
+/// ★2026-11-12 「连续大号抬基线」(领导定案方案 1)。
+/// 背景: 0a2fb91 删掉静默强放后 >+30 成了真硬拦, 但也失去自愈出口 —— 屏坏/
+/// 显示端重启整段号没上屏, 业务真从 GA041 直接叫到 GA075 时基线卡在 41,
+/// 之后 75~101 全被挡, 当班哑火到 17:00; 序列重置只认 v<last, 方向推不动。
+///
+/// 不用「静默时长」, 也不看「同帧有几行」, 而是看**后续叫号的连续性**:
+/// 残留号是同一个值反复挂屏(11-10 GA196 强放 1681 次), 误读是孤立值
+/// (11-11 GA400), 两者都凑不出「递增且紧邻的一串新号」; 只有业务真的跳到
+/// 大号段并继续叫号, 才会出现 75→76→77。
+/// 回放 6 天 service.log: 298 条被拦的超+30 候选、53 个基线、仅 18 个不同号值,
+/// 连续 3 个递增且相邻差<5 的三连 **0 组**; 最长连续不同号段只有 2 个
+/// ([195,196] / [136,139] / [177,178]) —— 历史误触发 0 次。
+///
+/// 判据(每轮最多取本轮最大的那个超+30 号, 防同帧多行残留凑数):
+///   ① 号值 > 段尾号值, 且差 < BIG_JUMP_SEQ_GAP(5);
+///   ② 距段尾时刻 ≤ BIG_JUMP_SEQ_TIMEOUT_SECS(600s), 超时重新起算;
+///   ③ 同一号重复出现 -> 忽略(不打断、不计数);
+///   ④ 回退 / 跳太远 / 超时 / 时钟回拨 -> 清空重新起算。
+/// 凑够 BIG_JUMP_SEQ_LEN(3) 个即把基线抬到第 3 个号, 这 3 个号只标记不播
+/// (进当日去重表, 防补播窗口把它们捞回来), 第 4 个号起正常放行。
+/// 代价明确并已接受: 最多牺牲 3 声, 换全天不哑火。
+const BIG_JUMP_SEQ_LEN: usize = 3;
+const BIG_JUMP_SEQ_GAP: u32 = 5;
+const BIG_JUMP_SEQ_TIMEOUT_SECS: f64 = 600.0;
+
+/// 大跳连续段推进(纯函数, 供单测): 返回 (新段, 是否凑够 3 个)。
+/// 刻意不接收静默时长 —— 时间只用来判定「两次叫号是否还算连续」,
+/// 不再像旧的 GATE_FORCE_SECS 那样用时间撬开 +30 硬上限。
+fn big_jump_seq_push(seq: &[(u32, f64)], v: u32, now: f64) -> (Vec<(u32, f64)>, bool) {
+    let mut out = seq.to_vec();
+    if let Some(&(last_v, last_t)) = out.last() {
+        if now < last_t || now - last_t > BIG_JUMP_SEQ_TIMEOUT_SECS {
+            out.clear(); // 隔太久 / 时钟回拨, 不是同一串连续叫号
+        } else if v == last_v {
+            return (out, false); // 同一个号反复读到, 忽略
+        } else if !(v > last_v && v - last_v < BIG_JUMP_SEQ_GAP) {
+            out.clear(); // 回退或跳太远, 重新起算
+        }
+    }
+    out.push((v, now));
+    let fire = out.len() >= BIG_JUMP_SEQ_LEN;
+    (out, fire)
+}
+
 /// 确认窗口的有效 TTL(秒) —— 取四个下界的最大值。
 ///
 /// - `ttl`: 配置值 `confirm_ttl_sec`;
@@ -391,6 +435,9 @@ struct Loop {
     seq_since: HashMap<(String, String), f64>,
     /// 本表所归属的静帧段起点, 用来发现"静帧段已经换了"。
     seq_seg: f64,
+    /// ★2026-11-12 连续大号段: (号值, 看见时刻), 见 BIG_JUMP_SEQ_LEN 注释。
+    /// 只在「超 +30 被拦」时推进; 真播报 / 跨日重置 / 闸门关闭时清空。
+    big_jump_seq: Vec<(u32, f64)>,
     /* —— 多行列表(2026-10-21) ————————————————————————————————
      * 叫号屏改成三行列表后, 最新号不一定在第一行(现场见过落到第二行)。
      * 检测框要覆盖多行才看得见变化, 但识别仍按单行裁 —— 整块喂 tesseract 会掉精度。
@@ -896,6 +943,7 @@ impl Loop {
             gate_log_at: 0.0,
             seq_since: HashMap::new(),
             seq_seg: 0.0,
+            big_jump_seq: Vec::new(),
 
             rows,
             pitch,
@@ -1739,7 +1787,12 @@ impl Loop {
         cands: HashSet<(String, String)>,
         now: f64,
     ) -> (HashSet<(String, String)>, bool) {
-        if self.max_jump == 0 || cands.is_empty() {
+        if self.max_jump == 0 {
+            // 闸门被人为关闭时不做任何累计, 免得下次开闸后拿旧段凑三连。
+            self.big_jump_seq.clear();
+            return (cands, false);
+        }
+        if cands.is_empty() {
             return (cands, false);
         }
         let mut by_pre: HashMap<String, Vec<(String, String, u32)>> = HashMap::new();
@@ -1833,9 +1886,46 @@ impl Loop {
                             }
                         }
                     }
+                    // ★2026-11-12 连续大号抬基线: 见 BIG_JUMP_SEQ_LEN 注释。
+                    // 每轮只取本轮超 +30 的最大号(同帧多行残留只算一个), 递进连续段。
+                    // 残留号是同一个值反复挂屏、误读是孤立值, 都凑不出递增三连。
+                    let hard = last.saturating_add(JUMP_HARD_MAX);
+                    if let Some(v) = items.iter().map(|x| x.2).filter(|&v| v > hard).max() {
+                        let (next, fire) = big_jump_seq_push(&self.big_jump_seq, v, now);
+                        if fire {
+                            let chain: Vec<String> = next
+                                .iter()
+                                .map(|(x, _)| format!("{}{:03}", pre, x))
+                                .collect();
+                            let t0 = next.first().map(|x| x.1).unwrap_or(now);
+                            // 3 个号只标记不播: 进当日去重表, 否则补播窗口
+                            // (last-5, last] 会把第 3 个号又捞回来播一声。
+                            for n in &chain {
+                                self.announced.insert(n.clone(), (), now);
+                            }
+                            self.last_num.insert(pre.clone(), v);
+                            self.big_jump_seq.clear();
+                            println!(
+                                "[闸门] 大跳恢复: 连续 {} 个大号 {} 均超基线 {}+{} (相邻差<{}, 用时 {:.0}s) \
+                                 -> 判为真跳号段, 基线抬为 {}, 这 {} 个号只标记不播, 后续号正常放行",
+                                chain.len(), chain.join("→"), last, JUMP_HARD_MAX,
+                                BIG_JUMP_SEQ_GAP, now - t0, v, chain.len()
+                            );
+                        } else {
+                            self.big_jump_seq = next;
+                        }
+                    } else if !self.big_jump_seq.is_empty()
+                        && now - self.big_jump_seq.last().map(|x| x.1).unwrap_or(now)
+                            > BIG_JUMP_SEQ_TIMEOUT_SECS
+                    {
+                        // 本轮已没有超限号(业务回到正常号段 / OCR 短暂读到相容号),
+                        // 隔太久就作废, 防止隔半天又拿旧段凑三连。
+                        self.big_jump_seq.clear();
+                    }
                     // ★2026-11-11: 原「静默 ≥ GATE_FORCE_SECS -> 强放最大的超硬上限候选」
                     // 兜底已删除。超硬上限的号一律留在 blocked; 基线真被带偏时由
-                    // 序列重置(SEQ_RESET_SECS)自愈, 不靠时间维度撬开硬上限。
+                    // 序列重置(SEQ_RESET_SECS)或上面的连续大号恢复自愈, 不靠时间维度
+                    // 撬开硬上限。
                 }
             }
         }
@@ -1864,6 +1954,8 @@ impl Loop {
 
     /// 记一次成功播报, 推进闸门基线。
     fn note_announced(&mut self, number: &str) {
+        // 真有号播出 -> 基线正常推进了, 之前攒的「连续大号段」作废重新起算。
+        self.big_jump_seq.clear();
         if let Some((pre, v)) = split_num(number) {
             // ★基线不回退: 补播漏号(GA126 在 GA127 之后才播)会把基线往回拉,
             // 补播窗口 (last-5, last] 随之重新拉开, 可能引发连环补播。
@@ -2038,6 +2130,7 @@ impl Loop {
                 self.last_num
             );
             self.last_num.clear();
+            self.big_jump_seq.clear(); // 跨日: 旧的大号连续段一并作废
             // ★2026-10-23 中危修复(第八轮): 置"等待首个候选"标记 —— 屏上若还停着
             // 昨日尾号, 首个无基线候选只标记不播报(见 seed_only_after_reset)。
             self.day_reseed = true;
@@ -2288,13 +2381,15 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        announce_sort_key, drop_shadow_empty, effective_ttl, enhancement_pixels_allowed,
-        fill_window_keep_number, filter_number_pool, gate_day_rollover, in_work_window,
-        jump_extra_confirm, jump_window_accepts, keep_day_reseed, number_pool_accepts, number_votes,
-        ocr_candidate_quality, resolve_highlight_row, resolve_row_pitch, schedule_day_active,
-        seed_only_decide, seed_only_on_startup, seq_reset_eligible, seq_reset_tick, settle_ready,
-        short, should_stop_before_row, start_window_accept, time_plausible_y, JUMP_HARD_MAX,
-        SEQ_RESET_SECS, SETTLE_MAX_WAIT_SECS, SHORT_MAX, START_WINDOW_MAX,
+        announce_sort_key, big_jump_seq_push, drop_shadow_empty, effective_ttl,
+        enhancement_pixels_allowed, fill_window_keep_number, filter_number_pool, gate_day_rollover,
+        in_work_window, jump_extra_confirm, jump_window_accepts, keep_day_reseed,
+        number_pool_accepts, number_votes, ocr_candidate_quality, resolve_highlight_row,
+        resolve_row_pitch, schedule_day_active, seed_only_decide, seed_only_on_startup,
+        seq_reset_eligible, seq_reset_tick, settle_ready, short, should_stop_before_row,
+        start_window_accept, time_plausible_y, BIG_JUMP_SEQ_GAP, BIG_JUMP_SEQ_LEN,
+        BIG_JUMP_SEQ_TIMEOUT_SECS, JUMP_HARD_MAX, SEQ_RESET_SECS, SETTLE_MAX_WAIT_SECS, SHORT_MAX,
+        START_WINDOW_MAX,
     };
     use std::collections::{HashMap, HashSet};
 
@@ -2539,6 +2634,60 @@ mod tests {
         assert!(jump_window_accepts(103, 104, 424.0));
         // u32 上界: saturating_add 不溢出, 近上界的正常 +1 仍放行
         assert!(jump_window_accepts(u32::MAX - 1, u32::MAX, 0.0));
+    }
+
+    // ———— 2026-11-12 连续大号抬基线(方案 1): 用后续叫号的连续性救真跳 ————
+    #[test]
+    fn big_jump_seq_fires_on_three_consecutive_rising_numbers() {
+        let (s, fire) = big_jump_seq_push(&[], 75, 100.0);
+        assert!(!fire);
+        assert_eq!(s, vec![(75, 100.0)]);
+        // 屏坏恢复: 基线 41 -> 75/76/77 相隔各 60s, 全在 600s 连续窗口内
+        let (s, fire) = big_jump_seq_push(&s, 76, 160.0);
+        assert!(!fire);
+        assert_eq!(s, vec![(75, 100.0), (76, 160.0)]);
+        let (s, fire) = big_jump_seq_push(&s, 77, 220.0);
+        assert!(fire, "三个紧邻递增大号应触发抬基线");
+        assert_eq!(s.len(), BIG_JUMP_SEQ_LEN);
+        // 触发后调用方清空段; 第 4 个号 78 走正常窗口, 不再攒旧段
+        let (s2, fire2) = big_jump_seq_push(&[], 78, 280.0);
+        assert!(!fire2);
+        assert_eq!(s2, vec![(78, 280.0)]);
+    }
+
+    #[test]
+    fn big_jump_seq_rejects_residual_and_misread_patterns() {
+        // 11-10 残留号 GA196 同值反复挂屏 1681 次: 永远只有 1 个号
+        let mut s = vec![];
+        for t in 0..12 {
+            let r = big_jump_seq_push(&s, 196, 100.0 + t as f64 * 10.0);
+            assert!(!r.1);
+            s = r.0;
+        }
+        assert_eq!(s.len(), 1);
+        assert_eq!(s, vec![(196, 100.0)]);
+        // 同帧残留组 195/196: 每轮只取最大号 -> 同样凑不出三连
+        let (s2, f2) = big_jump_seq_push(&[(196, 100.0)], 196, 130.0);
+        assert!(!f2);
+        assert_eq!(s2.len(), 1);
+        // 11-11 GA400 孤立误读, 后面来个不紧邻的号 -> 重新起算
+        let (s3, f3) = big_jump_seq_push(&[(400, 100.0)], 421, 130.0);
+        assert!(!f3);
+        assert_eq!(s3, vec![(421, 130.0)]);
+        // 回退 / 相邻差恰好 BIG_JUMP_SEQ_GAP / 超时 / 时钟回拨 都要重新起算
+        let (s4, _) = big_jump_seq_push(&[(75, 100.0), (76, 160.0)], 74, 220.0);
+        assert_eq!(s4, vec![(74, 220.0)]);
+        let (s5, _) = big_jump_seq_push(&[(75, 100.0)], 75 + BIG_JUMP_SEQ_GAP, 160.0);
+        assert_eq!(s5, vec![(75 + BIG_JUMP_SEQ_GAP, 160.0)]);
+        let late = 160.0 + BIG_JUMP_SEQ_TIMEOUT_SECS + 1.0;
+        let (s6, f6) = big_jump_seq_push(&[(75, 100.0), (76, 160.0)], 77, late);
+        assert!(!f6);
+        assert_eq!(s6, vec![(77, late)]);
+        let (s7, _) = big_jump_seq_push(&[(75, 100.0)], 76, 50.0);
+        assert_eq!(s7, vec![(76, 50.0)]);
+        // 硬上限本身仍然是真硬拦: 静默再久也不放行
+        assert!(!jump_window_accepts(41, 75, 86400.0));
+        assert!(!jump_window_accepts(103, 400, 424.0));
     }
 
     #[test]
