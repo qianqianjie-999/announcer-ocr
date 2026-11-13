@@ -594,6 +594,19 @@ fn local_day_of(now: f64) -> Option<String> {
         .map(|dt| dt.date_naive().format("%Y-%m-%d").to_string())
 }
 
+/// 闸门判时段用的"本地时刻": Unix 秒 -> 本地 HH:MM。
+/// 取法与 `local_day_of` 一致(chrono::Local); 时间不可信(年份越界)返回 None,
+/// 调用方按"无法判时段"保守处理 —— 与 `announcement_allowed` 的时间守卫同口径。
+/// 抽成纯函数是为了让跨日判据能直接单测, 不必依赖"当前真实时间"。
+fn local_hm_of(now: f64) -> Option<String> {
+    use chrono::{Local, TimeZone};
+    let dt = Local.timestamp_opt(now as i64, 0).single()?;
+    if !time_plausible_y(dt.year()) {
+        return None;
+    }
+    Some(dt.format("%H:%M").to_string())
+}
+
 /// 跨日检测(纯逻辑, 供单测): 发现日期变了就更新 `last_day` 并返回 true。
 /// 取不到日期(None)不动状态; 首次观测(last_day 为空, 启动时取日失败)只记录
 /// 不当跨日 —— 免得把刚 seed 出来的基线误清。
@@ -648,6 +661,32 @@ fn seed_only_on_startup(
         (true, Some(hm)) => !in_work_window(hm, work_start, work_end),
         _ => true,
     }
+}
+
+/// ★2026-11-13 高危修复(GA001 吞号断根): 零点挂下的跨日"只标记"此刻是否仍有效。
+///
+/// 根因链(与 10-29 的启动路径 bug 不是同一条):
+///   ① `maintenance` 零点跨日无条件置 `day_reseed = true`, 不看时段;
+///   ② 00:00~08:00 非营业时段, `announcement_allowed()` 让 fast_confirm /
+///      announce_winners 提前 return, 标记根本没机会被"首批候选处理完即清"消费;
+///   ③ 08:00 后今日首号 GA001 才第一次走到 `seed_only_after_reset`, 被
+///      `seed_only_decide(true, false)` 判成昨日残留只标记 -> 写进当日去重表
+///      -> 当天永久哑(11-11「部署后拉起没关停导致通宵」现场实证 4 条)。
+///   10-29 的 `4aeb280` 只把「08:00 全新进程启动」路径改成按营业时段判, 跨日这条没接上。
+///
+/// 修法: 与启动路径 **复用同一判据** `seed_only_on_startup` —— 营业时段内启动不启用
+///   只标记, 那么营业时段内仍挂着的跨日标记同样不该继续生效。首个参数恒 true 是因为
+///   标记生效期间基线必然为空(跨日刚 clear 过), 与启动判据的语义完全一致。
+///   时间不可信(None)或作息关闭时 `seed_only_on_startup` 保守返回 true -> 标记保留,
+///   夜里对昨日残留大号的防护一点没松。
+fn crossday_seed_still_valid(
+    day_reseed: bool,
+    now_hm: Option<&str>,
+    work_start: &str,
+    work_end: &str,
+    schedule_enabled: bool,
+) -> bool {
+    day_reseed && seed_only_on_startup(true, now_hm, work_start, work_end, schedule_enabled)
 }
 
 /// ★2026-10-31: 指定日期是否"该播"(纯函数, 供单测)。
@@ -1986,6 +2025,29 @@ impl Loop {
     ///
     /// 返回 true 表示已按"只标记"处理, 调用方应跳过后续播报动作。
     fn seed_only_after_reset(&mut self, number: &str, now: f64) -> bool {
+        // ★2026-11-13: 进入营业时段后, 零点挂着的跨日标记必须失效 —— 否则今日首号
+        //   (GA001) 被当昨日残留只标记, 当天永久哑。判据与启动路径共用(见
+        //   crossday_seed_still_valid)。放在 seed_only_decide 之前: 清标记后该候选
+        //   直接交调用方走正常播报流程(写 OK 日志 / 播种基线 / 入 TTS 队列)。
+        //   正常 08:00 全新启动时 day_reseed 本来就是 false, 本分支一次都不触发。
+        if self.day_reseed {
+            let hm = local_hm_of(now);
+            if !crossday_seed_still_valid(
+                self.day_reseed,
+                hm.as_deref(),
+                &self.cfg.schedule.work_start,
+                &self.cfg.schedule.work_end,
+                self.cfg.schedule.enabled,
+            ) {
+                println!(
+                    "[闸门] 已进入营业时段({}), 跨日只标记失效: 候选 {} 按今日新号正常播报",
+                    hm.as_deref().unwrap_or("时间不可信"),
+                    number
+                );
+                self.day_reseed = false;
+                return false; // 交调用方按正常流程播报
+            }
+        }
         let has_baseline = split_num(number)
             .map(|(pre, _)| self.last_num.contains_key(&pre))
             .unwrap_or(false);
@@ -2381,10 +2443,11 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        announce_sort_key, big_jump_seq_push, drop_shadow_empty, effective_ttl,
-        enhancement_pixels_allowed, fill_window_keep_number, filter_number_pool, gate_day_rollover,
-        in_work_window, jump_extra_confirm, jump_window_accepts, keep_day_reseed,
-        number_pool_accepts, number_votes, ocr_candidate_quality, resolve_highlight_row,
+        announce_sort_key, big_jump_seq_push, crossday_seed_still_valid, drop_shadow_empty,
+        effective_ttl, enhancement_pixels_allowed, fill_window_keep_number, filter_number_pool,
+        gate_day_rollover, in_work_window, jump_extra_confirm, jump_window_accepts,
+        keep_day_reseed, local_hm_of, number_pool_accepts, number_votes,
+        ocr_candidate_quality, resolve_highlight_row,
         resolve_row_pitch, schedule_day_active, seed_only_decide, seed_only_on_startup,
         seq_reset_eligible, seq_reset_tick, settle_ready, short, should_stop_before_row,
         start_window_accept, time_plausible_y, BIG_JUMP_SEQ_GAP, BIG_JUMP_SEQ_LEN,
@@ -3044,6 +3107,69 @@ mod tests {
         // 跨零点夜班窗口(22:00~06:00): 04:00 属工作时段 -> 不启用
         assert!(!seed_only_on_startup(true, Some("04:00"), "22:00", "06:00", true));
         assert!(seed_only_on_startup(true, Some("12:00"), "22:00", "06:00", true));
+    }
+
+    // ———— 跨日只标记失效(2026-11-13 GA001 吞号断根) ————
+    #[test]
+    fn crossday_seed_expires_in_work_hours() {
+        // 08:00 起进入营业时段: 零点挂的标记失效, 今日首号 GA001 正常播
+        assert!(!crossday_seed_still_valid(true, Some("08:00"), "08:00", "17:00", true));
+        assert!(!crossday_seed_still_valid(true, Some("08:46"), "08:00", "17:00", true));
+        assert!(!crossday_seed_still_valid(true, Some("12:30"), "08:00", "17:00", true));
+        assert!(!crossday_seed_still_valid(true, Some("16:59"), "08:00", "17:00", true));
+        // 边界: 07:59 仍属非营业 -> 保留; 17:00 起非营业 -> 保留
+        assert!(crossday_seed_still_valid(true, Some("07:59"), "08:00", "17:00", true));
+        assert!(crossday_seed_still_valid(true, Some("17:00"), "08:00", "17:00", true));
+        // 凌晨/深夜: 昨日残留大号的防护一点不松
+        assert!(crossday_seed_still_valid(true, Some("00:00"), "08:00", "17:00", true));
+        assert!(crossday_seed_still_valid(true, Some("02:00"), "08:00", "17:00", true));
+        assert!(crossday_seed_still_valid(true, Some("23:30"), "08:00", "17:00", true));
+        // 没有标记就不该"失效"(调用方根本不会进这个分支)
+        assert!(!crossday_seed_still_valid(false, Some("12:30"), "08:00", "17:00", true));
+        // 与 seed_only_decide 组合回放 11-11 通宵场景: 夜里仍吞残留大号,
+        // 08:46 的今日首号不再被吞(否则当天永久哑)
+        assert!(seed_only_decide(
+            crossday_seed_still_valid(true, Some("02:00"), "08:00", "17:00", true),
+            false
+        ));
+        assert!(!seed_only_decide(
+            crossday_seed_still_valid(true, Some("08:46"), "08:00", "17:00", true),
+            false
+        ));
+    }
+
+    #[test]
+    fn crossday_seed_conservative_when_schedule_unknown() {
+        // 时间不可信 / 作息关闭 -> 保守保留(与启动路径 seed_only_on_startup 同口径)
+        assert!(crossday_seed_still_valid(true, None, "08:00", "17:00", true));
+        assert!(crossday_seed_still_valid(true, Some("12:30"), "08:00", "17:00", false));
+        // 跨零点夜班窗口(22:00~06:00): 04:00 属营业 -> 失效, 12:00 非营业 -> 保留
+        assert!(!crossday_seed_still_valid(true, Some("04:00"), "22:00", "06:00", true));
+        assert!(crossday_seed_still_valid(true, Some("12:00"), "22:00", "06:00", true));
+        // 配置 s==e(全天营业): in_work_window 恒 true -> 标记始终失效
+        assert!(!crossday_seed_still_valid(true, Some("03:00"), "00:00", "00:00", true));
+    }
+
+    #[test]
+    fn local_hm_of_maps_timestamp_and_rejects_bad_year() {
+        use chrono::{Local, TimeZone};
+        let ts = |y, m, d, h, mi| -> f64 {
+            Local
+                .with_ymd_and_hms(y, m, d, h, mi, 0)
+                .single()
+                .unwrap()
+                .timestamp() as f64
+        };
+        assert_eq!(
+            local_hm_of(ts(2026, 11, 13, 8, 46)).as_deref(),
+            Some("08:46")
+        );
+        assert_eq!(
+            local_hm_of(ts(2026, 11, 13, 0, 0)).as_deref(),
+            Some("00:00")
+        );
+        // 年份越界(纽扣电池没电/时钟回退) -> None -> 保守保留标记
+        assert_eq!(local_hm_of(ts(2019, 11, 13, 8, 46)), None);
     }
 
     // ———— 起始窗口(2026-11-10 残留大号毒化基线修复) ————
