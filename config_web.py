@@ -255,6 +255,81 @@ def status_and_log():
     return st, tail
 
 
+def residue_guard_status():
+    # 配置台「残留号拦截告警」(2026-11-16 领导要求单独显示一行)。
+    # 只读两个日志文件的尾部字节, 避免 5s 的 /api/status 把几十万行
+    # service.log 全量读进内存; 本端点由页面每 30s 单独拉取。
+    #   * service.log 尾部找本次进程启动后的 [闸门] 拦截 GAxxx(+跳幅)
+    #   * announce_log.csv 尾部找该号今日上屏首/末时间、是否被播出
+    # 返回 {level, text, ...}, 前端只负责把 text 显示成一行并配色。
+    today = time.strftime("%Y-%m-%d")
+    tag = today.replace("-", "")
+    svc = "/var/log/announce-rs/service.log"
+    out = {"ok": True, "level": "clear", "numbers": [], "blocks": 0,
+           "maxjump": 0, "first": "", "last": "", "played": 0,
+           "text": "✅ 今日无残留 / 异常大号，闸门零拦截"}
+    try:
+        def tail_bytes(path, cap):
+            with open(path, "rb") as f:
+                f.seek(0, 2)
+                f.seek(max(0, f.tell() - cap))
+                return f.read().decode("utf-8", "replace")
+
+        seg = tail_bytes(svc, 2097152)
+        p = seg.rfind("启动时基线为空")
+        if p >= 0:
+            seg = seg[p:]
+        if tag not in seg and today not in seg:
+            out["level"] = "muted"
+            out["text"] = "今日日志段未定位到，残留告警暂不可用"
+            return out
+        blocks = []
+        for line in seg.splitlines():
+            if "[闸门] 拦截" in line:
+                blocks.extend(re.findall(r"(GA\d{3})\(\+(\d+)\)", line))
+        if not blocks:
+            return out
+        nums = sorted(set(n for n, _ in blocks))
+
+        first = last = ""
+        played = 0
+        csv_tail = tail_bytes(LOG_CSV, 1048576)
+        for line in csv_tail.splitlines():
+            line = line.lstrip("\ufeff")
+            if not line.startswith(today + "T"):
+                continue
+            parts = line.split(",", 2)
+            if len(parts) < 3:
+                continue
+            t, num, rest = parts
+            is_ok = line.rstrip("\r").endswith(",OK")
+            for n in nums:
+                if n in rest:
+                    if not first:
+                        first = t[11:19]
+                    last = t[11:19]
+                if is_ok and num == n:
+                    played += 1
+        out.update(numbers=nums, blocks=len(blocks),
+                   maxjump=max(int(j) for _, j in blocks),
+                   first=first, last=last, played=played)
+        if played:
+            out["level"] = "danger"
+            out["text"] = ("🔴 %s 被播出 %d 次！请核对播报日志与存证图"
+                           % ("/".join(nums), played))
+        else:
+            out["level"] = "warn"
+            span = ("%s ~ %s" % (first, last)) if first else "今日"
+            out["text"] = ("⚠ 今日残留 / 异常大号 %s：闸门拦截 %d 条"
+                           "（最大跳幅 +%d）｜上屏 %s｜播出 0 次 · 基线未被带偏 ✅"
+                           % ("/".join(nums), len(blocks), out["maxjump"], span))
+    except Exception as e:
+        out["ok"] = False
+        out["level"] = "muted"
+        out["text"] = "残留告警读取失败：%s" % e
+    return out
+
+
 def norm_src(src):
     """画面源归一化: '/dev/videoN' -> 'N'。
 
@@ -915,6 +990,11 @@ DNS <input id=n_dns type=text size=24>（可留空）</div>
 <button onclick=save()>💾 保存并重启播报服务</button>
 <pre id=msg></pre>
 
+<fieldset><legend>残留号拦截告警（今日）</legend>
+<div id=resbar style="font-size:15px;font-weight:600;padding:8px 10px;border-radius:6px;line-height:1.6;background:#f2f2f2;color:#666">加载中…</div>
+<div class=small style="margin-top:6px">依据 service.log 闸门拦截记录 + 当日播报日志 OCR 汇总，每 30 秒更新；拦截日志每 10 秒节流一次，条数不等于实际挡下的轮数。屏上残留号是对方叫号屏的昨日遗留，被闸门挡住、未错播即属正常，无需处理。</div>
+</fieldset>
+
 <fieldset><legend>播报日志尾部（announce_log.csv）</legend>
 <div id=logbox>加载中…</div></fieldset>
 
@@ -1263,6 +1343,17 @@ $('logbox').addEventListener('scroll',()=>{
  logPinned=el.scrollHeight-el.scrollTop-el.clientHeight<24;
 });
 
+function loadResidue(){
+ fetch('/api/residue').then(r=>r.json()).then(d=>{
+  const el=$('resbar'); if(!el)return;
+  el.textContent=d.text||'(无数据)';
+  const m={clear:['#e8f5e9','#0a6b2a'],warn:['#fff4e5','#8a4b00'],
+           danger:['#fdecea','#c00'],muted:['#f2f2f2','#666']}[d.level]
+          ||['#f2f2f2','#666'];
+  el.style.background=m[0]; el.style.color=m[1];
+ }).catch(()=>{});
+}
+
 function refresh(){
  fetch('/api/status').then(r=>r.json()).then(d=>{
   $('st').textContent='· 播报服务: '+d.active+' · PID '+d.pid+' · '+d.mem;
@@ -1270,6 +1361,7 @@ function refresh(){
  }).catch(()=>{});
  loadLogs();
  loadAudioHealth();
+ loadResidue();
 }
 
 function loadNet(){
@@ -1414,6 +1506,8 @@ setInterval(()=>{
   setLogText(d.log);
  }).catch(()=>{});
 },5000);
+// 残留告警 30s 单独刷新: 读日志尾部 2MB, 不挤进 5s 的轻量刷新里。
+setInterval(()=>{ if(!document.hidden)loadResidue(); },30000);
 refresh();loadNet();
 // ★默认不进实时预览: 小主机只有 4 核赛扬, 持续刷帧会和 OCR/TTS 抢 CPU(现场反馈"开着就卡")。
 //   这里只在打开页面时抓**一张静帧**(开销 = 一次缩图编码), 好让画面不为空、能直接拖 ROI;
@@ -2076,6 +2170,8 @@ class Handler(BaseHTTPRequestHandler):
             elif u.path == "/api/status":
                 st, tail = status_and_log()
                 self._json(dict(st, log=tail))
+            elif u.path == "/api/residue":
+                self._json(residue_guard_status())
             elif u.path == "/api/devices":
                 self._json({"devices": list_usb_cams()})
             elif u.path == "/api/audio":
