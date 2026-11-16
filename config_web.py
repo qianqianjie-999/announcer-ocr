@@ -266,7 +266,7 @@ def residue_guard_status():
     tag = today.replace("-", "")
     svc = "/var/log/announce-rs/service.log"
     out = {"ok": True, "level": "clear", "numbers": [], "blocks": 0,
-           "maxjump": 0, "first": "", "last": "", "played": 0,
+           "maxjump": 0, "first": "", "last": "", "played": 0, "chained": [],
            "text": "✅ 今日无残留 / 异常大号，闸门零拦截"}
     try:
         def tail_bytes(path, cap):
@@ -293,7 +293,33 @@ def residue_guard_status():
 
         first = last = ""
         played = 0
+        chained_times = {}
         csv_tail = tail_bytes(LOG_CSV, 1048576)
+        # 第一遍: 收集当日全部合规 OK 行(时间秒, 号值), 供"真号续到该号"判定
+        ok_rows = []
+        for line in csv_tail.splitlines():
+            line = line.lstrip("\ufeff")
+            if not line.startswith(today + "T"):
+                continue
+            parts = line.split(",", 2)
+            if len(parts) < 3:
+                continue
+            t, num, rest = parts
+            if line.rstrip("\r").endswith(",OK") and re.fullmatch(r"GA\d{3}", num):
+                ok_rows.append((int(t[11:13]) * 3600 + int(t[14:16]) * 60
+                                + int(t[17:19]), int(num[2:]), t[11:19]))
+
+        # 正常续号: 该号 OK 行的前一号 15 分钟内刚播过, 或后一号 15 分钟内接上。
+        # 场景: 上午残留 GA136 被拦 3 次, 午后真号轮到 GA136(GA135->136->137 连续),
+        # 旧判据会误报"被播出"; 修复后只有脱离真号链的孤立播出才计 played。
+        def in_chain(sec, val):
+            for s2, v2, _ in ok_rows:
+                if v2 == val - 1 and 0 <= sec - s2 <= 900:
+                    return True
+                if v2 == val + 1 and 0 <= s2 - sec <= 900:
+                    return True
+            return False
+
         for line in csv_tail.splitlines():
             line = line.lstrip("\ufeff")
             if not line.startswith(today + "T"):
@@ -303,26 +329,38 @@ def residue_guard_status():
                 continue
             t, num, rest = parts
             is_ok = line.rstrip("\r").endswith(",OK")
+            sec = None
+            if is_ok and re.fullmatch(r"GA\d{3}", num):
+                sec = int(t[11:13]) * 3600 + int(t[14:16]) * 60 + int(t[17:19])
             for n in nums:
                 if n in rest:
                     if not first:
                         first = t[11:19]
                     last = t[11:19]
                 if is_ok and num == n:
-                    played += 1
+                    if sec is not None and not in_chain(sec, int(num[2:])):
+                        played += 1
+                    elif sec is not None:
+                        chained_times.setdefault(num, t[11:19])
         out.update(numbers=nums, blocks=len(blocks),
                    maxjump=max(int(j) for _, j in blocks),
-                   first=first, last=last, played=played)
+                   first=first, last=last, played=played,
+                   chained=list(chained_times))
         if played:
             out["level"] = "danger"
-            out["text"] = ("🔴 %s 被播出 %d 次！请核对播报日志与存证图"
+            out["text"] = ("🔴 %s 被异常播出 %d 次！请核对播报日志与存证图"
                            % ("/".join(nums), played))
         else:
             out["level"] = "warn"
             span = ("%s ~ %s" % (first, last)) if first else "今日"
+            extra = ""
+            if chained_times:
+                extra = ("；%s 当天真号已轮到正常播出(%s)，与残留无关"
+                         % ("/".join(chained_times),
+                            "、".join(chained_times.values())))
             out["text"] = ("⚠ 今日残留 / 异常大号 %s：闸门拦截 %d 条"
-                           "（最大跳幅 +%d）｜上屏 %s｜播出 0 次 · 基线未被带偏 ✅"
-                           % ("/".join(nums), len(blocks), out["maxjump"], span))
+                           "（最大跳幅 +%d）｜上屏 %s｜残留播出 0 次 · 基线未被带偏 ✅%s"
+                           % ("/".join(nums), len(blocks), out["maxjump"], span, extra))
     except Exception as e:
         out["ok"] = False
         out["level"] = "muted"
